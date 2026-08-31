@@ -69,13 +69,15 @@ impl HidUsage {
     /// intercepts a key, so this must be checked before the identifier is used.
     #[must_use]
     pub const fn page(self) -> u16 {
-        (self.0 >> 16) as u16
+        let [_, _, a, b] = self.0.to_le_bytes();
+        u16::from_le_bytes([a, b])
     }
 
     /// The usage identifier within the page.
     #[must_use]
     pub const fn id(self) -> u16 {
-        self.0 as u16
+        let [a, b, _, _] = self.0.to_le_bytes();
+        u16::from_le_bytes([a, b])
     }
 }
 

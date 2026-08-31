@@ -112,4 +112,38 @@ Video packets carry a fixed 16-byte header written by hand, byte by byte. At
 thousands of packets a second, and as the part of the protocol most worth
 auditing, the layout is specified here rather than derived from a Rust type.
 
-Layout specified once the packetisation design is settled.
+All fields are little-endian.
+
+| Offset | Size | Field | Purpose |
+|---|---|---|---|
+| 0 | 4 | `frame_id` | Reassembly key, and what a recovery request names. |
+| 4 | 4 | `capture` | When the frame was captured, in units of 100 microseconds since the session began. |
+| 8 | 2 | `seq` | Session-wide datagram counter, so a gap is visible across a frame boundary. Compared circularly, in the manner of RFC 1982. |
+| 10 | 2 | `slice_pkts` | Packets in this slice. Every packet carries it, so any one of them can size the reassembly buffer. |
+| 12 | 2 | `pkt_idx` | This packet's position in the slice. |
+| 14 | 1 | `slice_id` | Which slice of the frame. |
+| 15 | 1 | `flags` | Bit 0 marks a key frame, bit 1 the frame's last slice. The rest are spare and a receiver must ignore them. |
+
+The payload follows immediately. At the 1434-byte datagram this transport reaches
+on a 1500-byte path, that leaves 1418 bytes of video, or 94.5% of the wire frame.
+
+The timestamp counts 100-microsecond ticks rather than microseconds because
+microseconds overflow four bytes after 71 minutes, and a remote desktop session
+routinely runs longer than that. At this resolution the same four bytes last 119
+hours. Nothing downstream needs finer: latency is reported in milliseconds and
+congestion feedback measures arrival deltas in units of 250 microseconds.
+
+There is no field counting the slices in a frame. The last-slice flag supplies
+that, which means the host does not need to know how many slices a frame will have
+before it sends the first one, and can send slice zero while slice one is still
+being encoded.
+
+Slices are an encoder-level division into independently decodable units, so losing
+one costs a band of the picture rather than the whole frame. Fragmentation within
+a slice is a separate axis, carried by `slice_pkts` and `pkt_idx`. Fragmentation
+alone would not give the property, because a lost fragment still destroys its
+slice.
+
+`slice_id` 255 and the spare flag bits are reserved for forward error correction,
+which is not implemented. On a local network a retransmission costs about a
+millisecond, which is cheaper than paying for parity on every frame.
