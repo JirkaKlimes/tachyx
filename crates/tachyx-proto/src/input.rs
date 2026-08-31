@@ -46,12 +46,38 @@ pub enum ScrollSource {
     Finger,
 }
 
-/// A USB HID usage code from the keyboard usage page.
+/// A USB HID usage, as a usage page in the high sixteen bits and a usage
+/// identifier in the low sixteen.
 ///
-/// The host resolves this to a Linux evdev keycode. Usages the host cannot
-/// resolve are dropped, not guessed at.
+/// This is exactly the encoding Flutter's `PhysicalKeyboardKey.usbHidUsage`
+/// produces, so a client copies the value onto the wire without touching it.
+/// The host resolves it to a Linux evdev keycode and drops what it cannot
+/// resolve rather than guessing.
+///
+/// Carrying the page costs one byte and keeps the consumer page, where the
+/// volume and media keys live, reachable without a protocol break.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HidUsage(pub u16);
+pub struct HidUsage(pub u32);
+
+impl HidUsage {
+    /// The keyboard usage page, the only page the host currently injects.
+    pub const KEYBOARD_PAGE: u16 = 0x0007;
+
+    /// The usage page.
+    ///
+    /// Android reports a value outside any HID page when an input method
+    /// intercepts a key, so this must be checked before the identifier is used.
+    #[must_use]
+    pub const fn page(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    /// The usage identifier within the page.
+    #[must_use]
+    pub const fn id(self) -> u16 {
+        self.0 as u16
+    }
+}
 
 /// One thing the user did.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
