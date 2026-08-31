@@ -27,9 +27,18 @@ transport.
 ## Control stream framing
 
 Each message is a `u32` big-endian byte length followed by that many bytes of a
-protobuf-encoded `ControlMessage`. Protobuf is used because the client on a phone
-and the daemon on a workstation are updated independently, and field numbers make
-that skew survivable.
+`postcard`-encoded message.
+
+The message types are defined once, as ordinary Rust types that make invalid
+states unrepresentable, and serialised with serde. Every consumer of this control
+plane is Rust, so a schema compiler would buy nothing but a second set of weaker
+types and the conversion layer between them.
+
+`postcard` varint-encodes integers and lengths, needs no allocator, and has a
+published wire specification. It is not self-describing, so the first message
+carries the protocol version and a mismatch is reported rather than misparsed.
+
+The video path does not use this encoding, or serde at all. See below.
 
 ## Control messages
 
@@ -99,4 +108,8 @@ can produce. The host synthesises whatever key press is needed to enter that tex
 
 ## Video path
 
-Specified once the packetisation design is settled.
+Video packets carry a fixed 16-byte header written by hand, byte by byte. At
+thousands of packets a second, and as the part of the protocol most worth
+auditing, the layout is specified here rather than derived from a Rust type.
+
+Layout specified once the packetisation design is settled.
