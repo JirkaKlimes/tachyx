@@ -63,6 +63,9 @@ const QUEUE_OVERHEAD: usize = size_of::<Bytes>();
 /// A 1080p60 key frame out of `vah264enc`, measured on the target machine.
 const MEASURED_KEY_FRAME_BYTES: usize = 130_427;
 
+/// An ordinary 1080p60 picture at 8 Mbit/s, measured on the same machine.
+const MEASURED_DELTA_FRAME_BYTES: usize = 16_673;
+
 /// The picture the measurement above was taken from.
 const MEASURED_KEY_FRAME_PIXELS: u64 = 1920 * 1080;
 
@@ -140,6 +143,13 @@ pub struct VideoSender {
     /// ones quinn is known to have taken.
     outstanding: VecDeque<usize>,
     key_frame_bytes: usize,
+    /// Bytes to expect an ordinary picture to occupy.
+    ///
+    /// Tracked apart from the key frame, because asking for key frame room
+    /// before an ordinary picture asks for roughly eight times what is needed
+    /// and refuses almost everything. Measured on a phone: 30 frames reached
+    /// the wire out of 130 encoded, and the session died having shown none.
+    delta_bytes: usize,
     /// What the session is configured to send, in bits a second. The rate a
     /// picture is released at is derived from it and from that picture's own
     /// size on the wire.
@@ -251,6 +261,7 @@ impl VideoSender {
                 buffer,
                 outstanding: VecDeque::new(),
                 key_frame_bytes: MEASURED_KEY_FRAME_BYTES,
+                delta_bytes: MEASURED_DELTA_FRAME_BYTES,
                 target: Arc::clone(&shared),
                 pacer: Pacer::new(rate_for(target, MEASURED_KEY_FRAME_BYTES), Instant::now()),
                 records,
@@ -396,6 +407,18 @@ impl VideoSender {
         self.key_frame_bytes
     }
 
+    /// Bytes to expect the next ordinary picture to occupy.
+    ///
+    /// This, not the key frame, is what a caller should gate on. Almost every
+    /// picture is an ordinary one, and demanding room for the rare large one
+    /// before each of them refuses the stream into silence. A key frame that
+    /// does not fit is refused when it arrives, which costs a repair rather
+    /// than the whole picture.
+    #[must_use]
+    pub const fn delta_estimate(&self) -> usize {
+        self.delta_bytes
+    }
+
     /// Frames put on the wire.
     #[must_use]
     pub const fn frames_sent(&self) -> u64 {
@@ -474,6 +497,10 @@ impl VideoSender {
             self.key_frame_bytes = unit
                 .encoded_len()
                 .max(self.key_frame_bytes - self.key_frame_bytes / 16);
+        } else {
+            self.delta_bytes = unit
+                .encoded_len()
+                .max(self.delta_bytes - self.delta_bytes / 16);
         }
         // Taken out of `self` for the release loop, which needs the rest of
         // `self` for the pacer, the queue record and the connection, and put

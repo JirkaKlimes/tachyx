@@ -600,7 +600,7 @@ fn release(
             // would then never wake to open the gate again. That is a deadlock,
             // and it looks exactly like the picture freezing a few seconds in.
             admission.store(
-                video.can_send_bytes(video.key_frame_estimate()),
+                video.can_send_bytes(video.delta_estimate()),
                 Ordering::Relaxed,
             );
             sent.store(video.frames_sent(), Ordering::Relaxed);
