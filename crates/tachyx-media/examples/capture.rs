@@ -75,8 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report("wait", &mut waits);
     report("age", &mut ages);
     println!(
-        "captured {} dropped {} failed {}",
-        motion.captured, motion.dropped, motion.failed
+        "captured {} dropped {} failed {} starved {}",
+        motion.captured, motion.dropped, motion.failed, motion.starved
     );
 
     let drain = std::thread::spawn(move || {
@@ -104,10 +104,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         100.0 * cpu.as_secs_f64() / idle_for.as_secs_f64()
     );
     println!(
-        "captured {} dropped {} failed {}",
+        "captured {} dropped {} failed {} starved {}",
         idle.captured - motion.captured,
         idle.dropped - motion.dropped,
-        idle.failed - motion.failed
+        idle.failed - motion.failed,
+        idle.starved - motion.starved
     );
     Ok(())
 }

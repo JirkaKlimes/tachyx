@@ -25,6 +25,12 @@ VideoTexture openVideoTexture({required PlatformInt64 engineHandle}) => RustLib
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<VideoTexture>>
 abstract class VideoTexture implements RustOpaqueInterface {
+  /// The first thing that went wrong, if anything has.
+  ///
+  /// A pipeline that cannot negotiate posts one message and then goes quiet,
+  /// so a client with no picture has nothing else to show the user.
+  String? failure();
+
   /// Tells the decoder the stream has ended.
   void finish();
 

@@ -1,5 +1,6 @@
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
+use gstreamer_gl::prelude::ContextGLExt;
 use gstreamer_gl::GL_DISPLAY_CONTEXT_TYPE;
 use tachyx_glctx::AdoptedContext;
 
@@ -11,7 +12,11 @@ const APP_CONTEXT_TYPE: &str = "gst.gl.app_context";
 
 /// Every caps filter here is load-bearing; see the crate documentation.
 const DESCRIPTION: &str = concat!(
+    // The caps say every buffer is one whole access unit. Without them the
+    // parser cannot tell where a unit ends until the next one arrives, and holds
+    // every frame for exactly one frame period.
     "appsrc name=source is-live=true format=time do-timestamp=false ",
+    "caps=video/x-h264,stream-format=byte-stream,alignment=au ",
     "! h264parse ",
     "! vah264dec ",
     "! video/x-raw(memory:DMABuf) ",
@@ -74,6 +79,33 @@ impl Decoder {
         );
     }
 
+    /// Calls `handler` with the first error the pipeline posts.
+    ///
+    /// An element that cannot negotiate says so on the bus and nowhere else, so
+    /// without this a pipeline that never starts is silent. That is the one
+    /// failure worth surfacing: everything on this path is decided when the
+    /// first frame is negotiated, and a pipeline that survives that runs.
+    pub(super) fn on_error<F>(&self, handler: F)
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        self.pipeline
+            .bus()
+            .expect("a pipeline has a bus")
+            .set_sync_handler(move |_, message| {
+                if let gstreamer::MessageView::Error(failure) = message.view() {
+                    handler(format!(
+                        "{}: {}",
+                        message
+                            .src()
+                            .map_or_else(|| "pipeline".to_owned(), |src| src.path_string().into()),
+                        failure.error()
+                    ));
+                }
+                gstreamer::BusSyncReply::Drop
+            });
+    }
+
     /// Hands the pipeline the embedder's display and render context, then starts
     /// it. The OpenGL elements find both without a bus round trip, because a bin
     /// passes a context it is given to every element it holds.
@@ -82,8 +114,7 @@ impl Decoder {
         display
             .get_mut()
             .expect("a freshly built context is unshared")
-            .structure_mut()
-            .set(GL_DISPLAY_CONTEXT_TYPE, adopted.display());
+            .set_gl_display(Some(adopted.display()));
         self.pipeline.set_context(&display);
 
         let mut application = gstreamer::Context::new(APP_CONTEXT_TYPE, true);

@@ -11,4 +11,12 @@ targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-linux-android",
   "x86_64-linux-android",
+  # `flutter build apk` names every ABI Flutter supports on its Gradle command
+  # line, and that overrides anything the project asks for, so the client is
+  # built for 32-bit ARM whether or not anyone wants it there. The list must say
+  # so: the native assets hook reads this file and refuses a target that is
+  # missing from it, before the compiler runs at all. The workspace root's copy
+  # carries the same target, because that is the one the dev shell builds the
+  # toolchain from.
+  "armv7-linux-androideabi",
 ]

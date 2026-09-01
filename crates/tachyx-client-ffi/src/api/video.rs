@@ -84,6 +84,16 @@ impl VideoTexture {
         self.core.finish();
     }
 
+    /// The first thing that went wrong, if anything has.
+    ///
+    /// A pipeline that cannot negotiate posts one message and then goes quiet,
+    /// so a client with no picture has nothing else to show the user.
+    #[frb(sync)]
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        self.core.failure()
+    }
+
     /// What the path has counted so far.
     #[frb(sync)]
     #[must_use]

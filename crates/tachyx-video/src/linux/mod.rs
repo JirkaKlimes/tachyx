@@ -85,14 +85,24 @@ impl VideoTexture {
             start: Instant::now(),
             context: OnceLock::new(),
             started: Once::new(),
+            failure: OnceLock::new(),
             notify: OnceLock::new(),
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                waiting: Some(VecDeque::new()),
+                ..State::default()
+            }),
         });
 
         let listener = Arc::downgrade(&shared);
         shared.pipeline.on_frame(move |sample| {
             if let Some(shared) = listener.upgrade() {
                 shared.receive(sample);
+            }
+        });
+        let reporter = Arc::downgrade(&shared);
+        shared.pipeline.on_error(move |failure| {
+            if let Some(shared) = reporter.upgrade() {
+                shared.fail(failure);
             }
         });
 
@@ -130,18 +140,13 @@ impl VideoTexture {
         let arrived = gstreamer::ClockTime::from_nseconds(
             u64::try_from(self.shared.start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
-        let queued = {
+        {
             let mut state = self.shared.locked();
             state.pushed += 1;
-            if self.shared.context.get().is_some() {
-                Some(access_unit)
-            } else {
-                state.waiting.push_back((access_unit, arrived));
-                None
+            match state.waiting.as_mut() {
+                Some(waiting) => waiting.push_back((access_unit, arrived)),
+                None => self.shared.pipeline.push(access_unit, arrived)?,
             }
-        };
-        if let Some(access_unit) = queued {
-            self.shared.pipeline.push(access_unit, arrived)?;
         }
         self.texture.mark_frame_available();
         Ok(())
@@ -150,6 +155,16 @@ impl VideoTexture {
     /// Tells the decoder the stream has ended.
     pub fn finish(&self) {
         self.shared.pipeline.finish();
+    }
+
+    /// The first thing that went wrong, if anything has.
+    ///
+    /// A pipeline that cannot negotiate posts one message and then goes quiet.
+    /// Without somewhere to read it, a client that shows no picture gives no
+    /// reason for it either.
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        self.shared.failure.get().cloned()
     }
 
     /// What the path has done so far.
@@ -184,15 +199,19 @@ struct Shared {
     start: Instant,
     context: OnceLock<AdoptedContext>,
     started: Once,
+    failure: OnceLock<String>,
     notify: OnceLock<Arc<SendableTexture<BoxedGLTexture>>>,
     state: Mutex<State>,
 }
 
 #[derive(Debug, Default)]
 struct State {
-    /// Access units pushed before the pipeline could run, with the moment
-    /// each arrived.
-    waiting: VecDeque<(Vec<u8>, gstreamer::ClockTime)>,
+    /// Access units pushed before the pipeline could run, with the moment each
+    /// arrived. Emptied and set to `None` when the pipeline starts, under the
+    /// lock, which is also what routes a later push straight to the decoder. A
+    /// push that overtook this queue would hand the decoder a frame before the
+    /// key frame it refers back to.
+    waiting: Option<VecDeque<(Vec<u8>, gstreamer::ClockTime)>>,
     /// The caps the pipeline currently produces, and their parsed form.
     format: Option<(gstreamer::Caps, VideoInfo)>,
     /// The newest frame Flutter has not asked for yet.
@@ -224,6 +243,13 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Records the first thing that went wrong, and only the first: later
+    /// messages are almost always that one failure repeating downstream.
+    fn fail(&self, failure: String) {
+        tracing::error!(%failure, "the decode and present path failed");
+        let _ = self.failure.set(failure);
+    }
+
     /// Adopts the embedder's context and starts decoding. Runs once, on the
     /// raster thread, inside the first texture callback.
     fn start(&self) {
@@ -231,20 +257,20 @@ impl Shared {
             let adopted = match AdoptedContext::adopt() {
                 Ok(adopted) => adopted,
                 Err(error) => {
-                    tracing::error!(%error, "could not adopt the embedder's OpenGL context");
+                    self.fail(format!("could not adopt the embedder's OpenGL context: {error}"));
                     return;
                 }
             };
             tracing::info!(api = ?adopted.api(), "adopted the embedder's OpenGL context");
             let adopted = self.context.get_or_init(|| adopted);
             if let Err(error) = self.pipeline.play(adopted) {
-                tracing::error!(%error, "the decode pipeline would not start");
+                self.fail(format!("the decode pipeline would not start: {error}"));
                 return;
             }
-            let waiting = std::mem::take(&mut self.locked().waiting);
-            for (access_unit, arrived) in waiting {
+            let mut state = self.locked();
+            for (access_unit, arrived) in state.waiting.take().into_iter().flatten() {
                 if let Err(error) = self.pipeline.push(access_unit, arrived) {
-                    tracing::error!(%error, "the decoder rejected a buffered access unit");
+                    self.fail(format!("the decoder rejected a buffered access unit: {error}"));
                 }
             }
         });
@@ -329,7 +355,7 @@ impl PayloadProvider<BoxedGLTexture> for Shared {
                         state.held.pop_front();
                     }
                 }
-                Err(error) => tracing::error!(%error, "could not draw a decoded frame"),
+                Err(error) => self.fail(format!("could not draw a decoded frame: {error}")),
             }
         }
         match state.held.back() {

@@ -172,6 +172,13 @@ pub struct CaptureStats {
     pub dropped: u64,
     /// Frames the compositor refused to fill.
     pub failed: u64,
+    /// Times no buffer was free to arm at the moment one became ready.
+    ///
+    /// The ring recovers by publishing first, which displaces the pending frame
+    /// and hands its buffer straight back, so this costs no vertical blank. It
+    /// is the measurement that says whether the ring is the right size: a run
+    /// that never reaches it has a spare buffer it does not need.
+    pub starved: u64,
 }
 
 #[derive(Debug, Default)]
@@ -179,6 +186,7 @@ struct Counters {
     captured: AtomicU64,
     dropped: AtomicU64,
     failed: AtomicU64,
+    starved: AtomicU64,
 }
 
 /// Where the pointer is and what it looks like.
@@ -283,6 +291,7 @@ impl Capture {
             captured: self.counters.captured.load(Ordering::Relaxed),
             dropped: self.counters.dropped.load(Ordering::Relaxed),
             failed: self.counters.failed.load(Ordering::Relaxed),
+            starved: self.counters.starved.load(Ordering::Relaxed),
         }
     }
 
@@ -814,6 +823,7 @@ impl Pump {
             // Nothing is free only when the slot still holds a frame the
             // encoder has not taken. Replacing it hands that buffer straight
             // back, so the arm happens one step later rather than not at all.
+            self.counters.starved.fetch_add(1, Ordering::Relaxed);
             self.store(frame);
             self.reclaim();
             let next = self

@@ -39,6 +39,9 @@ class VideoTextureController {
   /// What the path has counted so far.
   PresentStats get stats => _texture.stats();
 
+  /// The first thing that went wrong, if anything has.
+  String? get failure => _texture.failure();
+
   /// Releases the texture and stops the pipeline.
   void dispose() {
     _texture.finish();

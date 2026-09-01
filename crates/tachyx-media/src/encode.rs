@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -738,6 +738,7 @@ impl Counters {
             encoded: self.encoded.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             filler_bytes: self.filler.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
             latency: self
                 .latency
                 .lock()

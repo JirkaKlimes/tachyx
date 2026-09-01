@@ -96,6 +96,11 @@ class _ProbeState extends State<_Probe> {
   }
 
   void _tally() {
+    final failure = _video?.failure;
+    if (failure != null && failure != _error) {
+      debugPrint('probe: FAILED $failure');
+      setState(() => _error = failure);
+    }
     final stats = _video?.stats;
     if (stats == null) {
       return;
