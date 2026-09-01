@@ -1,9 +1,9 @@
 //! Messages on the reliable control stream.
 //!
 //! Every message is an ordinary Rust type serialised with `postcard`. That
-//! encoding is not self-describing, so [`ClientHello`] carries [`VERSION`]
-//! ahead of everything else and [`ClientHello::decode`] reads it before it
-//! reads anything that a later version might have reshaped.
+//! encoding is not self-describing, so the first message in each direction
+//! carries [`VERSION`] ahead of everything else, and [`Hello::decode`] reads
+//! that field before it reads anything a later version might have reshaped.
 
 use std::num::{NonZeroU16, NonZeroU32};
 

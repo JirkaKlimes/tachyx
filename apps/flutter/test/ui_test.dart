@@ -141,7 +141,12 @@ void main() {
         ),
       );
 
-      expect(find.text('${HostLink.defaultPort}'), findsOneWidget);
+      // Read the field rather than the text, because the hint says the same
+      // thing and matching on it would pass whether or not the field was filled.
+      final TextField port = tester.widget<TextField>(
+        find.byType(TextField).last,
+      );
+      expect(port.controller?.text, '${HostLink.defaultPort}');
     });
 
     testWidgets('a refusal is shown in the words the client was given', (
