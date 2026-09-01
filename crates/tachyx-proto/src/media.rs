@@ -10,6 +10,8 @@
 
 use core::num::{NonZeroU16, NonZeroUsize};
 
+use serde::{Deserialize, Serialize};
+
 /// Length of a packet header in bytes.
 pub const HEADER_LEN: usize = 16;
 
@@ -25,7 +27,7 @@ pub const HEADER_LEN: usize = 16;
 /// by [`Timestamp::micros_since`]. Saturating would leave a session open past 119
 /// hours emitting one identical timestamp forever, which stops presentation pacing
 /// with nothing to indicate why.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timestamp(u32);
 
 impl Timestamp {
@@ -151,7 +153,7 @@ impl Seq {
 }
 
 /// A frame number, counted over the session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FrameId(pub u32);
 
 /// The header carried by every video datagram.
