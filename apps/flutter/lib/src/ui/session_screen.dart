@@ -3,6 +3,8 @@ library;
 
 import 'dart:async';
 
+import 'dart:ui' show FlutterView;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:irondash_engine_context/irondash_engine_context.dart';
@@ -11,6 +13,7 @@ import 'package:tachyx/src/input/keyboard.dart';
 import 'package:tachyx/src/input/touchpad.dart';
 import 'package:tachyx/src/rust/api/session.dart';
 import 'package:tachyx/src/session/pipe.dart';
+import 'package:tachyx/src/session/viewport.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 import 'package:tachyx/src/ui/theme.dart';
 import 'package:tachyx/src/ui/video_surface.dart';
@@ -91,6 +94,22 @@ class _SessionScreenState extends State<SessionScreen>
   void didChangeDependencies() {
     super.didChangeDependencies();
     _rescale();
+  }
+
+  @override
+  void didChangeMetrics() {
+    // A rotation or a resize. The host chose its rung from the viewport the
+    // hello named, so it has to be told the viewport changed or it keeps
+    // encoding for a screen that is no longer there.
+    final Session? session = widget.session;
+    if (session == null || !mounted) return;
+    final FlutterView view = View.of(context);
+    final (int width, int height) = viewportOf(view);
+    session.viewportChanged(
+      viewportWidth: width,
+      viewportHeight: height,
+      refreshHz: refreshHz(view),
+    );
   }
 
   @override

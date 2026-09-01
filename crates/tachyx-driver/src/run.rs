@@ -15,7 +15,7 @@ use tachyx_transport::{Client, ClientSession, ControlError, ControlReader, Contr
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
-use crate::{Command, GOODBYE, Shared};
+use crate::{Command, Shared, GOODBYE};
 
 /// How long input is collected before a batch goes out.
 ///
@@ -55,7 +55,12 @@ pub(crate) async fn session(
                     let now = Instant::now();
                     match session.datagram(&datagram, now) {
                         Ok(Some(frame)) => {
-                            if let Some(sink) = shared.state().sink.clone() {
+                            // Taken out of the lock before it is used. Handing a
+                            // frame to a decoder takes as long as the decoder
+                            // takes, and the statistics panel reads this same
+                            // lock from the thread that draws the application.
+                            let sink = shared.state().sink.clone();
+                            if let Some(sink) = sink {
                                 sink.push(frame.data);
                             }
                         }

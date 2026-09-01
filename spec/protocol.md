@@ -103,9 +103,32 @@ The video path does not use this encoding, or serde at all. See below.
   choosing a monitor is a thing a client can do.
 
 `StreamConfig`
-: The host's decision: codec, encoded resolution, frame rate, target bitrate, and
-  the codec configuration bytes needed to initialise the decoder. Re-sent whenever
-  any of those change, including a change forced by congestion.
+: The host's decision: codec, coded size, visible size, display aspect ratio,
+  frame rate and target bitrate. Re-sent whenever any of those change, including
+  a change forced by congestion. It carries no codec configuration bytes: the
+  parameter sets are repeated in the bitstream before every key frame, so the
+  decoder takes the new geometry from the stream itself and a resolution change
+  needs no separate configuration step. The display aspect is here because it is
+  the one thing the bitstream cannot say: the sequence parameter set of a 16:10
+  capture scaled to 16:9 declares no aspect ratio at all.
+
+`Heartbeat`
+: Proof the host is alive, and what it has been doing: its session clock, the
+  last frame it sent, frames sent and gated, the transport's bandwidth estimate,
+  and its median capture-to-wire latency. Sent every 500 milliseconds whether or
+  not frames are flowing.
+
+  The host must say this out loud, and the client must read liveness from it
+  rather than from the video. Capture blocks while the screen is static, with
+  idle gaps measured up to 1.53 seconds, so silence on the video path does not
+  distinguish an idle host from a dead one. A client that treated no frames as a
+  fault would report one every time the user stopped to read something, so it
+  shows an idle screen as idle and reports a lost connection only after three
+  missed heartbeats. QUIC's own keep-alive does not answer the question either:
+  it is a transport ping the application never observes.
+
+  The interval is fixed rather than announced, because the client needs it
+  before it has received one: what it reads is the *absence* of a heartbeat.
 
 `CursorUpdate`
 : Cursor position and shape. The client renders the cursor locally so that pointer

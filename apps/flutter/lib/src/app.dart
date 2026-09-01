@@ -3,10 +3,13 @@ library;
 
 import 'dart:async';
 
+import 'dart:ui' show FlutterView;
+
 import 'package:flutter/material.dart';
 
 import 'package:tachyx/src/rust/api/session.dart' as rust;
 import 'package:tachyx/src/session/link.dart';
+import 'package:tachyx/src/session/viewport.dart';
 import 'package:tachyx/src/ui/connect_screen.dart';
 import 'package:tachyx/src/ui/session_screen.dart';
 import 'package:tachyx/src/ui/theme.dart';
@@ -37,31 +40,14 @@ class _TachyxAppState extends State<TachyxApp> {
   }
 
   void _dial(String host, int port) {
-    final Size size = MediaQuery.of(context).size;
-    final double ratio = MediaQuery.devicePixelRatioOf(context);
+    final FlutterView view = View.of(context);
     unawaited(
       _link.dial(
         '$host:$port',
-        viewport: (
-          (size.width * ratio).round().clamp(1, 0xFFFF),
-          (size.height * ratio).round().clamp(1, 0xFFFF),
-        ),
-        refreshHz: _refreshHz(context),
+        viewport: viewportOf(view),
+        refreshHz: refreshHz(view),
       ),
     );
-  }
-
-  /// What the display refreshes at, in hertz.
-  ///
-  /// It bounds the frame rate the client asks for, because a frame the display
-  /// never shows costs everything a shown one costs. An embedder that does not
-  /// know reports zero, and asking a host for zero frames a second would be
-  /// asking it for none, so the fallback is sixty.
-  static int _refreshHz(BuildContext context) {
-    final double reported = View.of(context).display.refreshRate;
-    return reported.isFinite && reported >= 1
-        ? reported.round().clamp(1, 0xFFFF)
-        : 60;
   }
 
   @override
