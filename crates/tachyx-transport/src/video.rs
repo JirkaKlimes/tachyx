@@ -160,8 +160,10 @@ impl VideoSender {
     /// already queued. Both are terms
     /// [`quinn::Connection::datagram_send_buffer_space`] omits: it subtracts a
     /// single entry's accounting from the buffer, while the eviction loop it is
-    /// meant to predict charges one per entry. Trusting the report costs a
-    /// frame as soon as two datagrams are queued ahead of it.
+    /// meant to predict charges one per entry. The report is therefore too
+    /// generous as soon as two datagrams are queued ahead of the frame, and
+    /// believing it reaches an eviction that does not merely lose the frame but
+    /// ends the connection. See this module's own documentation.
     #[must_use]
     pub fn can_send_frame(&self, datagrams: usize, payload_per_datagram: usize) -> bool {
         let space = self.connection.datagram_send_buffer_space();
