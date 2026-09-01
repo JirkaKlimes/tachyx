@@ -12,7 +12,9 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/JirkaKlimes/tachyx"
 
 [workspace.dependencies]
+tachyx-client = { path = "crates/tachyx-client" }
 tachyx-dmabuf = { path = "crates/tachyx-dmabuf" }
+tachyx-hostd = { path = "crates/tachyx-hostd" }
 tachyx-input = { path = "crates/tachyx-input" }
 tachyx-media = { path = "crates/tachyx-media" }
 tachyx-proto = { path = "crates/tachyx-proto" }
@@ -30,7 +32,7 @@ quinn = { version = "0.11", default-features = false, features = [
 ] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustix = { version = "1.1", features = ["fs", "time"] }
+rustix = { version = "1.1", features = ["event", "fs", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
@@ -47,7 +49,7 @@ gstreamer-video = "0.25"
 drm-fourcc = "2.2"
 gbm = { version = "0.18", default-features = false }
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 

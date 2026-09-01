@@ -17,6 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 tachyx-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
 
 [lints]
 workspace = true
