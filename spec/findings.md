@@ -509,6 +509,72 @@ single maintainer, a stable release from 2023, and not one issue ever filed abou
 its OpenGL support, working or broken. It is about a hundred lines and we should be
 prepared to take ownership of it.
 
+### The Linux path, measured
+
+Built and run. A test pattern encoded by `vah264enc` at 1920x1088 was decoded and
+drawn in a Flutter window on Wayland, on both renderers. Numbers below are from a
+release build.
+
+The pipeline is
+`appsrc(alignment=au) ! h264parse ! vah264dec ! video/x-raw(memory:DMABuf) !
+glupload ! glcolorconvert ! appsink(memory:GLMemory, RGBA, texture-target=2D)`.
+Three caps in it are load-bearing and each one turns a silent regression into a
+negotiation failure: `memory:DMABuf` after the decoder, `texture-target=2D` at the
+sink, and `format=RGBA`.
+
+`glupload` chooses the `DirectDmabufExternal` method, which imports the decoder's
+buffer as an `EGLImage` and gives back a `GL_TEXTURE_EXTERNAL_OES` texture.
+`glcolorconvert` then converts to `GL_TEXTURE_2D` RGBA in one shader pass. That
+pass cannot be removed: Flutter demands `GL_TEXTURE_2D` and `GL_RGBA8`, and the
+decoder produces tiled NV12. It costs GPU time, not a copy.
+
+- Decode to texture ready, at a 60 Hz feed: median **0.63 ms**, 95th percentile
+  **0.85 ms**, worst **1.34 ms**.
+- Texture ready to Flutter's rasteriser: nothing measurable. End to end is the
+  decode figure plus the wait for the compositor's next frame, which every client
+  pays. The lowest end-to-end figure seen was **1.87 ms**, the highest one frame
+  interval more.
+- Sustained throughput, fed as fast as the pipeline accepts: **430 frames a
+  second** at 1920x1088, seven times what 60 Hz asks for.
+- Steady state drops nothing. Frames replaced before Flutter asks for them fall
+  to zero once the first second is past.
+
+The CPU cost is what proves nothing is copied. Per frame at 1920x1088, all
+threads counted:
+
+| path | CPU per frame |
+|---|---|
+| decoder to shared buffer to texture, as above | **1.0 ms** |
+| decoder to system memory, `videoconvert` on four threads to RGBA | 5.0 ms |
+| the same, then uploaded to a texture, which is what a pixel buffer fallback costs | 5.6 to 11.7 ms |
+
+So a CPU fallback costs five to twelve times as much CPU per frame and spends
+three to eleven milliseconds of the latency budget. It is not an option at 60 Hz.
+
+Impeller is already the default on this version: the Linux embedder sets
+`enable_impeller = TRUE` when it builds its project, and the log says
+`Using the Impeller rendering backend (OpenGLESSDF)` with no flag passed. Both
+renderers draw the picture correctly, with correct colour. Skia was reached with
+`FLUTTER_ENGINE_SWITCHES=1` and `FLUTTER_ENGINE_SWITCH_1=enable-impeller=false`,
+which is the only way in: the runner's command line arguments go to the Dart
+entry point, not to the engine.
+
+`irondash_texture` 0.5.0, the published stable release, does carry the Linux
+OpenGL payload. Its vtable still matches: `FlTexture` became a GObject interface
+and `FlTextureGL` now derives from `GObject` directly, but `FlTextureGLClass` is
+still `GObjectClass` followed by one `populate` pointer, so the layout the crate
+declares is byte for byte the current one. The embedder still uses the texture's
+address as its identifier, which is what the crate returns. No fork is needed.
+
+Two things about the embedder that are not written down anywhere else:
+
+- Without `alignment=au` on the `appsrc` caps the parser cannot tell where an
+  access unit ends until the next one arrives, and holds every frame for exactly
+  one frame period. That was 16 ms of the 17 ms first measured.
+- A pipeline that cannot negotiate says so on the bus and nowhere else. The
+  present path records the first such message and offers it, because a client
+  showing no picture otherwise gives no reason for it.
+
 ### Consequences for the host
 
 Three requirements land on the encoder, and all three are cheap if done from the

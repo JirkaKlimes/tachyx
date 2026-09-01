@@ -5,16 +5,17 @@
 /// H.264 access units stands in for the network, because the transport is not
 /// what is under test here.
 ///
-/// Run it with the clip and the pace given on the command line:
+/// The clip and the pace come from the environment, so one build measures many
+/// conditions:
 ///
 /// ```sh
-/// flutter run -t lib/probe_video.dart \
-///   --dart-define=CLIP=/path/to/clip.h264 \
-///   --dart-define=FPS=60
+/// CLIP=/path/to/clip.h264 FPS=60 ./build/linux/x64/release/bundle/tachyx
 /// ```
 ///
 /// `FPS=0` floods: it hands over access units as fast as the decoder takes them,
-/// which measures throughput rather than latency.
+/// which measures throughput rather than latency. A pace that is not the
+/// display's refresh rate drifts through the compositor's frame interval, which
+/// separates the path's own cost from the wait for the next frame.
 library;
 
 import 'dart:async';
@@ -27,8 +28,8 @@ import 'package:tachyx/src/rust/api/video.dart';
 import 'package:tachyx/src/rust/frb_generated.dart';
 import 'package:tachyx/src/ui/video_texture_view.dart';
 
-const String _clipPath = String.fromEnvironment('CLIP');
-const int _fps = int.fromEnvironment('FPS', defaultValue: 60);
+final String _clipPath = Platform.environment['CLIP'] ?? '';
+final int _fps = int.tryParse(Platform.environment['FPS'] ?? '') ?? 60;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -61,7 +62,7 @@ class _ProbeState extends State<_Probe> {
 
   Future<void> _start() async {
     if (_clipPath.isEmpty) {
-      setState(() => _error = 'pass --dart-define=CLIP=/path/to/clip.h264');
+      setState(() => _error = 'set CLIP=/path/to/clip.h264');
       return;
     }
     try {

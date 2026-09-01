@@ -257,7 +257,9 @@ impl Shared {
             let adopted = match AdoptedContext::adopt() {
                 Ok(adopted) => adopted,
                 Err(error) => {
-                    self.fail(format!("could not adopt the embedder's OpenGL context: {error}"));
+                    self.fail(format!(
+                        "could not adopt the embedder's OpenGL context: {error}"
+                    ));
                     return;
                 }
             };
@@ -270,7 +272,9 @@ impl Shared {
             let mut state = self.locked();
             for (access_unit, arrived) in state.waiting.take().into_iter().flatten() {
                 if let Err(error) = self.pipeline.push(access_unit, arrived) {
-                    self.fail(format!("the decoder rejected a buffered access unit: {error}"));
+                    self.fail(format!(
+                        "the decoder rejected a buffered access unit: {error}"
+                    ));
                 }
             }
         });
