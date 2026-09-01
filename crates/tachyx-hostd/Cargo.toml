@@ -1,0 +1,22 @@
+[package]
+name = "tachyx-hostd"
+description = "The tachyx host daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "tachyx_hostd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tachyx-hostd"
+path = "src/main.rs"
+
+[dependencies]
+tachyx-proto.workspace = true
+
+[lints]
+workspace = true

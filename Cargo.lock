@@ -1162,6 +1162,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachyx-hostd"
+version = "0.1.0"
+dependencies = [
+ "tachyx-proto",
+]
+
+[[package]]
 name = "tachyx-input"
 version = "0.1.0"
 dependencies = [
