@@ -1202,6 +1202,55 @@ question about frames that are not key frames.
 **Reasoned:** the gate should ask for the frame it is about to encode, and ask
 for a key frame's room only when it is about to ask for a key frame.
 
+### What WebRTC does, for comparison
+
+Read from the libwebrtc source at tip and cross-checked against seven release
+branches, by a second researcher. **Read, not run.** It is worth recording
+because two of the recommendations below match it and one deliberately does not.
+
+**It paces at a byte rate with a burst allowance, not over a frame interval.**
+`PacingController` grants a burst of `min(kDefaultBurstInterval, kMaxBurstSize /
+rate)`, where `kDefaultBurstInterval` is 40 ms
+(`modules/pacing/pacing_controller.h`, renamed `PacerConfig::kDefaultTimeInterval`
+at tip) and `kMaxBurstSize` is 63,000 bytes. The crossover is a pacing rate of
+12.6 Mbit/s: below it the time bound binds, above it the byte bound does. At a
+target of 10 Mbit/s with the usual pacing factor of 2.5, a 130 kB key frame takes
+**41.6 ms** to leave, about two and a half frame intervals. So WebRTC does not
+try to fit a key frame into one frame interval, and it does not burst it either.
+That is the shape recommendation 1 asks for.
+
+Its `queue_time_limit` of two seconds, the rule that raises the pacing rate to
+drain a long queue, is inert at our scale: triggering it at 25 Mbit/s needs 6.25
+MB queued and our key frame is 130 kB.
+
+**It caps key frame size for VP8 and not for H.264.**
+`LibvpxVp8Encoder::MaxIntraTarget` feeds `VP8E_SET_MAX_INTRA_BITRATE_PCT`, which
+at 60 fps works out to 1800% of the per-frame budget. `H264EncoderImpl` sets
+`iMaxBitrate = UNSPECIFIED_BIT_RATE` and `uiMaxNalSize = 0`, so H.264 key frames
+are uncapped and only the frame dropper and the pacer stand behind them. We use
+H.264, so we are on the uncapped side of that, which is what recommendation 3 is
+about.
+
+**It protects key frames harder, not less.** The parity count is
+`(num_media_packets * protection_factor + 128) >> 8`
+(`modules/video_coding/utility/...` and `forward_error_correction.cc`), and the
+key frame factor is boosted by `BoostCodeRateKey = max(2, packetFrameKey /
+packetFrameDelta)` with `_scaleProtKey = 2.0` in `media_opt_util.cc`. At our
+92-against-12 datagram ratio that boost is 7, which drives the key frame
+protection factor to its clamp: 40 to 50 percent on key frames against 20 to 32
+percent on delta frames. Our own Monte Carlo reaches the same conclusion from the
+survival probabilities, and it is the opposite of giving key frames no parity.
+
+It turns FEC off above a round trip of 200 ms (`kMaxRttTurnOffFec`, function
+local in `BitRateTooLowForFec`), which is far above ours, so on this link WebRTC
+would carry both parity and retransmission.
+
+Two constants worth knowing about because of how far they are from ours: its
+NACK list tolerates `kMaxReorderedPackets = 128` and runs on a
+`kUpdateInterval` of 20 ms (`modules/video_coding/nack_requester.{h,cc}`), and
+its retransmission window is `kRetransmitWindowSizeMs = 500`. Our receiver gives
+up on a frame 2 ms after it first suspects a gap.
+
 ### Recommendations
 
 1. **Pace, in the transport, at a byte rate.** Spread a frame's datagrams evenly
