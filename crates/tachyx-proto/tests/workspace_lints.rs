@@ -6,8 +6,17 @@
 
 use std::path::Path;
 
-/// The one crate allowed to contain unsafe, and why.
-const UNSAFE_EXCEPTION: &str = "tachyx-dmabuf";
+/// The crates allowed to contain unsafe, and why each one is.
+///
+/// `tachyx-dmabuf` hands a buffer descriptor to GStreamer: no type can prove a
+/// file descriptor names a live buffer.
+///
+/// `tachyx-client-ffi` holds the code `flutter_rust_bridge` generates, where
+/// every call across the Dart boundary reads a pointer Dart wrote.
+///
+/// Both keep the rest of the workspace lint set, which the first test below
+/// checks, and neither holds any decision of its own.
+const UNSAFE_EXCEPTIONS: [&str; 2] = ["tachyx-dmabuf", "tachyx-client-ffi"];
 
 #[test]
 fn every_crate_opts_in_to_the_workspace_lints() {
@@ -28,9 +37,9 @@ fn every_crate_opts_in_to_the_workspace_lints() {
             .and_then(|name| name.to_str())
             .expect("crate directory name");
 
-        if name == UNSAFE_EXCEPTION {
-            // The one crate that cannot take the workspace table, because that
-            // table forbids unsafe. It must still carry the rest of the set.
+        if UNSAFE_EXCEPTIONS.contains(&name) {
+            // A crate that cannot take the workspace table, because that table
+            // forbids unsafe. It must still carry the rest of the set.
             for lint in [
                 "missing_docs = \"deny\"",
                 "missing_debug_implementations = \"deny\"",
@@ -56,7 +65,7 @@ fn every_crate_opts_in_to_the_workspace_lints() {
 }
 
 #[test]
-fn only_one_crate_may_lift_the_ban_on_unsafe() {
+fn only_the_named_crates_may_lift_the_ban_on_unsafe() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crates directory");
@@ -66,7 +75,7 @@ fn only_one_crate_may_lift_the_ban_on_unsafe() {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("crate directory name");
-        if name == UNSAFE_EXCEPTION {
+        if UNSAFE_EXCEPTIONS.contains(&name) {
             continue;
         }
         let source = path.join("src");
@@ -77,7 +86,7 @@ fn only_one_crate_may_lift_the_ban_on_unsafe() {
             let text = std::fs::read_to_string(&file).expect("source is readable");
             assert!(
                 !text.contains("allow(unsafe_code)") && !text.contains("expect(unsafe_code)"),
-                "{} tries to lift the ban on unsafe; only {UNSAFE_EXCEPTION} may",
+                "{} tries to lift the ban on unsafe; only {UNSAFE_EXCEPTIONS:?} may",
                 file.display()
             );
         }

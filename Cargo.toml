@@ -31,7 +31,14 @@ quinn = { version = "0.11", default-features = false, features = [
   "log",
 ] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# The SHA-256 behind a certificate fingerprint. Named here rather than taken
+# through rustls, whose hash implementations are reachable only through a
+# cipher suite.
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Reads the subject public key info out of a peer certificate, which is what a
+# pin is taken over. Already in the tree as rustls' own certificate parser.
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 rustix = { version = "1.1", features = ["event", "fs", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
@@ -43,8 +50,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The GStreamer crates must move in lockstep; a mismatched pair fails to link.
 gstreamer = { version = "0.25", features = ["v1_26"] }
 gstreamer-allocators = { version = "0.25", features = ["v1_26"] }
-gstreamer-app = "0.25"
-gstreamer-video = "0.25"
+gstreamer-app = { version = "0.25", features = ["v1_26"] }
+gstreamer-video = { version = "0.25", features = ["v1_26"] }
 
 drm-fourcc = "2.2"
 gbm = { version = "0.18", default-features = false }

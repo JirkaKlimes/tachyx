@@ -353,6 +353,15 @@ impl Reassembler {
         self.stats
     }
 
+    /// When the earliest open frame gives up, if any frame is open.
+    ///
+    /// A receiver waits on this rather than on a fixed tick, so a session
+    /// watching a static screen costs no wakeups.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.open.values().map(|partial| partial.deadline).min()
+    }
+
     /// Takes one datagram, returning the access unit it completed.
     ///
     /// Runs [`Reassembler::expire`] first, so a caller that keeps feeding
