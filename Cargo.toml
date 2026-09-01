@@ -13,6 +13,7 @@ repository = "https://github.com/JirkaKlimes/tachyx"
 
 [workspace.dependencies]
 tachyx-client = { path = "crates/tachyx-client" }
+tachyx-congestion = { path = "crates/tachyx-congestion" }
 tachyx-dmabuf = { path = "crates/tachyx-dmabuf" }
 tachyx-driver = { path = "crates/tachyx-driver" }
 tachyx-glctx = { path = "crates/tachyx-glctx" }

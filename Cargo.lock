@@ -2382,6 +2382,7 @@ dependencies = [
  "rustls",
  "rustls-webpki",
  "serde",
+ "tachyx-congestion",
  "tachyx-proto",
  "thiserror 2.0.20",
  "tokio",

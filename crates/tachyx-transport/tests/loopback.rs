@@ -817,6 +817,7 @@ async fn a_key_frame_leaves_paced_and_a_delta_frame_leaves_at_once() {
     let link = Link::open("pacing", tuning, tuning);
     let (host, client) = link.sessions().await;
     let mut video = host.video;
+    let control = host.control;
 
     // Every datagram of the session, stamped as it arrives. Reading them raw
     // rather than through the reassembler is the point: what is being checked
@@ -838,14 +839,14 @@ async fn a_key_frame_leaves_paced_and_a_delta_frame_leaves_at_once() {
         let mut sent = Vec::new();
         // What the session configures the encoder for. The pacing rate is
         // derived from it and from the key frame the sender has measured.
-        video.set_target_bitrate(NonZeroU32::new(8_000_000).expect("nonzero"));
+        control.set_target_bitrate(NonZeroU32::new(8_000_000).expect("nonzero"));
         let paced = video.release_rate();
         // A key frame, then a delta frame, then the same key frame again with
         // the pacer set so far above what is being sent that it never engages,
         // which is what the transport did before it had one.
         for (id, key_interval) in [(0, 1), (1, 60), (2, 1)] {
             if id == 2 {
-                video.set_target_bitrate(NonZeroU32::MAX);
+                control.set_target_bitrate(NonZeroU32::MAX);
             }
             let started = Instant::now();
             let Sent::Queued { datagrams } = send_frame(&mut video, id, key_interval) else {

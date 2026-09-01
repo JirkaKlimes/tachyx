@@ -25,15 +25,28 @@
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::Connection;
+use tachyx_congestion::{ClusterId, Probe, Release, cluster_datagrams};
 use tachyx_proto::control::CodedSize;
-use tachyx_proto::media::{FrameKind, HEADER_LEN};
+use tachyx_proto::media::{FrameKind, HEADER_LEN, Seq};
 use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
 
 use crate::pace::{Pacer, rate_for};
+
+/// Release records held for the controller to read.
+///
+/// Three seconds of history at 20 Mbit/s is 5,289 datagrams, and the controller
+/// drains this every report and again on its own tick, so this is generous. A
+/// record that does not fit is dropped rather than blocking the send path, and
+/// the controller skips a datagram it has no record of, which is exactly what
+/// it does for one that has aged out.
+const RECORD_BACKLOG: usize = 8_192;
 
 /// Bytes of accounting quinn charges for each queued datagram, on top of its
 /// payload.
@@ -130,39 +143,118 @@ pub struct VideoSender {
     /// What the session is configured to send, in bits a second. The rate a
     /// picture is released at is derived from it and from that picture's own
     /// size on the wire.
-    target: NonZeroU32,
+    ///
+    /// Shared rather than owned, because this lives inside a blocking task for
+    /// the life of the session and the controller that moves it does not. Same
+    /// shape as `tachyx_media::Encoder::admission`, and for the same reason.
+    target: Arc<AtomicU32>,
     pacer: Pacer,
+    /// Where the record of each release goes, for the controller to match a
+    /// receiver report against.
+    records: SyncSender<Release>,
+    /// Clusters the controller has asked for.
+    probes: Receiver<Probe>,
+    armed: Option<Armed>,
     frames_sent: u64,
     frames_refused: u64,
+    padding_sent: u64,
+}
+
+/// A probe cluster part way through going out.
+#[derive(Debug, Clone, Copy)]
+struct Armed {
+    cluster: ClusterId,
+    rate: NonZeroU32,
+    left: usize,
+}
+
+/// What the congestion controller drives the send path through.
+///
+/// The path itself runs in a blocking task, because releasing a paced key frame
+/// takes tens of milliseconds of waiting, and the controller runs beside the
+/// rest of the session. Everything they have to say to each other crosses here:
+/// the rate to release at, the clusters to release above it, and the record of
+/// what actually went out and when.
+#[derive(Debug)]
+pub struct VideoControl {
+    target: Arc<AtomicU32>,
+    records: Receiver<Release>,
+    probes: SyncSender<Probe>,
+}
+
+impl VideoControl {
+    /// Sets the rate the pacer releases against, in bits a second.
+    ///
+    /// The transport does not decide this and cannot: it is the session's
+    /// operating point. What the transport does with it is release datagrams at
+    /// a multiple of it, so that pacing never becomes the bottleneck. See
+    /// [`crate::pace::rate_for`].
+    pub fn set_target_bitrate(&self, target: NonZeroU32) {
+        self.target.store(target.get(), Ordering::Relaxed);
+    }
+
+    /// Asks for a cluster to be released above the pacing rate.
+    ///
+    /// It goes out as the next picture if one is ready, which costs nothing at
+    /// all because the same bytes were leaving anyway, and as padding if none
+    /// is. Padding is the case that matters: a still desktop produces no frames
+    /// for seconds at a time, which is precisely when a probe is most needed.
+    ///
+    /// A probe offered while one is still going out is dropped: one cluster
+    /// measures the link and two overlapping ones measure each other.
+    pub fn probe(&self, probe: Probe) {
+        match self.probes.try_send(probe) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::debug!("the video path ended before a probe reached it");
+            }
+        }
+    }
+
+    /// Every datagram released since this was last called.
+    pub fn released(&self) -> impl Iterator<Item = Release> + '_ {
+        self.records.try_iter()
+    }
 }
 
 impl VideoSender {
     /// Starts sending on `connection`, whose outgoing datagram queue holds
     /// `buffer` bytes, for a session configured to send `target` bits a second.
     #[must_use]
-    pub fn new(connection: Connection, buffer: usize, target: NonZeroU32) -> Self {
-        Self {
-            connection,
-            packetiser: Packetiser::new(NOMINAL_PAYLOAD),
-            datagrams: Vec::new(),
-            buffer,
-            outstanding: VecDeque::new(),
-            key_frame_bytes: MEASURED_KEY_FRAME_BYTES,
-            target,
-            pacer: Pacer::new(rate_for(target, MEASURED_KEY_FRAME_BYTES), Instant::now()),
-            frames_sent: 0,
-            frames_refused: 0,
-        }
+    pub fn new(connection: Connection, buffer: usize, target: NonZeroU32) -> (Self, VideoControl) {
+        let shared = Arc::new(AtomicU32::new(target.get()));
+        let (records, drained) = sync_channel(RECORD_BACKLOG);
+        // One deep. A second cluster offered while the first is still going out
+        // would measure the first rather than the link.
+        let (asked, probes) = sync_channel(1);
+        (
+            Self {
+                connection,
+                packetiser: Packetiser::new(NOMINAL_PAYLOAD),
+                datagrams: Vec::new(),
+                buffer,
+                outstanding: VecDeque::new(),
+                key_frame_bytes: MEASURED_KEY_FRAME_BYTES,
+                target: Arc::clone(&shared),
+                pacer: Pacer::new(rate_for(target, MEASURED_KEY_FRAME_BYTES), Instant::now()),
+                records,
+                probes,
+                armed: None,
+                frames_sent: 0,
+                frames_refused: 0,
+                padding_sent: 0,
+            },
+            VideoControl {
+                target: shared,
+                records: drained,
+                probes: asked,
+            },
+        )
     }
 
-    /// Sets the bitrate the session is configured to send, in bits a second.
-    ///
-    /// The transport does not decide this and cannot: it is the encoder's
-    /// operating point, chosen by whatever policy runs the session. What the
-    /// transport does with it is release datagrams at a multiple of it, so that
-    /// pacing never becomes the bottleneck. See [`crate::pace::rate_for`].
-    pub const fn set_target_bitrate(&mut self, target: NonZeroU32) {
-        self.target = target;
+    /// The rate the session is configured to send at, in bits a second.
+    fn target(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.target.load(Ordering::Relaxed)).unwrap_or(NonZeroU32::MIN)
     }
 
     /// The rate the last picture was released at, in bits a second.
@@ -298,6 +390,12 @@ impl VideoSender {
         self.frames_refused
     }
 
+    /// Datagrams of padding released to time the path.
+    #[must_use]
+    pub const fn padding_sent(&self) -> u64 {
+        self.padding_sent
+    }
+
     /// The transport's own bandwidth estimate, in bits per second.
     ///
     /// The congestion controller applies to datagrams: they are
@@ -342,6 +440,7 @@ impl VideoSender {
     pub fn send(&mut self, unit: &AccessUnit<'_>) -> Result<Sent, VideoError> {
         let payload = self.payload_len().ok_or(VideoError::NoDatagrams)?;
         self.packetiser.set_payload_len(payload);
+        self.take_probe(payload);
         self.forget_sent();
         // The packetiser's count, not the picture's: parity is real bytes on
         // this same queue, and a gate that counted only the picture would
@@ -366,8 +465,15 @@ impl VideoSender {
         // parity and per-datagram headers included. Measured against the
         // encoded length instead, a key frame carrying parity is understated by
         // about a third and leaves over half as long again as intended.
-        self.pacer
-            .set_rate(rate_for(self.target, queue.iter().map(Vec::len).sum()));
+        //
+        // Unless a cluster is going out, in which case the picture *is* the
+        // cluster: the same bytes were leaving anyway and releasing them faster
+        // measures the link for nothing.
+        let weight = queue.iter().map(Vec::len).sum();
+        self.pacer.set_rate(
+            self.armed
+                .map_or_else(|| rate_for(self.target(), weight), |probe| probe.rate),
+        );
         let sent = self.release(&mut queue, datagrams);
         queue.clear();
         self.datagrams = queue;
@@ -382,6 +488,7 @@ impl VideoSender {
     fn release(&mut self, queue: &mut Vec<Vec<u8>>, datagrams: usize) -> Result<Sent, VideoError> {
         for datagram in queue.drain(..) {
             let queued = datagram.len();
+            let seq = seq_of(&datagram);
             let wait = self.pacer.release(queued, Instant::now());
             if !wait.is_zero() {
                 self.wait(wait)?;
@@ -390,8 +497,12 @@ impl VideoSender {
                 // is what keeps the gate exact for the next frame.
                 self.forget_sent();
             }
+            let at = Instant::now();
             match self.connection.send_datagram(Bytes::from(datagram)) {
-                Ok(()) => self.outstanding.push_back(queued),
+                Ok(()) => {
+                    self.outstanding.push_back(queued);
+                    self.record(seq, at, queued);
+                }
                 // The path's measured size can shrink underneath a frame: the
                 // transport lowers it from its own task when it decides a larger
                 // packet is being black-holed, and that lands mid-frame during
@@ -412,6 +523,92 @@ impl VideoSender {
         Ok(Sent::Queued { datagrams })
     }
 
+    /// Records one release for the controller, and counts it against whatever
+    /// cluster is going out.
+    ///
+    /// The time is taken after the datagram was handed over rather than before
+    /// the pacer's wait, because what the delay estimator needs is when the
+    /// datagram actually left. A send time taken at queue entry is a queue
+    /// entry time, and a delay estimate built on wrong send times is worse than
+    /// none.
+    fn record(&mut self, seq: Option<Seq>, at: Instant, wire: usize) {
+        let cluster = self.armed.and_then(|probe| {
+            let armed = self.armed.as_mut()?;
+            armed.left -= 1;
+            let cluster = probe.cluster;
+            if armed.left == 0 {
+                self.armed = None;
+            }
+            Some(cluster)
+        });
+        let Some(seq) = seq else { return };
+        let record = Release {
+            seq,
+            at,
+            wire: u16::try_from(wire).unwrap_or(u16::MAX),
+            cluster,
+        };
+        // A record that does not fit is dropped rather than blocking the send
+        // path. The controller skips a datagram it has no record of, which is
+        // what it does for one that has aged out.
+        if let Err(TrySendError::Full(_)) = self.records.try_send(record) {
+            tracing::debug!("a release record was dropped");
+        }
+    }
+
+    /// Arms whatever cluster the controller has asked for.
+    fn take_probe(&mut self, payload: NonZeroUsize) {
+        if self.armed.is_some() {
+            return;
+        }
+        if let Ok(probe) = self.probes.try_recv() {
+            self.armed = Some(Armed {
+                cluster: probe.cluster,
+                rate: probe.rate,
+                left: cluster_datagrams(probe.rate, payload.get() + HEADER_LEN),
+            });
+        }
+    }
+
+    /// Finishes an armed cluster with padding, when no picture came along to be
+    /// it.
+    ///
+    /// This is the case that matters rather than an afterthought: a desktop
+    /// nobody is touching produces no frames for seconds at a time, and a
+    /// controller that only ever learns from media never learns that the link
+    /// has recovered. A padding datagram carries the ordinary header with the
+    /// padding bit set and a payload of zeroes, and the only thing it takes
+    /// part in is the sequence accounting the receiver report is keyed on.
+    ///
+    /// # Errors
+    /// If the connection has ended, or the peer will not take datagrams.
+    pub fn pad(&mut self) -> Result<usize, VideoError> {
+        let payload = self.payload_len().ok_or(VideoError::NoDatagrams)?;
+        self.take_probe(payload);
+        self.forget_sent();
+        let Some(probe) = self.armed else {
+            return Ok(0);
+        };
+        if !self.can_send_frame(probe.left, payload.get()) {
+            self.armed = None;
+            return Ok(0);
+        }
+        self.pacer.set_rate(probe.rate);
+        let mut queue = std::mem::take(&mut self.datagrams);
+        queue.clear();
+        for _ in 0..probe.left {
+            queue.push(self.packetiser.padding(payload.get()));
+        }
+        let sent = queue.len();
+        let released = self.release(&mut queue, sent);
+        // Padding is not a picture, so it must not be counted as one.
+        self.frames_sent -= 1;
+        self.padding_sent += sent as u64;
+        queue.clear();
+        self.datagrams = queue;
+        released.map(|_| sent)
+    }
+
     /// Sleeps out a datagram's turn, in slices short enough that a connection
     /// which ends is noticed rather than slept through.
     ///
@@ -428,6 +625,16 @@ impl VideoSender {
         }
         Ok(())
     }
+}
+
+/// The sequence number a built datagram carries.
+///
+/// Read back out of the bytes rather than threaded alongside them, because the
+/// packetiser is what stamps it and there is one place it appears. Sixteen bits
+/// at a fixed offset is two loads.
+fn seq_of(datagram: &[u8]) -> Option<Seq> {
+    let bytes = datagram.get(8..10)?;
+    Some(Seq(u16::from_le_bytes([bytes[0], bytes[1]])))
 }
 
 /// Why video could not move.

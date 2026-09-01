@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tachyx-congestion.workspace = true
 tachyx-proto.workspace = true
 bytes.workspace = true
 postcard.workspace = true

@@ -11,7 +11,7 @@ use tachyx_proto::control::{ClientHello, HostHello};
 
 use crate::control::{ControlError, ControlReader, ControlWriter};
 use crate::identity::{HostIdentity, IdentityError, PinStore, PinnedServer};
-use crate::video::VideoSender;
+use crate::video::{VideoControl, VideoSender};
 
 /// The application protocol both ends announce.
 ///
@@ -154,21 +154,23 @@ impl Host {
                 return Err(refused.into());
             }
         };
+        // The ceiling the client announced, until the session says what it
+        // actually configured the encoder for. It is an over-estimate of the
+        // real operating point, which is the safe direction: pacing above what
+        // is being sent costs nothing, and pacing below it would throttle the
+        // encoder from inside the transport.
+        let (video, control) = VideoSender::new(
+            connection.clone(),
+            self.tuning.video_buffer,
+            hello.capabilities.bitrate_ceiling,
+        );
         Ok(HostSession {
-            // The ceiling the client announced, until the session says what it
-            // actually configured the encoder for. It is an over-estimate of
-            // the real operating point, which is the safe direction: pacing
-            // above what is being sent costs nothing, and pacing below it would
-            // throttle the encoder from inside the transport.
-            video: VideoSender::new(
-                connection.clone(),
-                self.tuning.video_buffer,
-                hello.capabilities.bitrate_ceiling,
-            ),
+            connection,
+            hello,
+            video,
+            control,
             to_client,
             from_client,
-            hello,
-            connection,
         })
     }
 
@@ -202,7 +204,12 @@ pub struct HostSession {
     /// What the client said it can decode.
     pub hello: ClientHello,
     /// Encoded pictures out.
+    ///
+    /// Moved into a thread of its own for the life of the session, because
+    /// releasing a paced key frame is tens of milliseconds of waiting.
     pub video: VideoSender,
+    /// What the congestion controller drives that thread through.
+    pub control: VideoControl,
     /// Stream configuration and heartbeats out.
     pub to_client: ControlWriter,
     /// Input and key frame requests in.
