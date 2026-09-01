@@ -35,6 +35,13 @@ quinn = { version = "0.11", default-features = false, features = [
   "log",
 ] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# Parity for the video path. Chosen over `reed-solomon-erasure`, which was last
+# released in 2022 and multiplies over GF(2^8) a byte at a time: at the 92 data
+# and 18 parity shards of a 1080p key frame that is 2.3 MB of table lookups per
+# frame. This one is an O(n log n) Leopard-RS coder over GF(2^16) with AVX2,
+# SSSE3 and NEON back ends, released 2025-10, and it keeps its `unsafe` inside
+# itself, so `tachyx-proto` stays `forbid(unsafe_code)`.
+reed-solomon-simd = { version = "3.1", default-features = false, features = ["std"] }
 # The SHA-256 behind a certificate fingerprint. Named here rather than taken
 # through rustls, whose hash implementations are reachable only through a
 # cipher suite.

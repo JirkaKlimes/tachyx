@@ -90,7 +90,8 @@ impl Fragment {
     }
 
     /// Describes packet `index` of `count`, rejecting an index outside the count.
-    const fn checked(index: u16, count: NonZeroU16) -> Option<Self> {
+    #[must_use]
+    pub const fn checked(index: u16, count: NonZeroU16) -> Option<Self> {
         if index < count.get() {
             Some(Self { count, index })
         } else {
@@ -122,6 +123,36 @@ pub enum FrameKind {
     Key,
     /// Depends on earlier frames.
     Delta,
+}
+
+/// Which slice of a frame a picture packet carries.
+///
+/// The identifier is one byte and 255 of it names a parity packet rather than a
+/// slice, so a picture cannot be given that value in the first place. That is
+/// the whole of how the two kinds of datagram are told apart: a receiver reads
+/// one byte at a fixed offset and knows which of the two headers it is holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SliceId(u8);
+
+impl SliceId {
+    /// The identifier that marks a parity packet instead of a slice.
+    pub const PARITY: u8 = 255;
+
+    /// Names a slice, rejecting the identifier parity has taken.
+    #[must_use]
+    pub const fn new(id: u8) -> Option<Self> {
+        if id == Self::PARITY {
+            None
+        } else {
+            Some(Self(id))
+        }
+    }
+
+    /// The identifier as it appears on the wire.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
 }
 
 /// A datagram sequence number, counted over the whole session rather than per
@@ -181,16 +212,26 @@ impl Seq {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FrameId(pub u32);
 
-/// The header carried by every video datagram.
+/// What a video datagram carries for its frame.
+///
+/// The two are told apart by the slice identifier alone: [`SliceId::PARITY`]
+/// means parity, anything else means picture. The parity header reuses the four
+/// bytes a picture packet spends on its capture time, because a repair has no
+/// capture time of its own, and reuses the fragment count and index for its own
+/// count and index, because the invariant is the same one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PacketHeader {
-    /// Which frame this packet belongs to. The reassembly key, and what a
-    /// recovery request names.
-    pub frame: FrameId,
+pub enum Role {
+    /// A fragment of one slice of the picture.
+    Picture(PictureHeader),
+    /// One parity shard, repairing the frame's picture datagrams.
+    Parity(ParityHeader),
+}
+
+/// What a picture packet says beyond [`PacketHeader`]'s common fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PictureHeader {
     /// When the frame was captured.
     pub capture: Timestamp,
-    /// Position in the session-wide datagram sequence.
-    pub seq: Seq,
     /// Which packet of the slice this is.
     pub fragment: Fragment,
     /// Which slice of the frame this packet belongs to.
@@ -199,11 +240,47 @@ pub struct PacketHeader {
     /// picture rather than the whole frame. There is deliberately no field
     /// counting the slices in a frame: `last_slice` supplies that, which lets the
     /// host send slice zero while slice one is still being encoded.
-    pub slice: u8,
-    /// Whether the frame stands alone.
-    pub kind: FrameKind,
+    pub slice: SliceId,
     /// Whether this is the final slice of the frame.
     pub last_slice: bool,
+}
+
+/// What a parity packet says beyond [`PacketHeader`]'s common fields.
+///
+/// Between them these size the whole coding block, so a receiver holding one
+/// parity packet and some of the picture knows exactly what to hand a decoder.
+/// The shard length is not a field: every shard is the same size and this
+/// packet carries one, so the datagram's own payload length is the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParityHeader {
+    /// Picture datagrams the frame was cut into, which is how many shards a
+    /// decoder needs in total, from either kind, to rebuild it.
+    pub data_shards: NonZeroU16,
+    /// Video bytes in the frame's final picture datagram.
+    ///
+    /// Every other one is a full shard, so this is the only thing standing
+    /// between the shard count and the frame's exact length. Without it a
+    /// rebuilt final shard would carry its zero padding into the bitstream.
+    pub tail: NonZeroU16,
+    /// Which parity shard this is, of how many the frame carries.
+    pub shard: Fragment,
+}
+
+/// The header carried by every video datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketHeader {
+    /// Which frame this packet belongs to. The reassembly key, and what a
+    /// recovery request names.
+    pub frame: FrameId,
+    /// Position in the session-wide datagram sequence.
+    ///
+    /// Parity packets are counted in it like any other, because they cost the
+    /// path the same bytes and their loss is the same evidence about it.
+    pub seq: Seq,
+    /// Whether the frame stands alone.
+    pub kind: FrameKind,
+    /// Picture or repair, and what each needs to say.
+    pub role: Role,
 }
 
 impl PacketHeader {
@@ -218,27 +295,39 @@ impl PacketHeader {
         if matches!(self.kind, FrameKind::Key) {
             flags |= Self::FLAG_KEY;
         }
-        if self.last_slice {
-            flags |= Self::FLAG_LAST_SLICE;
-        }
         head[0..4].copy_from_slice(&self.frame.0.to_le_bytes());
-        head[4..8].copy_from_slice(&self.capture.0.to_le_bytes());
         head[8..10].copy_from_slice(&self.seq.0.to_le_bytes());
-        head[10..12].copy_from_slice(&self.fragment.count.get().to_le_bytes());
-        head[12..14].copy_from_slice(&self.fragment.index.to_le_bytes());
-        head[14] = self.slice;
+        let fragment = match self.role {
+            Role::Picture(picture) => {
+                if picture.last_slice {
+                    flags |= Self::FLAG_LAST_SLICE;
+                }
+                head[4..8].copy_from_slice(&picture.capture.0.to_le_bytes());
+                head[14] = picture.slice.get();
+                picture.fragment
+            }
+            Role::Parity(parity) => {
+                head[4..6].copy_from_slice(&parity.data_shards.get().to_le_bytes());
+                head[6..8].copy_from_slice(&parity.tail.get().to_le_bytes());
+                head[14] = SliceId::PARITY;
+                parity.shard
+            }
+        };
+        head[10..12].copy_from_slice(&fragment.count.get().to_le_bytes());
+        head[12..14].copy_from_slice(&fragment.index.to_le_bytes());
         head[15] = flags;
         head
     }
 
-    /// Splits a received datagram into its header and its video payload.
+    /// Splits a received datagram into its header and its payload.
     ///
     /// Unknown flag bits are ignored rather than rejected, so a later version can
     /// use them without this version discarding the packet.
     ///
     /// # Errors
-    /// If the datagram is too short to hold a header, carries no payload, or
-    /// describes a fragment whose index falls outside its count.
+    /// If the datagram is too short to hold a header, carries no payload,
+    /// describes a fragment whose index falls outside its count, or is a parity
+    /// packet describing a coding block no decoder could be given.
     pub fn parse(datagram: &[u8]) -> Result<(Self, &[u8]), MalformedPacket> {
         let (head, payload) = datagram
             .split_at_checked(HEADER_LEN)
@@ -251,23 +340,52 @@ impl PacketHeader {
         let index = u16::from_le_bytes([head[12], head[13]]);
         let fragment = Fragment::checked(index, count).ok_or(MalformedPacket::IndexOutOfRange)?;
         let flags = head[15];
+        let role = match SliceId::new(head[14]) {
+            Some(slice) => Role::Picture(PictureHeader {
+                capture: Timestamp(u32::from_le_bytes([head[4], head[5], head[6], head[7]])),
+                fragment,
+                slice,
+                last_slice: flags & Self::FLAG_LAST_SLICE != 0,
+            }),
+            None => Role::Parity(parity(head, payload, fragment)?),
+        };
         Ok((
             Self {
                 frame: FrameId(u32::from_le_bytes([head[0], head[1], head[2], head[3]])),
-                capture: Timestamp(u32::from_le_bytes([head[4], head[5], head[6], head[7]])),
                 seq: Seq(u16::from_le_bytes([head[8], head[9]])),
-                fragment,
-                slice: head[14],
                 kind: if flags & Self::FLAG_KEY == 0 {
                     FrameKind::Delta
                 } else {
                     FrameKind::Key
                 },
-                last_slice: flags & Self::FLAG_LAST_SLICE != 0,
+                role,
             },
             payload,
         ))
     }
+}
+
+/// Reads the parity half of a header, rejecting anything a decoder could not be
+/// given.
+///
+/// Validated here rather than at the reassembler so that everything past this
+/// point can treat a [`ParityHeader`] as describing a real coding block.
+fn parity(head: &[u8], payload: &[u8], shard: Fragment) -> Result<ParityHeader, MalformedPacket> {
+    if !payload.len().is_multiple_of(2) {
+        return Err(MalformedPacket::OddShard);
+    }
+    let data_shards = NonZeroU16::new(u16::from_le_bytes([head[4], head[5]]))
+        .ok_or(MalformedPacket::NoDataShards)?;
+    let tail = NonZeroU16::new(u16::from_le_bytes([head[6], head[7]]))
+        .ok_or(MalformedPacket::EmptyTail)?;
+    if usize::from(tail.get()) > payload.len() {
+        return Err(MalformedPacket::TailPastShard);
+    }
+    Ok(ParityHeader {
+        data_shards,
+        tail,
+        shard,
+    })
 }
 
 /// Why a received datagram could not be a video packet.
@@ -285,24 +403,53 @@ pub enum MalformedPacket {
     /// A packet index outside the slice it claims to belong to.
     #[error("packet index falls outside its slice")]
     IndexOutOfRange,
+    /// A parity shard of an odd length. The coder works two bytes at a time, so
+    /// no shard it ever produced can be one.
+    #[error("parity shard holds an odd number of bytes")]
+    OddShard,
+    /// A parity packet repairing a frame with no picture datagrams.
+    #[error("parity claims to repair a frame of no packets")]
+    NoDataShards,
+    /// A parity packet claiming the frame's last picture datagram is empty.
+    #[error("parity claims an empty final packet")]
+    EmptyTail,
+    /// A final picture datagram claimed longer than a shard.
+    #[error("parity claims a final packet longer than a shard")]
+    TailPastShard,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fragment(index: u16, count: u16) -> Fragment {
+        Fragment::checked(index, NonZeroU16::new(count).unwrap()).expect("index inside count")
+    }
+
     fn header() -> PacketHeader {
         PacketHeader {
             frame: FrameId(0x0123_4567),
-            capture: Timestamp::from_session_micros(9_999_900),
             seq: Seq(0xBEEF),
-            fragment: Fragment::split(7 * 100, NonZeroUsize::new(100).unwrap())
-                .nth(2)
-                .expect("seven packets exist")
-                .0,
-            slice: 3,
             kind: FrameKind::Key,
-            last_slice: true,
+            role: Role::Picture(PictureHeader {
+                capture: Timestamp::from_session_micros(9_999_900),
+                fragment: fragment(2, 7),
+                slice: SliceId::new(3).expect("not the parity identifier"),
+                last_slice: true,
+            }),
+        }
+    }
+
+    fn parity_header() -> PacketHeader {
+        PacketHeader {
+            frame: FrameId(0x0123_4567),
+            seq: Seq(0xBEEF),
+            kind: FrameKind::Key,
+            role: Role::Parity(ParityHeader {
+                data_shards: NonZeroU16::new(92).unwrap(),
+                tail: NonZeroU16::new(4).unwrap(),
+                shard: fragment(5, 18),
+            }),
         }
     }
 
@@ -316,13 +463,79 @@ mod tests {
     }
 
     #[test]
+    fn a_parity_header_survives_a_round_trip() {
+        let mut buf = parity_header().to_bytes().to_vec();
+        buf.extend_from_slice(b"shard!!!");
+        let (parsed, payload) = PacketHeader::parse(&buf).unwrap();
+        assert_eq!(parsed, parity_header());
+        assert_eq!(payload, b"shard!!!");
+        assert_eq!(buf[14], SliceId::PARITY);
+        assert_eq!(
+            buf.len() - HEADER_LEN,
+            8,
+            "the shard length is the payload's"
+        );
+    }
+
+    #[test]
+    fn the_two_roles_never_collide() {
+        assert!(SliceId::new(SliceId::PARITY).is_none());
+        assert_eq!(
+            SliceId::new(254).map(SliceId::get),
+            Some(254),
+            "a picture may use every identifier below the reserved one"
+        );
+    }
+
+    #[test]
     fn unknown_flag_bits_do_not_reject_a_packet() {
         let mut buf = header().to_bytes().to_vec();
         buf[15] |= 0b1111_1100;
         buf.push(1);
         let (parsed, _) = PacketHeader::parse(&buf).expect("later versions may set spare bits");
         assert_eq!(parsed.kind, FrameKind::Key);
-        assert!(parsed.last_slice);
+        assert!(matches!(
+            parsed.role,
+            Role::Picture(PictureHeader {
+                last_slice: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn malformed_parity_is_named() {
+        let sound = {
+            let mut b = parity_header().to_bytes().to_vec();
+            b.extend_from_slice(b"shard!!!");
+            b
+        };
+        assert!(PacketHeader::parse(&sound).is_ok());
+
+        let mut odd = sound.clone();
+        odd.push(0);
+        assert_eq!(PacketHeader::parse(&odd), Err(MalformedPacket::OddShard));
+
+        let mut no_data = sound.clone();
+        no_data[4..6].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            PacketHeader::parse(&no_data),
+            Err(MalformedPacket::NoDataShards)
+        );
+
+        let mut no_tail = sound.clone();
+        no_tail[6..8].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            PacketHeader::parse(&no_tail),
+            Err(MalformedPacket::EmptyTail)
+        );
+
+        let mut long_tail = sound;
+        long_tail[6..8].copy_from_slice(&9u16.to_le_bytes());
+        assert_eq!(
+            PacketHeader::parse(&long_tail),
+            Err(MalformedPacket::TailPastShard)
+        );
     }
 
     #[test]

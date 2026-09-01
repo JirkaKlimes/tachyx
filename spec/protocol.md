@@ -1,8 +1,12 @@
-# tachyx wire protocol — draft 0
+# tachyx wire protocol — draft 1
 
 Status: draft. Covers only what the current milestone implements: one client, one
 host, one LAN. Pairing, authentication and relaying are specified elsewhere when
 they exist.
+
+Draft 1 defines `slice_id` 255, which draft 0 reserved. A draft 0 client reads a
+parity packet as a slice of the picture and then completes no frame at all, so
+the version had to move rather than the field being added quietly.
 
 ## Transport
 
@@ -251,18 +255,96 @@ auditing, the layout is specified here rather than derived from a Rust type.
 
 All fields are little-endian.
 
+A datagram carries either a piece of the picture or a piece of the parity that
+repairs it, and `slice_id` says which. 255 means parity; anything else is a
+slice of the picture. That byte is read at a fixed offset before anything that
+depends on it, so telling the two apart costs one comparison.
+
+Four fields mean the same thing in both:
+
 | Offset | Size | Field | Purpose |
 |---|---|---|---|
 | 0 | 4 | `frame_id` | Reassembly key, and what a recovery request names. Counts encoded pictures and skips none. |
+| 8 | 2 | `seq` | Session-wide datagram counter, so a gap is visible across a frame boundary. Compared circularly, in the manner of RFC 1982. Parity packets are counted in it like any other: they cost the path the same bytes and their loss is the same evidence about it. |
+| 14 | 1 | `slice_id` | Which slice of the frame, or 255 for parity. |
+| 15 | 1 | `flags` | Bit 0 marks a key frame, bit 1 the frame's last slice, bit 2 padding. The rest are spare and a receiver must ignore them. Bit 1 is meaningless on a parity packet. |
+
+A picture packet, `slice_id` under 255:
+
+| Offset | Size | Field | Purpose |
+|---|---|---|---|
 | 4 | 4 | `capture` | When the frame was captured, in units of 100 microseconds since the session began. |
-| 8 | 2 | `seq` | Session-wide datagram counter, so a gap is visible across a frame boundary. Compared circularly, in the manner of RFC 1982. |
 | 10 | 2 | `slice_pkts` | Packets in this slice. Every packet carries it, so any one of them can size the reassembly buffer. |
 | 12 | 2 | `pkt_idx` | This packet's position in the slice. |
-| 14 | 1 | `slice_id` | Which slice of the frame. |
-| 15 | 1 | `flags` | Bit 0 marks a key frame, bit 1 the frame's last slice, bit 2 padding. The rest are spare and a receiver must ignore them. |
+
+A parity packet, `slice_id` 255:
+
+| Offset | Size | Field | Purpose |
+|---|---|---|---|
+| 4 | 2 | `data_shards` | Picture datagrams the frame was cut into, which is how many shards of either kind a decoder needs to rebuild it. |
+| 6 | 2 | `tail` | Video bytes in the frame's final picture datagram. |
+| 10 | 2 | `parity_shards` | Parity packets the frame carries. |
+| 12 | 2 | `parity_idx` | This packet's position among them. |
 
 The payload follows immediately. At the 1434-byte datagram this transport reaches
 on a 1500-byte path, that leaves 1418 bytes of video, or 94.5% of the wire frame.
+A parity payload is one shard and is exactly as wide as a full picture payload,
+so the shard length needs no field of its own: the datagram's own length is the
+answer, and the packetiser rounds the payload down to an even number of bytes
+because the coder works two bytes at a time.
+
+### Forward error correction
+
+Parity is Reed-Solomon over the frame's own picture datagrams, in send order.
+Shard `i` is datagram `i` padded with zeroes to the payload width, and the coder
+produces `parity_shards` more of the same width. Any `data_shards` of the
+`data_shards + parity_shards` rebuild the frame.
+
+Three fields is everything a receiver needs and they fit the sixteen bytes that
+were already there, because a repair has no capture time of its own and the four
+bytes a picture spends on one are free. `parity_shards` and `parity_idx` sit
+where `slice_pkts` and `pkt_idx` sit, and mean the same thing about a different
+group, so the check that an index falls inside its count is one piece of code
+for both.
+
+Two rules follow from that reuse and both are deliberate.
+
+**A parity packet never opens a frame.** A frame of which no picture datagram
+arrived would need more parity than picture to rebuild, which no parity level
+this system sets ever reaches, so such a frame is lost either way. Keeping the
+rule means the capture time and the key-frame flag are always the picture's to
+state and never have to travel on a repair.
+
+**A frame that carries parity has exactly one slice.** Parity indexes the
+frame's datagrams in send order, and only one slice makes that index recoverable
+from `pkt_idx` alone; with two, a receiver would have to know each slice's own
+fragment count to place a rebuilt shard, and there is no room to say so. The
+encoder is configured for one slice and [`findings.md`](findings.md) recommends
+firmly against more, so a multi-slice frame simply goes out unprotected.
+
+Parity is generated after the picture and sent behind it, which has one visible
+consequence: a frame that arrives whole is delivered by its last picture
+datagram, and its parity lands after the frame has already been decided. A
+receiver counts that parity and discards it, and must not count it as a late
+packet, or a perfect link reports a fifth of its datagrams late.
+
+Recovery is attempted only when a frame is already known to be damaged and its
+reorder window has elapsed, or a later frame has overtaken it. A stream losing
+nothing never runs the decoder at all.
+
+How much parity a frame carries is the sender's choice and is not announced:
+every parity packet says what its own frame's block is, which is all a receiver
+reads. The rule the host applies is a percentage of the frame's datagram count,
+rounded up, raised by half for a key frame, with a floor of 5% and a ceiling of
+50%. At the 2.79% loss measured in [`findings.md`](findings.md) that is 20% on a
+delta frame and 30% on a key frame, and the measurement there puts the stream at
+99.9% of frames delivered for **less** total bandwidth than the
+key-frame-on-demand recovery it replaces.
+
+The level is meant to follow measured loss, and the receiver report in
+[`congestion.md`](congestion.md) is where that measurement will come from. That
+message does not exist yet, so a session runs at the measured level and the
+level is a settable parameter for the congestion work to drive.
 
 ### The frame identifier counts encoded pictures, and skips none
 
@@ -332,6 +414,7 @@ A receiver counts its sequence number, records its arrival for the next
 Sequence accounting is the only thing padding takes part in, and it is the only
 thing it is for.
 
-`slice_id` 255 and the remaining spare flag bits are reserved for forward error
-correction, which is not implemented. On a local network a retransmission costs
-about a millisecond, which is cheaper than paying for parity on every frame.
+`slice_id` 255 is what forward error correction took, and it is specified above.
+The spare flag bits were not needed: one byte at a fixed offset separates the
+two kinds of datagram, and a second marker saying the same thing would be a
+second thing to get wrong. They stay spare.

@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 postcard.workspace = true
+reed-solomon-simd.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

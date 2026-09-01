@@ -23,4 +23,10 @@ pub mod packet;
 ///
 /// A client and a host are updated independently, so the first message of a
 /// session carries this and a mismatch ends the session with a clear reason.
-pub const VERSION: u16 = 0;
+///
+/// Raised to 1 by forward error correction. A host that carries parity sends
+/// datagrams with `slice_id` 255, which draft 0 reserved but did not define: a
+/// draft 0 client reads one as a slice of the picture, waits for a slice 255
+/// that never fills, and completes no frame at all. That is exactly the failure
+/// this field exists to turn into a named refusal.
+pub const VERSION: u16 = 1;

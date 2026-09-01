@@ -27,7 +27,7 @@ use tachyx_proto::control::{
 };
 use tachyx_proto::input::{InputEvent, PointerButton, Press};
 use tachyx_proto::media::{FrameId, FrameKind, Timestamp};
-use tachyx_proto::packet::{AccessUnit, Packetiser};
+use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
 use tachyx_transport::{ControlWriter, Host, HostIdentity, HostSession, Tuning};
 
 /// A 1080p60 key frame out of `vah264enc`, measured on the target machine.
@@ -397,6 +397,10 @@ fn a_frame_the_wire_ate_earns_one_key_frame_request() {
                 .expect("a live stream");
             let payload = host.video.payload_len().expect("the handshake has settled");
             let mut packetiser = Packetiser::new(payload);
+            // No parity, because what is under test is the request a hole
+            // earns. With parity this hole is repaired and nothing is asked
+            // for, which is the point of parity and not of this test.
+            packetiser.set_parity(Parity::fixed(0));
 
             // Sent by hand rather than through the sender, because what is under
             // test is a datagram that never arrives, and the sender has no way
@@ -490,15 +494,19 @@ fn a_host_of_another_version_is_named_and_not_misparsed() {
         .dial(&decoder)
         .expect_err("a host of another version is not a session");
     let said = refused.to_string();
+    let theirs = VERSION + 7;
     assert!(
-        said.contains("protocol version 7"),
+        said.contains(&format!("protocol version {theirs}")),
         "the client must be able to show this to a user, and got {said}"
     );
 }
 
 #[test]
 fn a_refusal_reaches_the_client_as_the_close_reason() {
-    const REASON: &str = "peer speaks protocol version 7, this build speaks 0";
+    let reason = format!(
+        "peer speaks protocol version {}, this build speaks {VERSION}",
+        VERSION + 7
+    );
 
     let loopback = Loopback::raw("refusal", |host, report| {
         Box::pin(async move {
@@ -508,7 +516,11 @@ fn a_refusal_reaches_the_client_as_the_close_reason() {
             // The measured case: closing discards stream data the peer has not
             // acknowledged, so a refused client usually never sees the greeting
             // and reads the reason off the close instead.
-            connection.close(quinn::VarInt::from_u32(1), REASON.as_bytes());
+            let spoken = format!(
+                "peer speaks protocol version {}, this build speaks {VERSION}",
+                VERSION + 7
+            );
+            connection.close(quinn::VarInt::from_u32(1), spoken.as_bytes());
             // Held until quinn has put the closing frame on the wire. Letting
             // the runtime die here instead would take the socket with it and the
             // client would learn only that the host had gone quiet.
@@ -523,7 +535,7 @@ fn a_refusal_reaches_the_client_as_the_close_reason() {
         .expect_err("a host that closes is not a session");
     let said = refused.to_string();
     assert!(
-        said.contains(REASON),
+        said.contains(&reason),
         "the host's own words must reach the user, and got {said}"
     );
 }

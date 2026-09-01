@@ -137,6 +137,7 @@ pub struct Session {
     outgoing: VecDeque<ClientMessage>,
     input: InputQueue,
     video: Reassembler,
+    pictures: VecDeque<Frame>,
     decoded: Option<FrameId>,
     ask_again_at: Instant,
     heard: Instant,
@@ -157,6 +158,7 @@ impl Session {
             outgoing: VecDeque::new(),
             input: InputQueue::new(),
             video: Reassembler::new(FRAME_DEADLINE),
+            pictures: VecDeque::new(),
             decoded: None,
             // The reassembler starts wanting a key frame and the host starts by
             // sending one, so asking inside the first gap would be noise. Asking
@@ -235,22 +237,38 @@ impl Session {
         }
     }
 
-    /// Takes one video datagram, returning the picture it completed.
+    /// Takes one video datagram.
+    ///
+    /// Whatever it completed, or the parity behind it rebuilt, comes out of
+    /// [`Session::pop_frame`]. One datagram can finish more than one picture,
+    /// so a caller drains rather than reading a single return.
     ///
     /// # Errors
     /// If the datagram is not a video packet.
-    pub fn datagram(
-        &mut self,
-        datagram: &[u8],
-        now: Instant,
-    ) -> Result<Option<Frame>, MalformedPacket> {
-        let frame = self.video.push(datagram, now)?;
-        if let Some(frame) = &frame {
+    pub fn datagram(&mut self, datagram: &[u8], now: Instant) -> Result<(), MalformedPacket> {
+        self.video.push(datagram, now)?;
+        self.collect(now);
+        self.request_key_if_needed(now);
+        Ok(())
+    }
+
+    /// The next picture ready to decode, in frame order.
+    ///
+    /// Drained after every [`Session::datagram`] and every [`Session::expire`].
+    /// A picture the caller never takes is still a picture that arrived, so
+    /// liveness and the identifier a key frame request names are settled when
+    /// the picture is finished rather than when it is taken.
+    pub fn pop_frame(&mut self) -> Option<Frame> {
+        self.pictures.pop_front()
+    }
+
+    /// Takes everything reassembly has finished, and records that it arrived.
+    fn collect(&mut self, now: Instant) {
+        while let Some(frame) = self.video.pop() {
             self.decoded = Some(frame.id);
             self.saw = Some(now);
+            self.pictures.push_back(frame);
         }
-        self.request_key_if_needed(now);
-        Ok(frame)
     }
 
     /// When the session next has something to do without being spoken to.
@@ -275,6 +293,7 @@ impl Session {
     /// Gives up on frames whose wait has run out.
     pub fn expire(&mut self, now: Instant) {
         self.video.expire(now);
+        self.collect(now);
         self.request_key_if_needed(now);
     }
 
@@ -353,7 +372,7 @@ mod tests {
     use tachyx_proto::control::{Aspect, Codec, CodedSize};
     use tachyx_proto::input::{PointerButton, Press};
     use tachyx_proto::media::FrameKind;
-    use tachyx_proto::packet::{AccessUnit, Packetiser};
+    use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
 
     use super::*;
 
@@ -378,6 +397,15 @@ mod tests {
             framerate: NonZeroU16::new(120).expect("nonzero"),
             bitrate: NonZeroU32::new(25_000_000).expect("nonzero"),
         }
+    }
+
+    /// A host that sends no parity, because these tests induce loss by
+    /// removing the last datagram of a picture and parity would repair it. The
+    /// repair itself is tested where it lives, in `tachyx_proto::packet`.
+    fn bare_packetiser() -> Packetiser {
+        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        packetiser.set_parity(Parity::fixed(0));
+        packetiser
     }
 
     fn queued(session: &mut Session) -> Vec<ClientMessage> {
@@ -539,16 +567,16 @@ mod tests {
     #[test]
     fn a_whole_picture_comes_back_out_of_its_datagrams() {
         let mut session = session();
-        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let mut packetiser = bare_packetiser();
         let payload = payload();
 
-        let mut delivered = None;
+        let now = Instant::now();
         for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload) {
-            delivered = session
-                .datagram(&datagram, Instant::now())
-                .expect("a video packet");
+            session.datagram(&datagram, now).expect("a video packet");
         }
-        let frame = delivered.expect("the last datagram completes the picture");
+        let frame = session
+            .pop_frame()
+            .expect("the last datagram completes the picture");
         assert_eq!(frame.id, FrameId(0));
         assert_eq!(frame.kind, FrameKind::Key);
         assert_eq!(frame.data, payload);
@@ -564,7 +592,7 @@ mod tests {
     fn loss_asks_for_one_key_frame_and_not_one_per_packet() {
         let opened = Instant::now();
         let mut session = Session::new(caps(), opened);
-        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let mut packetiser = bare_packetiser();
         let payload = payload();
         // The opening key frame arrives inside the gap the session opens with,
         // where the one the host sends unasked is waited for rather than asked
@@ -610,11 +638,13 @@ mod tests {
 
         // The key frame that answers it arms the next request without sending
         // one.
-        let mut recovered = None;
         for datagram in picture(&mut packetiser, 3, FrameKind::Key, &payload) {
-            recovered = session.datagram(&datagram, now).expect("a video packet");
+            session.datagram(&datagram, now).expect("a video packet");
         }
-        assert!(recovered.is_some(), "the key frame ends the outage");
+        assert!(
+            session.pop_frame().is_some(),
+            "the key frame ends the outage"
+        );
         assert_eq!(session.poll_control(), None, "recovery is not a request");
     }
 
@@ -627,7 +657,7 @@ mod tests {
         // decision.
         let opened = Instant::now();
         let mut session = Session::new(caps(), opened);
-        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let mut packetiser = bare_packetiser();
         let payload = payload();
         for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload) {
             session.datagram(&datagram, opened).expect("a video packet");
@@ -669,7 +699,7 @@ mod tests {
         // what has to carry the retry.
         let opened = Instant::now();
         let mut session = Session::new(caps(), opened);
-        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let mut packetiser = bare_packetiser();
         let payload = payload();
         let start = opened + KEYFRAME_REQUEST_GAP;
 
@@ -702,7 +732,7 @@ mod tests {
     fn a_link_that_breaks_repeatedly_cannot_spam_the_host() {
         let opened = Instant::now();
         let mut session = Session::new(caps(), opened);
-        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let mut packetiser = bare_packetiser();
         let payload = payload();
         let start = opened + KEYFRAME_REQUEST_GAP;
         let mut id = 0;
@@ -743,7 +773,7 @@ mod tests {
         let mut session = Session::new(caps(), start);
         assert_eq!(session.liveness(start), Liveness::Idle);
 
-        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let mut packetiser = bare_packetiser();
         for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload()) {
             session.datagram(&datagram, start).expect("a video packet");
         }

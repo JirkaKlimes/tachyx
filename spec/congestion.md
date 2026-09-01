@@ -723,9 +723,11 @@ every frame after it until the next key frame. Lowering the rate lowers how
 often that happens; it does not change what happens when it does. The twelve
 undecodable frames in the failed session came from post-encode drops and are
 fixed by moving the drop ahead of the encoder. The ones that come from real wire
-loss are not fixed by anything in this document. Forward error correction is
-reserved in the header and not implemented, intra refresh and long-term
-reference frames are unreachable on this hardware, and more slices measured
+loss are not fixed by anything in this document. They are fixed by the parity in
+[`protocol.md`](protocol.md), which is a separate mechanism with its own
+bandwidth cost: the controller's target has to cover the parity as well as the
+picture, because both go on the same queue. Intra refresh and long-term
+reference frames remain unreachable on this hardware, and more slices measured
 slower.
 
 It does not escape the key frame tax. Every change to the operating point costs

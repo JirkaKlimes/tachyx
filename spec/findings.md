@@ -578,6 +578,12 @@ both defaults compiles both. The provider is selected explicitly, and with quinn
 on `rustls-ring` and rustls on `ring` the resolved lockfile contains no
 `aws-lc-rs` at all.
 
+**Superseded.** The paragraph below was written from loopback measurements and
+its premise is gone. See "Loss resilience, re-derived for this link" further
+down: the round trip on the real link is 13.91 ms, an unprotected key frame
+arrives intact seven times in a hundred, and parity is now carried on every
+frame. Recovery on demand stays as the backstop for what parity cannot cover.
+
 Recovery is on demand rather than by forward error correction. Video datagrams are
 never retransmitted, and neither intra-refresh nor long-term reference frames are
 reachable on this hardware, so what recovery means here is exactly one thing: the

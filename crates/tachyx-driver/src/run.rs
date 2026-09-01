@@ -54,28 +54,10 @@ pub(crate) async fn session(
         let ended = tokio::select! {
             datagram = connection.read_datagram() => match datagram {
                 Ok(datagram) => {
-                    let now = Instant::now();
-                    match session.datagram(&datagram, now) {
-                        Ok(Some(frame)) => {
-                            // Taken out of the lock before it is used. Handing a
-                            // frame to a decoder takes as long as the decoder
-                            // takes, and the statistics panel reads this same
-                            // lock from the thread that draws the application.
-                            let sink = shared.state().sink.clone();
-                            match sink {
-                                Some(sink) => sink.push(frame.data),
-                                // Nothing is presenting yet, so this picture is
-                                // gone and every picture after it refers back to
-                                // one no decoder has seen. Only this loop knows:
-                                // reassembly saw the picture arrive whole.
-                                None => unshown = true,
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(malformed) => {
-                            tracing::debug!(%malformed, "a datagram that is not a video packet");
-                        }
+                    if let Err(malformed) = session.datagram(&datagram, Instant::now()) {
+                        tracing::debug!(%malformed, "a datagram that is not a video packet");
                     }
+                    present(&mut session, &shared, &mut unshown);
                     None
                 }
                 Err(gone) => Some(gone.to_string()),
@@ -115,6 +97,7 @@ pub(crate) async fn session(
             },
             () = sleep_until(at(expiry)), if expiry.is_some() => {
                 session.expire(Instant::now());
+                present(&mut session, &shared, &mut unshown);
                 None
             },
         };
@@ -130,6 +113,27 @@ pub(crate) async fn session(
         shared.state().ended = Some(reason);
     }
     connection.close(GOODBYE, b"the client is leaving");
+}
+
+/// Hands every picture the session has finished to the decoder.
+///
+/// One datagram can finish more than one: the datagram that completes a frame
+/// is also what decides the damaged frames below it, and any of those the
+/// parity rebuilt come out ahead of it.
+fn present(session: &mut Session, shared: &Arc<Shared>, unshown: &mut bool) {
+    while let Some(frame) = session.pop_frame() {
+        // Taken out of the lock before it is used. Handing a frame to a decoder
+        // takes as long as the decoder takes, and the statistics panel reads
+        // this same lock from the thread that draws the application.
+        let sink = shared.state().sink.clone();
+        match sink {
+            Some(sink) => sink.push(frame.data),
+            // Nothing is presenting yet, so this picture is gone and every
+            // picture after it refers back to one no decoder has seen. Only
+            // this loop knows: reassembly saw the picture arrive whole.
+            None => *unshown = true,
+        }
+    }
 }
 
 /// Writes everything the session has to say, reporting the first refusal.
