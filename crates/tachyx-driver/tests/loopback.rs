@@ -224,6 +224,24 @@ const FRAMES: u32 = 20;
 
 /// A host that streams, says what it has been doing, and reads what the user
 /// did.
+/// The next thing the client says that these tests are about.
+///
+/// Receiver reports are not: a datagram that arrives is a datagram whose
+/// arrival has to be reported, so every test that sends a picture would
+/// otherwise have to step around one. What the reports themselves say is
+/// asserted where the reporter lives.
+async fn next_of_interest(from_client: &mut tachyx_transport::ControlReader) -> ClientMessage {
+    loop {
+        let message = from_client
+            .recv::<ClientMessage>()
+            .await
+            .expect("the client speaks");
+        if !matches!(message, ClientMessage::Feedback(_)) {
+            return message;
+        }
+    }
+}
+
 async fn stream_and_listen(mut host: HostSession, report: Sender<String>) {
     host.to_client
         .send(&HostMessage::Stream(stream()))
@@ -254,17 +272,16 @@ async fn stream_and_listen(mut host: HostSession, report: Sender<String>) {
             last_frame: Some(FrameId(FRAMES - 1)),
             frames_sent: u64::from(FRAMES),
             frames_gated: 0,
+            frames_refused: 0,
             pacing_rate: host.video.pacing_rate(),
+            estimate: Some(8_000_000),
+            padding_sent: 0,
             pipeline_micros: 4_200,
         }))
         .await
         .expect("a live stream");
 
-    let batch = host
-        .from_client
-        .recv::<ClientMessage>()
-        .await
-        .expect("the client speaks");
+    let batch = next_of_interest(&mut host.from_client).await;
     report
         .send(format!("{batch:?}"))
         .expect("the test is waiting");
@@ -362,7 +379,10 @@ fn a_still_screen_is_idle_rather_than_a_lost_host() {
                         last_frame: None,
                         frames_sent: 0,
                         frames_gated: 0,
+                        frames_refused: 0,
                         pacing_rate: None,
+                        estimate: None,
+                        padding_sent: 0,
                         pipeline_micros: 0,
                     }))
                     .await
@@ -428,11 +448,7 @@ fn a_frame_the_wire_ate_earns_one_key_frame_request() {
             send(1, FrameKind::Delta, 1);
             send(2, FrameKind::Delta, 0);
 
-            let asked = host
-                .from_client
-                .recv::<ClientMessage>()
-                .await
-                .expect("the client speaks");
+            let asked = next_of_interest(&mut host.from_client).await;
             report
                 .send(format!("{asked:?}"))
                 .expect("the test is waiting");

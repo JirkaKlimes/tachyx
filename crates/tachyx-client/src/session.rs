@@ -788,7 +788,10 @@ mod tests {
             last_frame: Some(FrameId(0)),
             frames_sent: 1,
             frames_gated: 0,
+            frames_refused: 0,
             pacing_rate: None,
+            estimate: None,
+            padding_sent: 0,
             pipeline_micros: 4_200,
         };
         let mut at = start;

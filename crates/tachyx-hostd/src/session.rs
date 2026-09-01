@@ -4,24 +4,32 @@
 //! where they meet, and where the policy that decides what the encoder is asked
 //! for actually runs.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+use tachyx_congestion::{Controller, MIN_TARGET, START_TARGET};
 use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Idle, Rate};
 use tachyx_proto::control::{
-    Aspect, ClientMessage, Codec, CodedSize, HEARTBEAT_INTERVAL, Heartbeat, HostMessage,
+    Aspect, ClientMessage, Codec, CodedSize, Feedback, HEARTBEAT_INTERVAL, Heartbeat, HostMessage,
     Size as WireSize, StreamConfig,
 };
 use tachyx_proto::media::Timestamp;
-use tachyx_proto::packet::AccessUnit as WireUnit;
+use tachyx_proto::packet::{AccessUnit as WireUnit, Parity};
 use tachyx_transport::endpoint::HostSession;
+use tachyx_transport::video::VideoControl;
 
 use crate::config::Config;
 use crate::idr::{Budget, Reason, Verdict};
-use crate::ladder::{Ladder, Settings, Size as RungSize};
+use crate::ladder::{Ladder, Produced, Settings, Size as RungSize};
 
 /// How often the rate controller looks at what the link is carrying.
+///
+/// The estimate itself moves on every receiver report, twenty times a second.
+/// This is the slower loop beside it: what the ladder reads, when a probe is
+/// scheduled on a link nothing is reporting about, and the round trip the
+/// additive increase is paced by.
 const RATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The longest a picture may stay wrong before a key frame repairs it.
@@ -38,7 +46,8 @@ const KEY_FRAME_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2)
 /// How often the send gate is re-examined while nothing is being encoded.
 ///
 /// Short enough that a gate which shut on a burst reopens within a frame or two
-/// of the queue draining.
+/// of the queue draining, and it is also the tick that finishes a probe cluster
+/// with padding when no picture came along to be one.
 const GATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Why a session ended.
@@ -74,48 +83,14 @@ pub enum SessionError {
 /// other than the client disconnecting.
 pub async fn serve(
     config: &Config,
-    mut session: HostSession,
+    session: HostSession,
     injector: &mut tachyx_input::Injector,
 ) -> Result<(), SessionError> {
     // Held for the whole session. A blanked screen stops producing frames, and
     // the one person who wants the machine awake cannot reach it.
     let _awake = crate::idle::Inhibitor::new()?;
-
-    let Pipeline {
-        capture,
-        encoder,
-        units,
-        bitrate,
-        framerate,
-        capture_size,
-    } = start(config, &session)?;
-    let admission = encoder.admission();
-
-    // The pacer releases datagrams at a rate derived from this. Without it the
-    // transport falls back to the ceiling the client announced, which is an
-    // over-estimate and paces looser than the session actually needs.
-    session.video.set_target_bitrate(
-        std::num::NonZeroU32::new(bitrate.kbps() * 1000).ok_or(SessionError::Unsendable)?,
-    );
-
-    session
-        .to_client
-        .send(&HostMessage::Stream(stream_config(&encoder, bitrate)?))
-        .await?;
-
-    run(
-        config,
-        session,
-        injector,
-        capture,
-        encoder,
-        units,
-        admission,
-        bitrate,
-        framerate,
-        capture_size,
-    )
-    .await
+    let pipeline = start(config, &session)?;
+    run(session, injector, pipeline).await
 }
 
 /// What bringing the pipeline up produces.
@@ -123,137 +98,372 @@ struct Pipeline {
     capture: Capture,
     encoder: Arc<Encoder>,
     units: tachyx_media::AccessUnits,
-    bitrate: Bitrate,
-    framerate: tachyx_media::Framerate,
+    ladder: Ladder,
+    /// The most this session may ever ask for, in bits a second.
+    ceiling: NonZeroU32,
     capture_size: tachyx_media::Size,
+    /// The output's own refresh, lowered by what the client asked for.
+    refresh: u32,
 }
 
 /// Starts capture and encode for what this client says it can decode.
+///
+/// The ladder is built first and the encoder from what it chose, because the
+/// opening point is a decision about the link rather than about the client:
+/// a session that starts at the ceiling is the single largest cause of the
+/// failure `spec/congestion.md` opens with.
 fn start(config: &Config, session: &HostSession) -> Result<Pipeline, SessionError> {
     let (capture, frames) = Capture::start(config.output.as_deref().unwrap_or_default())?;
     let format = capture.format().clone();
     let capture_size = format.size;
 
-    let wanted = session.hello.capabilities.viewport.height.get();
-    let wanted = u32::from(wanted)
-        .min(u32::from(
-            session.hello.capabilities.max_decode.height.get(),
-        ))
-        .min(capture_size.height());
-    let size = EncodeSize::fit(capture_size, halving_for(capture_size.height(), wanted))?;
-
-    // The encoder divides its bit budget by the rate declared here and ignores
-    // when frames actually arrive, so it has to be a rate frames really arrive
-    // at. That is the output's refresh, lowered by whatever the client asked for
-    // and whatever the configuration allows: sending a phone 75 frames a second
-    // when it asked for 60 spends a fifth of the link on frames it will not show.
+    // The encoder divides its bit budget by the rate declared to it and ignores
+    // when frames actually arrive, so the declared rate has to be one frames
+    // really arrive at. That is the output's refresh, lowered by whatever the
+    // client asked for and whatever the configuration allows: sending a phone
+    // 75 frames a second when it asked for 60 spends a fifth of the link on
+    // frames it will not show.
     let asked = u32::from(session.hello.capabilities.requested_fps.get());
     let allowed = config.max_framerate.unwrap_or(u32::MAX);
-    let framerate = tachyx_media::Framerate::from_millihertz(
-        format
-            .refresh
-            .millihertz()
-            .min(asked * 1000)
-            .min(allowed * 1000),
-    )
-    .unwrap_or(format.refresh);
-    let bitrate = Bitrate::from_kbps(
+    let refresh = format
+        .refresh
+        .millihertz()
+        .min(asked.saturating_mul(1000))
+        .min(allowed.saturating_mul(1000))
+        .max(1);
+
+    let ceiling = NonZeroU32::new(
         config
             .max_bitrate
             .min(session.hello.capabilities.bitrate_ceiling.get())
-            / 1000,
+            .max(MIN_TARGET),
     )
-    .ok_or(tachyx_media::BadEncodeSize::Odd)?;
+    .ok_or(SessionError::Unsendable)?;
 
-    let (encoder, units) = Encoder::start(
-        frames,
-        EncodeConfig {
-            size,
-            rate: Rate { bitrate, framerate },
-        },
-    )?;
+    let ladder = Ladder::new(
+        top_rung(
+            capture_size,
+            viewport(session.hello.capabilities, capture_size),
+        )?,
+        refresh,
+        START_TARGET.min(ceiling.get()),
+        ceiling.get(),
+    );
+    let opened = ladder.settings();
+    let (encoder, units) = Encoder::start(frames, encode_config(capture_size, opened)?)?;
     Ok(Pipeline {
         capture,
         encoder: Arc::new(encoder),
         units,
-        bitrate,
-        framerate,
+        ladder,
+        ceiling,
         capture_size,
+        refresh,
     })
 }
 
-/// Runs the session until the client goes away.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the pipeline's parts, threaded through one call rather than bundled into a struct that exists only to be unpacked"
-)]
-async fn run(
-    _config: &Config,
-    mut session: HostSession,
-    injector: &mut tachyx_input::Injector,
-    capture: Capture,
+/// Everything that decides what the encoder is asked for, and how fast the
+/// transport lets it out.
+///
+/// It is one object because every one of these moves the others: a receiver
+/// report moves the estimate, the estimate moves the pacer, the token bucket
+/// and the parity level, and what the encoder then produces moves the ladder,
+/// which spends the same key frame budget a client's own request spends.
+struct Live {
     encoder: Arc<Encoder>,
-    units: tachyx_media::AccessUnits,
-    admission: Arc<std::sync::atomic::AtomicBool>,
-    bitrate: Bitrate,
-    framerate: tachyx_media::Framerate,
+    controller: Controller,
+    ladder: Ladder,
+    budget: Budget,
+    parity: Parity,
+    control: VideoControl,
+    /// The bits a second the encoder's own rate limiter is allowed to produce.
+    spending: Arc<AtomicU32>,
+    /// The transport's admission gate, which the watchdog reopens.
+    admission: Arc<AtomicBool>,
+    sent: Arc<AtomicU64>,
+    padded: Arc<AtomicU64>,
+    watchdog: Watchdog,
+    last_key: Instant,
+    started: Instant,
+    ceiling: NonZeroU32,
+    refresh: u32,
     capture_size: tachyx_media::Size,
+}
+
+impl Live {
+    /// Takes one receiver report, which is the only measurement of the path
+    /// this host can have.
+    fn feedback(&mut self, report: &Feedback, now: Instant) {
+        self.collect();
+        let update = self.controller.feedback(report, now);
+        // Adaptive parity, which is where this beats the prior art: Sunshine
+        // and Moonlight carry a flat fifth for ever, and this follows what the
+        // link is really losing.
+        self.parity
+            .observe(update.losses.lost, update.losses.received);
+        self.control.set_parity(self.parity.level());
+        self.spend(update);
+    }
+
+    /// Looks at the link without a report to read, and moves the ladder.
+    ///
+    /// A still desktop produces no frames, so the client has nothing to report
+    /// the arrival of and the controller would otherwise never hear that the
+    /// link recovered. This is what schedules the padding probe that breaks
+    /// that silence.
+    async fn tick(
+        &mut self,
+        connection: &quinn::Connection,
+        to_client: &mut tachyx_transport::control::ControlWriter,
+        now: Instant,
+    ) -> Result<(), SessionError> {
+        self.collect();
+        // What paces the additive increase. The transport measures it and the
+        // controller has no other way to know it.
+        self.controller.set_rtt(connection.rtt());
+        let update = self.controller.tick(now);
+        self.spend(update);
+
+        let produced = produced(&self.encoder);
+        let Some(want) = self.ladder.observe(update.video.get(), produced, now) else {
+            return Ok(());
+        };
+        self.apply(want, to_client, now).await
+    }
+
+    /// Hands the controller everything the send path has released.
+    fn collect(&mut self) {
+        for release in self.control.released() {
+            self.controller.released(&release);
+        }
+    }
+
+    /// Tells the pacer and the encoder's rate limiter what the link will carry,
+    /// and releases whatever cluster the controller asked for.
+    ///
+    /// Both the pacer and the bucket, because they bound different things and
+    /// neither bounds the other. The pacer decides how fast bytes leave; the
+    /// bucket decides how many the encoder is allowed to make. Nothing written
+    /// into the encoder itself bounds either.
+    fn spend(&mut self, update: tachyx_congestion::Update) {
+        self.control.set_target_bitrate(update.video);
+        self.spending.store(update.video.get(), Ordering::Relaxed);
+        if let Some(probe) = update.probe {
+            self.control.probe(probe);
+        }
+    }
+
+    /// Applies a rung, spending the key frame it costs from the shared budget.
+    ///
+    /// The size and the rate go in together deliberately: measured on a running
+    /// pipeline, a resolution change and a bitrate change applied in the same
+    /// tick cost **one** key frame between them, not two, so the whole operating
+    /// point moves in a single step and the client sees one [`StreamConfig`].
+    async fn apply(
+        &mut self,
+        want: Settings,
+        to_client: &mut tachyx_transport::control::ControlWriter,
+        now: Instant,
+    ) -> Result<(), SessionError> {
+        let held = self.ladder.applied();
+        let reason = if want.size == held.size {
+            Reason::Bitrate
+        } else {
+            Reason::Resolution
+        };
+        if self.budget.request(reason, now) == Verdict::Refuse {
+            return Ok(());
+        }
+        if want.size != held.size {
+            self.encoder.set_resolution(EncodeSize::new(
+                u32::from(want.size.width),
+                u32::from(want.size.height),
+            )?)?;
+        }
+        self.encoder.set_rate(rate_of(want)?)?;
+        self.budget.retarget(want.bitrate);
+        self.ladder.acknowledge(want, now);
+        self.last_key = now;
+        to_client
+            .send(&HostMessage::Stream(stream_config(
+                &self.encoder,
+                want.bitrate,
+            )?))
+            .await?;
+        Ok(())
+    }
+
+    /// The client lost a frame and cannot continue from what it holds.
+    fn keyframe_request(&mut self, now: Instant) {
+        if self.budget.request(Reason::ClientRequest, now) == Verdict::Allow {
+            self.encoder.force_keyframe();
+            self.last_key = now;
+        }
+    }
+
+    /// The client can show something different now.
+    ///
+    /// The rungs are what the client can show, so a different client needs a
+    /// different ladder. Its opening point is what the link is known to carry,
+    /// which by now is a measurement rather than a guess.
+    fn viewport_changed(&mut self, capabilities: tachyx_proto::control::Capabilities) {
+        let wanted = viewport(capabilities, self.capture_size);
+        if let Ok(top) = top_rung(self.capture_size, wanted) {
+            self.ladder = Ladder::new(
+                top,
+                self.refresh,
+                self.controller.video_target().get(),
+                self.ceiling.get(),
+            );
+        }
+    }
+
+    /// Asks for a key frame when the last one is old enough that a loss nobody
+    /// reported would still be showing.
+    ///
+    /// On a clock rather than a frame count. The encoder applies the request to
+    /// the next picture it encodes, so a screen producing nothing pays nothing:
+    /// the cost lands on the first frame after the quiet, which is exactly the
+    /// frame a client needs to be able to decode.
+    fn repair_if_stale(&mut self, now: Instant) {
+        if now.duration_since(self.last_key) >= KEY_FRAME_MAX_AGE
+            && self.budget.request(Reason::Periodic, now) == Verdict::Allow
+        {
+            self.encoder.force_keyframe();
+            self.last_key = now;
+        }
+    }
+
+    /// Honours whatever the budget refused earlier and can now afford.
+    ///
+    /// A refusal that nothing acts on later is a change that never happens. The
+    /// client repeats its own request, because it holds no record of having
+    /// been refused; the host's own causes have nobody to repeat them.
+    fn honour_owed(&mut self, now: Instant) {
+        let Some(owed) = self.budget.owed() else {
+            return;
+        };
+        match owed {
+            Reason::ClientRequest | Reason::Periodic | Reason::Startup => {
+                if self.budget.request(owed, now) == Verdict::Allow {
+                    self.encoder.force_keyframe();
+                    self.last_key = now;
+                }
+            }
+            // The ladder still wants the change and offers it again on its own
+            // tick, where it is applied as well as paid for. A key frame forced
+            // here would spend the allowance on nothing.
+            Reason::Bitrate | Reason::Resolution => {}
+        }
+    }
+
+    /// Notices a connection that is up and carrying nothing.
+    fn watch(&mut self, now: Instant) {
+        let stats = self.encoder.stats();
+        if !self
+            .watchdog
+            .stalled(self.sent.load(Ordering::Relaxed), &stats, now)
+        {
+            return;
+        }
+        tracing::warn!(
+            sent = self.sent.load(Ordering::Relaxed),
+            encoded = stats.encoded,
+            refused = stats.refused,
+            gated = stats.gated,
+            "the video path is carrying nothing while the connection is up"
+        );
+        // Not through the budget. It rations key frames against what the link
+        // can carry, and this fires only when nothing is reaching the link at
+        // all, so there is nothing to ration against and the client is holding a
+        // picture it cannot decode from. The gate is reopened for one frame;
+        // the send path checks the queue again for itself, so opening it cannot
+        // reach the transport's eviction path.
+        self.admission.store(true, Ordering::Relaxed);
+        self.encoder.force_keyframe();
+        self.last_key = now;
+    }
+
+    /// What the host has been doing, for a client that cannot tell a still
+    /// screen from a host that has gone away.
+    fn beat(&self, capture: &Capture, connection: &quinn::Connection) -> Heartbeat {
+        let stats = self.encoder.stats();
+        Heartbeat {
+            sent: Timestamp::from_session_micros(
+                u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            ),
+            last_frame: None,
+            frames_sent: self.sent.load(Ordering::Relaxed),
+            frames_gated: capture.stats().dropped + stats.gated,
+            frames_refused: stats.refused,
+            pacing_rate: connection.congestion_state().metrics().pacing_rate,
+            estimate: Some(self.controller.estimate().get()),
+            padding_sent: self.padded.load(Ordering::Relaxed),
+            pipeline_micros: 0,
+        }
+    }
+}
+
+/// Runs the session until the client goes away.
+async fn run(
+    session: HostSession,
+    injector: &mut tachyx_input::Injector,
+    pipeline: Pipeline,
 ) -> Result<(), SessionError> {
-    let mut ladder = Ladder::new(rung(capture_size), fps(framerate), bitrate.kbps() * 1000);
-    let mut budget = Budget::new(bitrate.kbps() * 1000);
+    let Pipeline {
+        capture,
+        encoder,
+        units,
+        ladder,
+        ceiling,
+        capture_size,
+        refresh,
+    } = pipeline;
+    let HostSession {
+        connection,
+        video,
+        control,
+        mut to_client,
+        mut from_client,
+        ..
+    } = session;
+
+    let started = Instant::now();
+    let sent = Arc::new(AtomicU64::new(0));
+    let padded = Arc::new(AtomicU64::new(0));
+    let admission = encoder.admission();
+    let pump = release(units, video, &admission, &sent, &padded);
+
+    let mut live = Live {
+        spending: encoder.budget(),
+        controller: Controller::new(ceiling, started),
+        budget: Budget::new(ladder.applied().bitrate),
+        parity: Parity::default(),
+        watchdog: Watchdog::new(started),
+        last_key: started,
+        encoder,
+        ladder,
+        control,
+        admission,
+        sent,
+        padded,
+        started,
+        ceiling,
+        refresh,
+        capture_size,
+    };
     // The picture the session opens on. Spent here so that a later request
     // cannot be refused on the grounds that this one was free: the budget is
     // shared precisely so every cause is counted.
-    budget.request(Reason::Startup, Instant::now());
-    let started = Instant::now();
-    let sent_frames = Arc::new(AtomicU64::new(0));
-    let mut last_key = Instant::now();
-
-    let pump = {
-        let sent_frames = Arc::clone(&sent_frames);
-        let admission = Arc::clone(&admission);
-        let mut video = session.video;
-        tokio::task::spawn_blocking(move || {
-            loop {
-                match units.recv_timeout(GATE_INTERVAL) {
-                    Ok(unit) => {
-                        let slices = unit.slices();
-                        let Ok(wire) = WireUnit::new(unit.frame, unit.captured, unit.kind, &slices)
-                        else {
-                            continue;
-                        };
-                        // Only a lost connection ends the pump. A refusal is
-                        // this frame's problem and the next one may well fit;
-                        // treating it as fatal would end video for the life of
-                        // the session over a transient.
-                        if let Err(error) = video.send(&wire) {
-                            tracing::warn!(%error, "video path ended");
-                            break;
-                        }
-                        sent_frames.store(video.frames_sent(), Ordering::Relaxed);
-                    }
-                    Err(Idle::Waiting) => {}
-                    Err(Idle::Ended) => break,
-                }
-                // Gate the NEXT frame before it is encoded. A frame never
-                // submitted leaves the encoder's reference chain intact; a frame
-                // encoded and then dropped breaks it, and with one reference
-                // frame and a long key frame interval the picture stays wrong
-                // for many seconds.
-                //
-                // Re-evaluated on the timeout as well as after a send, because a
-                // shut gate stops the encoder, and a loop that only woke for a
-                // frame would then never wake to open the gate again. That is a
-                // deadlock, and it looks exactly like the picture freezing a few
-                // seconds in.
-                admission.store(
-                    video.can_send_bytes(video.key_frame_estimate()),
-                    Ordering::Relaxed,
-                );
-            }
-            video
-        })
-    };
+    live.budget.request(Reason::Startup, started);
+    let opening = live.controller.tick(started);
+    live.spend(opening);
+    to_client
+        .send(&HostMessage::Stream(stream_config(
+            &live.encoder,
+            live.ladder.applied().bitrate,
+        )?))
+        .await?;
 
     let mut rate_tick = tokio::time::interval(RATE_INTERVAL);
     // The interval is the protocol's, not this daemon's: the client reads
@@ -261,11 +471,11 @@ async fn run(
     // one the host keeps.
     let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut key_frame_tick = tokio::time::interval(KEY_FRAME_MAX_AGE / 4);
-    let connection = session.connection.clone();
 
     let outcome = loop {
+        let now = Instant::now();
         tokio::select! {
-            message = session.from_client.recv::<ClientMessage>() => match message {
+            message = from_client.recv::<ClientMessage>() => match message {
                 Ok(ClientMessage::Input(batch)) => {
                     let events: Vec<_> =
                         batch.events.into_iter().map(|timed| timed.event).collect();
@@ -276,105 +486,187 @@ async fn run(
                         tracing::warn!(%error, count = events.len(), "cannot inject input");
                     }
                 }
+                Ok(ClientMessage::Feedback(report)) => live.feedback(&report, Instant::now()),
                 Ok(ClientMessage::KeyframeRequest { .. }) => {
-                    let now = Instant::now();
-                    if budget.request(Reason::ClientRequest, now) == Verdict::Allow {
-                        encoder.force_keyframe();
-                        last_key = now;
-                    }
+                    live.keyframe_request(Instant::now());
                 }
-                Ok(ClientMessage::ViewportChanged(changed)) => {
-                    let wanted = u32::from(changed.viewport.height.get())
-                        .min(u32::from(changed.max_decode.height.get()))
-                        .min(capture_size.height());
-                    if let Ok(size) =
-                        EncodeSize::fit(capture_size, halving_for(capture_size.height(), wanted))
-                        && budget.request(Reason::Resolution, Instant::now()) == Verdict::Allow
-                    {
-                        encoder.set_resolution(size)?;
-                        let config = stream_config(&encoder, bitrate)?;
-                        session.to_client.send(&HostMessage::Stream(config)).await?;
-                    }
-                }
+                Ok(ClientMessage::ViewportChanged(changed)) => live.viewport_changed(changed),
                 Err(_) => break Ok(()),
             },
             _ = rate_tick.tick() => {
-                if let Some(target) = connection_target(&connection)
-                    && let Some(Settings { size, bitrate: bits, .. }) =
-                        ladder.observe(target, Instant::now())
-                {
-                    apply(&encoder, &mut budget, size, bits, &mut session.to_client).await?;
-                }
+                live.tick(&connection, &mut to_client, Instant::now()).await?;
             }
-            _ = key_frame_tick.tick() => {
-                repair_if_stale(&encoder, &mut budget, &mut last_key);
-            }
+            _ = key_frame_tick.tick() => live.repair_if_stale(Instant::now()),
             _ = heartbeat_tick.tick() => {
-                let beat = beat(&capture, &connection, started, &sent_frames);
-                if session.to_client.send(&HostMessage::Heartbeat(beat)).await.is_err() {
+                live.watch(Instant::now());
+                let beat = live.beat(&capture, &connection);
+                if to_client.send(&HostMessage::Heartbeat(beat)).await.is_err() {
                     break Ok(());
                 }
             }
         }
+        live.honour_owed(now);
     };
 
-    drop(encoder);
+    drop(live);
     drop(pump);
     capture.stop()?;
     outcome
 }
 
-/// The bandwidth the link will carry, in bits per second.
-/// What the link will carry, if anything here can say.
+/// Puts encoded pictures on the wire, on a thread of its own.
 ///
-/// Nothing here can, yet. The transport's own bandwidth estimate was measured
-/// reporting zero on a healthy hundred-megabit path, for every sample of a
-/// twenty-second run: its sampler discards any measurement taken while the
-/// sender is limited by its own supply, and a sender producing sixty frames a
-/// second is in that state whenever an acknowledgement arrives. Feeding that
-/// zero to the ladder drove the encoder to its smallest picture on a link with
-/// room to spare, which is worse than not adapting at all.
-///
-/// So this reports nothing until the receiver's own report exists, and the
-/// ladder holds what the session was configured for. See `spec/congestion.md`.
-const fn connection_target(_connection: &quinn::Connection) -> Option<u32> {
-    None
-}
-
-/// Applies a rung, spending the key frame it costs from the shared budget.
-async fn apply(
-    encoder: &Encoder,
-    budget: &mut Budget,
-    size: RungSize,
-    bits: u32,
-    to_client: &mut tachyx_transport::control::ControlWriter,
-) -> Result<(), SessionError> {
-    let now = Instant::now();
-    budget.retarget(bits);
-    let Some(bitrate) = Bitrate::from_kbps(bits / 1000) else {
-        return Ok(());
-    };
-    let encode = EncodeSize::new(u32::from(size.width), u32::from(size.height))?;
-    let current = encoder.geometry().visible;
-    if encode.visible() != current {
-        if budget.request(Reason::Resolution, now) == Verdict::Refuse {
-            return Ok(());
+/// It has to be its own thread: `send` blocks until the pacer has released the
+/// last datagram of the picture, which for a key frame is tens of milliseconds.
+/// Nothing that produces frames is held while it waits, because capture writes
+/// into a slot that displaces rather than queues.
+fn release(
+    units: tachyx_media::AccessUnits,
+    mut video: tachyx_transport::video::VideoSender,
+    admission: &Arc<std::sync::atomic::AtomicBool>,
+    sent: &Arc<AtomicU64>,
+    padded: &Arc<AtomicU64>,
+) -> tokio::task::JoinHandle<tachyx_transport::video::VideoSender> {
+    let admission = Arc::clone(admission);
+    let sent = Arc::clone(sent);
+    let padded = Arc::clone(padded);
+    tokio::task::spawn_blocking(move || {
+        loop {
+            match units.recv_timeout(GATE_INTERVAL) {
+                Ok(unit) => {
+                    let slices = unit.slices();
+                    let Ok(wire) = WireUnit::new(unit.frame, unit.captured, unit.kind, &slices)
+                    else {
+                        continue;
+                    };
+                    // Only a lost connection ends this. A refusal is this
+                    // frame's problem and the next one may well fit; treating it
+                    // as fatal would end video for the life of the session over
+                    // a transient.
+                    if let Err(error) = video.send(&wire) {
+                        tracing::warn!(%error, "video path ended");
+                        break;
+                    }
+                }
+                // No picture came along to be the probe, which on a desktop
+                // nobody is touching is the ordinary case. Padding is what times
+                // the path when the picture is supplying nothing.
+                Err(Idle::Waiting) => {
+                    if let Err(error) = video.pad() {
+                        tracing::warn!(%error, "video path ended");
+                        break;
+                    }
+                }
+                Err(Idle::Ended) => break,
+            }
+            // Gate the NEXT frame before it is encoded. A frame never submitted
+            // leaves the encoder's reference chain intact; a frame encoded and
+            // then dropped breaks it, and with one reference frame and a long
+            // key frame interval the picture stays wrong for many seconds.
+            //
+            // Re-evaluated on the timeout as well as after a frame, because a
+            // shut gate stops the encoder, and a loop that only woke for a frame
+            // would then never wake to open the gate again. That is a deadlock,
+            // and it looks exactly like the picture freezing a few seconds in.
+            admission.store(
+                video.can_send_bytes(video.key_frame_estimate()),
+                Ordering::Relaxed,
+            );
+            sent.store(video.frames_sent(), Ordering::Relaxed);
+            padded.store(video.padding_sent(), Ordering::Relaxed);
         }
-        encoder.set_resolution(encode)?;
-    } else if budget.request(Reason::Bitrate, now) == Verdict::Refuse {
-        return Ok(());
-    }
-    encoder.set_rate(Rate {
-        bitrate,
-        framerate: encoder.rate().framerate,
-    })?;
-    to_client
-        .send(&HostMessage::Stream(stream_config(encoder, bitrate)?))
-        .await?;
-    Ok(())
+        video
+    })
 }
 
-fn stream_config(encoder: &Encoder, bitrate: Bitrate) -> Result<StreamConfig, SessionError> {
+/// What the encoder has done, as the ladder reads it.
+fn produced(encoder: &Encoder) -> Produced {
+    let stats = encoder.stats();
+    Produced {
+        // Every capture frame the rate limiter was asked about. Frames dropped
+        // to honour the declared frame rate are not among them: that is the
+        // ladder's own decision being carried out, not a shortage.
+        offered: stats.encoded + stats.refused + stats.gated,
+        refused: stats.refused,
+        bits: stats.bytes * 8,
+    }
+}
+
+/// Notices a connection that is up and carrying nothing.
+///
+/// A still desktop produces no frames at all, so silence on the video path is
+/// not a fault by itself. What is a fault is the encoder being offered pictures
+/// and none of them reaching the wire: whatever shut the path, the client is
+/// holding a picture it can no longer decode from.
+#[derive(Debug)]
+struct Watchdog {
+    checked: Instant,
+    sent: u64,
+    offered: u64,
+}
+
+/// How long the path may carry nothing while the pipeline is producing.
+const STALL: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Watchdog {
+    const fn new(now: Instant) -> Self {
+        Self {
+            checked: now,
+            sent: 0,
+            offered: 0,
+        }
+    }
+
+    fn stalled(&mut self, sent: u64, stats: &tachyx_media::EncodeStats, now: Instant) -> bool {
+        if now.duration_since(self.checked) < STALL {
+            return false;
+        }
+        let offered = stats.encoded + stats.refused + stats.gated;
+        let stalled = sent == self.sent && offered > self.offered;
+        self.checked = now;
+        self.sent = sent;
+        self.offered = offered;
+        stalled
+    }
+}
+
+/// The rungs this client can show, as an encode size.
+fn top_rung(
+    capture: tachyx_media::Size,
+    wanted: u32,
+) -> Result<RungSize, tachyx_media::BadEncodeSize> {
+    let fitted = EncodeSize::fit(capture, halving_for(capture.height(), wanted))?;
+    Ok(rung(fitted.visible()))
+}
+
+/// The tallest picture this client can put to use.
+fn viewport(capabilities: tachyx_proto::control::Capabilities, capture: tachyx_media::Size) -> u32 {
+    u32::from(capabilities.viewport.height.get())
+        .min(u32::from(capabilities.max_decode.height.get()))
+        .min(capture.height())
+}
+
+/// The encoder configuration for one rung of the ladder.
+fn encode_config(
+    capture: tachyx_media::Size,
+    settings: Settings,
+) -> Result<EncodeConfig, SessionError> {
+    Ok(EncodeConfig {
+        size: EncodeSize::fit(capture, u32::from(settings.size.height))?,
+        rate: rate_of(settings)?,
+    })
+}
+
+/// The bitrate and declared frame rate a rung asks for.
+fn rate_of(settings: Settings) -> Result<Rate, SessionError> {
+    Ok(Rate {
+        bitrate: Bitrate::from_kbps(settings.bitrate / 1000).ok_or(SessionError::Unsendable)?,
+        framerate: tachyx_media::Framerate::from_millihertz(settings.millihertz)
+            .ok_or(SessionError::Unsendable)?,
+    })
+}
+
+fn stream_config(encoder: &Encoder, bitrate: u32) -> Result<StreamConfig, SessionError> {
     let geometry = encoder.geometry();
     let rate = encoder.rate();
     Ok(StreamConfig {
@@ -396,47 +688,8 @@ fn stream_config(encoder: &Encoder, bitrate: Bitrate) -> Result<StreamConfig, Se
         .ok_or(SessionError::Unsendable)?,
         framerate: std::num::NonZeroU16::new(fps(rate.framerate))
             .ok_or(SessionError::Unsendable)?,
-        bitrate: std::num::NonZeroU32::new(bitrate.kbps() * 1000)
-            .ok_or(SessionError::Unsendable)?,
+        bitrate: NonZeroU32::new(bitrate).ok_or(SessionError::Unsendable)?,
     })
-}
-
-/// Asks for a key frame when the last one is old enough that a loss nobody
-/// reported would still be showing.
-///
-/// On a clock rather than a frame count. The encoder applies the request to the
-/// next picture it encodes, so a screen producing nothing pays nothing: the cost
-/// lands on the first frame after the quiet, which is exactly the frame a client
-/// needs to be able to decode.
-/// What the host has been doing, for a client that cannot tell a still screen
-/// from a host that has gone away.
-fn beat(
-    capture: &Capture,
-    connection: &quinn::Connection,
-    started: Instant,
-    sent_frames: &AtomicU64,
-) -> Heartbeat {
-    let stats = capture.stats();
-    Heartbeat {
-        sent: Timestamp::from_session_micros(
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        ),
-        last_frame: None,
-        frames_sent: sent_frames.load(Ordering::Relaxed),
-        frames_gated: stats.dropped,
-        pacing_rate: connection.congestion_state().metrics().pacing_rate,
-        pipeline_micros: 0,
-    }
-}
-
-fn repair_if_stale(encoder: &Encoder, budget: &mut Budget, last_key: &mut Instant) {
-    let now = Instant::now();
-    if now.duration_since(*last_key) >= KEY_FRAME_MAX_AGE
-        && budget.request(Reason::Periodic, now) == Verdict::Allow
-    {
-        encoder.force_keyframe();
-        *last_key = now;
-    }
 }
 
 fn rung(size: tachyx_media::Size) -> RungSize {

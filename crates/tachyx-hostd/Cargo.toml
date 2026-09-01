@@ -16,6 +16,7 @@ name = "tachyx-hostd"
 path = "src/main.rs"
 
 [dependencies]
+tachyx-congestion.workspace = true
 tachyx-proto.workspace = true
 tachyx-input.workspace = true
 tachyx-media.workspace = true

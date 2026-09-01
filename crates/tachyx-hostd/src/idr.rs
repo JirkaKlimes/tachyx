@@ -18,19 +18,23 @@
 use std::time::{Duration, Instant};
 
 /// Why a key frame was asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The order is the order they are honoured in when several are refused at
+/// once: a client with a broken picture outranks a change the host wanted to
+/// make to itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Reason {
-    /// The session is starting and the client has nothing to decode from.
-    Startup,
     /// The encoder's target bitrate changed.
     Bitrate,
     /// The encoded resolution changed.
     Resolution,
-    /// The client lost a frame and cannot continue from what it has.
-    ClientRequest,
     /// Enough time has passed that a picture damaged by a loss nobody reported
     /// should be repaired anyway.
     Periodic,
+    /// The client lost a frame and cannot continue from what it has.
+    ClientRequest,
+    /// The session is starting and the client has nothing to decode from.
+    Startup,
 }
 
 /// What a request for a key frame is worth against the budget.
@@ -50,6 +54,14 @@ pub struct Budget {
     key_frame_bytes: u32,
     /// The encoder's current target, in bits per second.
     target_bits: u32,
+    /// The most urgent reason a refusal is still owed for.
+    ///
+    /// A refusal that is dropped on the floor is a refusal nothing ever acts
+    /// on: the client repeats its own request, but the host's own causes have
+    /// no one to repeat them, so a bitrate step refused during a busy moment
+    /// would simply never be applied. This is what the next allowed instant
+    /// honours.
+    owed: Option<Reason>,
 }
 
 impl Budget {
@@ -70,6 +82,7 @@ impl Budget {
             // stands in for a 1080p key frame.
             key_frame_bytes: 130_000,
             target_bits,
+            owed: None,
         }
     }
 
@@ -112,10 +125,24 @@ impl Budget {
                 .is_none_or(|last| now.duration_since(last) >= self.interval());
         if allowed {
             self.last = Some(now);
+            // Any allowed request spends the allowance on a key frame, which is
+            // what the owed one was waiting for.
+            self.owed = None;
             Verdict::Allow
         } else {
+            self.owed = Some(self.owed.map_or(reason, |owed| owed.max(reason)));
             Verdict::Refuse
         }
+    }
+
+    /// The refusal still outstanding, if one is.
+    ///
+    /// Reading it changes nothing: a caller acts on it by asking for it again,
+    /// which is what spends the allowance and clears this. That keeps one path
+    /// through the budget rather than two that could each believe they had paid.
+    #[must_use]
+    pub const fn owed(&self) -> Option<Reason> {
+        self.owed
     }
 }
 
@@ -190,6 +217,51 @@ mod tests {
             budget.interval() > assumed,
             "a key frame twice the assumed size must be allowed half as often"
         );
+    }
+
+    #[test]
+    fn a_refusal_is_owed_rather_than_dropped() {
+        let mut budget = Budget::new(TARGET);
+        let now = Instant::now();
+        assert_eq!(budget.request(Reason::Bitrate, now), Verdict::Allow);
+        assert_eq!(budget.request(Reason::Resolution, now), Verdict::Refuse);
+        assert_eq!(
+            budget.owed(),
+            Some(Reason::Resolution),
+            "a refused change must be remembered, or it is never applied at all"
+        );
+        assert_eq!(
+            budget.request(Reason::Resolution, now),
+            Verdict::Refuse,
+            "the allowance has not recovered"
+        );
+
+        let later = now + budget.interval();
+        assert_eq!(budget.request(Reason::Resolution, later), Verdict::Allow);
+        assert_eq!(budget.owed(), None, "and it is owed once");
+    }
+
+    #[test]
+    fn the_most_urgent_refusal_is_the_one_owed() {
+        let mut budget = Budget::new(TARGET);
+        let now = Instant::now();
+        budget.request(Reason::Startup, now);
+        for reason in [Reason::Bitrate, Reason::ClientRequest, Reason::Resolution] {
+            assert_eq!(budget.request(reason, now), Verdict::Refuse);
+        }
+        assert_eq!(
+            budget.owed(),
+            Some(Reason::ClientRequest),
+            "a client with a broken picture outranks a change the host wanted"
+        );
+    }
+
+    #[test]
+    fn a_request_that_was_allowed_owes_nothing() {
+        let mut budget = Budget::new(TARGET);
+        let now = Instant::now();
+        assert_eq!(budget.request(Reason::ClientRequest, now), Verdict::Allow);
+        assert_eq!(budget.owed(), None);
     }
 
     #[test]

@@ -26,7 +26,7 @@
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -154,6 +154,8 @@ pub struct VideoSender {
     records: SyncSender<Release>,
     /// Clusters the controller has asked for.
     probes: Receiver<Probe>,
+    /// The parity level, as a percentage of a frame's picture datagrams.
+    parity: Arc<AtomicU8>,
     armed: Option<Armed>,
     frames_sent: u64,
     frames_refused: u64,
@@ -178,6 +180,7 @@ struct Armed {
 #[derive(Debug)]
 pub struct VideoControl {
     target: Arc<AtomicU32>,
+    parity: Arc<AtomicU8>,
     records: Receiver<Release>,
     probes: SyncSender<Probe>,
 }
@@ -191,6 +194,18 @@ impl VideoControl {
     /// [`crate::pace::rate_for`].
     pub fn set_target_bitrate(&self, target: NonZeroU32) {
         self.target.store(target.get(), Ordering::Relaxed);
+    }
+
+    /// Sets how much parity every frame carries, as a percentage of its own
+    /// picture datagrams.
+    ///
+    /// The level follows measured loss, which the receiver report is the only
+    /// source of. Sunshine and Moonlight carry a flat fifth for ever; this one
+    /// rises on the first report that asks for it and falls only once the lower
+    /// reading has held, because too little parity costs a broken reference
+    /// chain and a key frame while too much costs a few percent of the link.
+    pub fn set_parity(&self, percent: u8) {
+        self.parity.store(percent, Ordering::Relaxed);
     }
 
     /// Asks for a cluster to be released above the pacing rate.
@@ -223,6 +238,7 @@ impl VideoSender {
     #[must_use]
     pub fn new(connection: Connection, buffer: usize, target: NonZeroU32) -> (Self, VideoControl) {
         let shared = Arc::new(AtomicU32::new(target.get()));
+        let parity = Arc::new(AtomicU8::new(Parity::MEASURED));
         let (records, drained) = sync_channel(RECORD_BACKLOG);
         // One deep. A second cluster offered while the first is still going out
         // would measure the first rather than the link.
@@ -239,6 +255,7 @@ impl VideoSender {
                 pacer: Pacer::new(rate_for(target, MEASURED_KEY_FRAME_BYTES), Instant::now()),
                 records,
                 probes,
+                parity: Arc::clone(&parity),
                 armed: None,
                 frames_sent: 0,
                 frames_refused: 0,
@@ -246,6 +263,7 @@ impl VideoSender {
             },
             VideoControl {
                 target: shared,
+                parity,
                 records: drained,
                 probes: asked,
             },
@@ -440,6 +458,8 @@ impl VideoSender {
     pub fn send(&mut self, unit: &AccessUnit<'_>) -> Result<Sent, VideoError> {
         let payload = self.payload_len().ok_or(VideoError::NoDatagrams)?;
         self.packetiser.set_payload_len(payload);
+        self.packetiser
+            .set_parity(Parity::fixed(self.parity.load(Ordering::Relaxed)));
         self.take_probe(payload);
         self.forget_sent();
         // The packetiser's count, not the picture's: parity is real bytes on
@@ -470,10 +490,12 @@ impl VideoSender {
         // cluster: the same bytes were leaving anyway and releasing them faster
         // measures the link for nothing.
         let weight = queue.iter().map(Vec::len).sum();
-        self.pacer.set_rate(
-            self.armed
-                .map_or_else(|| rate_for(self.target(), weight), |probe| probe.rate),
-        );
+        let paced = rate_for(self.target(), weight);
+        // Never below what the picture's own weight asks for: a key frame paced
+        // slower than the receiver's deadline is a key frame thrown away, and a
+        // probe rate is not an excuse to miss it.
+        self.pacer
+            .set_rate(self.armed.map_or(paced, |probe| probe.rate.max(paced)));
         let sent = self.release(&mut queue, datagrams);
         queue.clear();
         self.datagrams = queue;

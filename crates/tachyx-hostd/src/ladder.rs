@@ -1,14 +1,76 @@
 //! Choosing what to ask the encoder for.
 //!
-//! The transport reports what the link will carry. This turns that into an
-//! encode size, a frame rate and a bitrate.
+//! The controller says how many bits a second the link will carry. This turns
+//! that into an encode size, a declared frame rate and a bitrate.
 //!
-//! Desktop content resists downscaling badly. Sharp text degrades far worse
-//! under a resample than under coarser quantisation, and a desktop is mostly
-//! static, so a low bitrate is cheap where a low resolution is not. The ladder
-//! therefore spends bitrate first and reaches for resolution last.
+//! Three knobs, spent in this order. **Bitrate** first, because it is the cheap
+//! one. **Frame rate** second, because frame admission drops whole capture
+//! frames and the deliverable rates are the output's refresh divided by a whole
+//! number: on a 74.983 Hz output that is 75, 37.5, 25, 18.75 and 15. And
+//! **resolution** last, because desktop content resists downscaling badly:
+//! sharp text degrades far worse under a resample than under coarser
+//! quantisation, so sharp text at 25 Hz beats soft text at 75.
+//!
+//! What it wants and what the encoder holds are separate, and they have to be.
+//! Every change costs a key frame drawn from the shared budget in
+//! [`crate::idr`], which refuses; a ladder that recorded a change it only
+//! *asked* for would believe the encoder was somewhere it never went, and would
+//! never ask again.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+/// Bits per pixel per frame the opening point is chosen at.
+///
+/// Measured rather than assumed: the busiest desktop content measured on this
+/// host, a busy quarter-screen window at 1080p60, carried 7.86 Mbit/s of
+/// picture, which is 0.063 bits per pixel per frame. Rounded down.
+///
+/// It is a worst case, and real desktop content measures 0.006 to 0.063, which
+/// is why it only ever chooses the point a session *opens* on. After that the
+/// ladder closes the loop on what the encoder is really producing.
+const OPENING_QUALITY: f64 = 0.06;
+
+/// The coarsest cadence frames are admitted at.
+///
+/// Five is 15 frames a second on a 75 Hz output, and below that a desktop stops
+/// feeling connected.
+const MAX_STRIDE: u32 = 5;
+
+/// The share of what the encoder is set to below which the target is retargeted
+/// down, and above which it is retargeted up.
+///
+/// Down is more eager than up because the two errors are not symmetric. Set 25%
+/// high, the bucket refuses a fifth of frames and a 75 Hz stream becomes 60.
+/// Set 25% low, the picture is slightly soft and nothing else happens. Set
+/// twice too high, half the frames go and the session is unusable.
+const RETARGET_DOWN: f64 = 0.8;
+const RETARGET_UP: f64 = 1.3;
+
+/// The smallest gap between two changes of the operating point.
+///
+/// Every one costs a full key frame, which on a 2 Mbit/s link is 768 ms of link
+/// time, and they are drawn from the same budget a client that lost a frame
+/// draws from.
+const DWELL: Duration = Duration::from_secs(1);
+
+/// The smallest gap between two changes of the encoded size, which the client
+/// must reconfigure its decoder for.
+const RESOLUTION_DWELL: Duration = Duration::from_secs(5);
+
+/// Refusals over this window that ask for a step down, as a share of the frames
+/// the rate limiter was offered.
+const REFUSAL_WINDOW: Duration = Duration::from_secs(2);
+const REFUSAL_SHARE: f64 = 0.10;
+
+/// Production under this share of the target over this window asks for a step
+/// up.
+///
+/// Sixty percent because a step from stride `n` to `n - 1` raises production by
+/// roughly `n / (n - 1)`, which is 1.5 at the tightest step, so anything above
+/// one over 1.5 of the target would step up into a refusal.
+const PRODUCTION_WINDOW: Duration = Duration::from_secs(5);
+const PRODUCTION_SHARE: f64 = 0.60;
 
 /// An encode size.
 ///
@@ -32,104 +94,69 @@ impl Size {
     }
 }
 
-/// Bits per pixel per frame, the measure the ladder decides on.
-///
-/// Resolution and frame rate both cancel, so one pair of thresholds covers every
-/// rung instead of a table of bitrates per size.
-fn bits_per_pixel_per_frame(bits_per_second: u32, size: Size, fps: u16) -> f32 {
-    let pixel_rate = size.pixels().saturating_mul(u32::from(fps));
-    if pixel_rate == 0 {
-        return 0.0;
-    }
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "both values are far below the exact integer range of a float"
-    )]
-    let ratio = bits_per_second as f32 / pixel_rate as f32;
-    ratio
+/// A change the ladder wants applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    /// The size to encode at.
+    pub size: Size,
+    /// The frame rate to declare, in millihertz.
+    ///
+    /// The encoder budgets bits as the bitrate divided by this and ignores when
+    /// frames actually arrive, so it is part of the same decision as the
+    /// bitrate rather than an independent knob. The pump delivers at it.
+    pub millihertz: u32,
+    /// The target, in bits per second.
+    pub bitrate: u32,
 }
 
-/// Below this the picture is visibly starved and the rung is too tall.
+/// What the encoder has done since the session started.
 ///
-/// Full-motion streaming at 1080p60 sits between 0.08 and 0.16 in practice, so
-/// this is already well under what a video service would accept, which is the
-/// latitude desktop content earns.
-const STARVED: f32 = 0.045;
-
-/// Above this there is room to climb.
-///
-/// The gap to [`STARVED`] is the hysteresis: a rung must be comfortably affordable
-/// before the ladder takes it, or it oscillates across a single threshold.
-const COMFORTABLE: f32 = 0.09;
-
-/// How long a reading must persist before the ladder steps down.
-const FALL_DWELL: Duration = Duration::from_secs(2);
-
-/// How long a reading must persist before the ladder steps up.
-///
-/// Climbing is slower than falling on purpose. A step costs a key frame, and
-/// being one rung low is far cheaper than flapping between two.
-const RISE_DWELL: Duration = Duration::from_secs(5);
-
-/// The smallest gap between resolution changes.
-///
-/// Each one costs a key frame and makes the client reconfigure its decoder.
-const RESOLUTION_DWELL: Duration = Duration::from_secs(5);
-
-/// Which way the ladder wants to move, and since when.
-#[derive(Debug, Clone, Copy)]
-enum Pressure {
-    Settled,
-    Falling(Instant),
-    Rising(Instant),
+/// Cumulative rather than per interval, so a sample missed or delayed still
+/// leaves the window exactly right about what it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Produced {
+    /// Capture frames the rate limiter was offered.
+    pub offered: u64,
+    /// Of those, the ones it refused because the picture would have cost more
+    /// than the link carries.
+    pub refused: u64,
+    /// Bits the encoder actually emitted.
+    pub bits: u64,
 }
 
 /// Tracks the encode settings a session should be using.
 #[derive(Debug)]
 pub struct Ladder {
     rungs: Vec<Size>,
-    rung: usize,
-    fps: u16,
-    bitrate: u32,
+    /// The output's own refresh, in millihertz, which every declared rate is a
+    /// whole fraction of.
+    refresh: u32,
     ceiling: u32,
-    pressure: Pressure,
-    last_resolution_change: Option<Instant>,
-}
-
-/// A change the ladder wants applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Settings {
-    /// The size to encode at.
-    pub size: Size,
-    /// The frame rate to declare.
-    ///
-    /// The encoder budgets bits as the bitrate divided by this, and ignores when
-    /// frames actually arrive, so it is part of the same decision as the bitrate
-    /// rather than an independent knob.
-    pub fps: u16,
-    /// The target, in bits per second.
-    pub bitrate: u32,
+    rung: usize,
+    stride: u32,
+    bitrate: u32,
+    /// What the encoder is known to hold, which is only ever what a caller has
+    /// said it applied.
+    applied: Settings,
+    /// Cumulative counters and when each was taken.
+    history: VecDeque<(Instant, Produced)>,
+    changed: Option<Instant>,
+    resized: Option<Instant>,
 }
 
 impl Ladder {
-    /// Builds a ladder of sizes no larger than `capture`, preserving its aspect
-    /// ratio so the scaler is never asked to stretch.
+    /// Builds a ladder for a `capture` refreshing `refresh` millihertz, opening
+    /// at whatever `target` bits a second can carry and never asking for more
+    /// than `ceiling`.
     ///
-    /// The scaler does not preserve aspect ratio unless told to, and the
-    /// correction it records never reaches the bitstream, so a client cannot
-    /// recover the geometry. Choosing rungs that keep the ratio avoids the
-    /// question entirely.
+    /// The rungs are halvings and nothing between them. Measured on this
+    /// hardware, scaling to three quarters costs more than not scaling at all:
+    /// 9.8 milliseconds against 7.6 at full size, while a halving costs 5.1. A
+    /// fraction that is not a power of two puts the scaler on an expensive
+    /// filter path, so an intermediate rung would buy a smaller picture for
+    /// more latency.
     #[must_use]
-    pub fn new(capture: Size, fps: u16, bitrate: u32) -> Self {
-        // Halvings, and nothing between them. Measured on this hardware, scaling
-        // to three quarters costs more than not scaling at all: 9.8 milliseconds
-        // against 7.6 at full size, while a halving costs 5.1. A fraction that
-        // is not a power of two puts the scaler on an expensive filter path, so
-        // an intermediate rung would buy a smaller picture for more latency.
-        //
-        // Few rungs is not a compromise here. Resolution is the last thing this
-        // ladder spends, after bitrate, so the fine-grained work happens before
-        // any of these are reached.
+    pub fn new(capture: Size, refresh: u32, target: u32, ceiling: u32) -> Self {
         let mut rungs = Vec::new();
         for shift in [2u32, 1, 0] {
             let size = Size {
@@ -143,113 +170,246 @@ impl Ladder {
         if rungs.is_empty() {
             rungs.push(capture);
         }
-        let rung = rungs.len() - 1;
+        let bitrate = target.min(ceiling).max(1);
+        let (rung, stride) = opening(&rungs, refresh, bitrate);
+        let applied = settings(&rungs, refresh, rung, stride, bitrate);
         Self {
             rungs,
+            refresh,
+            ceiling,
             rung,
-            fps,
+            stride,
             bitrate,
-            ceiling: bitrate,
-            pressure: Pressure::Settled,
-            last_resolution_change: None,
+            applied,
+            history: VecDeque::new(),
+            changed: None,
+            resized: None,
         }
     }
 
-    /// The settings currently in force.
+    /// The settings the ladder wants, which the encoder may not have taken.
     #[must_use]
     pub fn settings(&self) -> Settings {
-        Settings {
-            size: self.rungs[self.rung],
-            fps: self.fps,
-            bitrate: self.bitrate,
-        }
+        settings(
+            &self.rungs,
+            self.refresh,
+            self.rung,
+            self.stride,
+            self.bitrate,
+        )
     }
 
-    /// Feeds the ladder a fresh estimate of what the link will carry.
+    /// The settings the encoder is known to hold.
+    #[must_use]
+    pub const fn applied(&self) -> Settings {
+        self.applied
+    }
+
+    /// Records what the caller managed to apply.
     ///
-    /// Returns the settings to apply when they differ from what is in force.
-    /// The bitrate follows the estimate immediately, because it is the cheap
-    /// knob; the resolution follows only after the pressure has persisted and
-    /// the dwell has elapsed.
-    pub fn observe(&mut self, available_bits: u32, now: Instant) -> Option<Settings> {
-        let before = self.settings();
-        // Clamped, not followed. The transport reports what the path could carry,
-        // which on a fast local network is far more than anyone asked for: a
-        // Wi-Fi 6 link reported 216 Mbit/s, and encoding at that produces key
-        // frames too large for a client to reassemble before its deadline. The
-        // ceiling is what the user asked for and the estimate can only lower it.
-        let wanted = available_bits.min(self.ceiling);
-        if worth_a_key_frame(self.bitrate, wanted) {
-            self.bitrate = wanted;
+    /// The dwells are stamped here rather than where the decision was made,
+    /// because a change that was refused cost no key frame and must not spend
+    /// the interval that rations them. The measurement window is cleared with
+    /// them: what the encoder produced under the old settings says nothing
+    /// about the new ones.
+    pub fn acknowledge(&mut self, applied: Settings, now: Instant) {
+        if applied.size != self.applied.size {
+            self.resized = Some(now);
         }
-
-        let ratio = bits_per_pixel_per_frame(self.bitrate, self.rungs[self.rung], self.fps);
-        // The climb is judged at the rung it would climb into, not at the one it
-        // is standing on. A rung is a factor of four in pixels and the band
-        // between the two thresholds is a factor of two, so a ladder that asked
-        // "is this comfortable here?" would climb into a rung it cannot afford,
-        // starve there, fall back out, and repeat for the rest of the session.
-        // Asking "would it still be comfortable there?" makes the two decisions
-        // the same decision and settles by construction.
-        let above = self
-            .rungs
-            .get(self.rung + 1)
-            .map(|rung| bits_per_pixel_per_frame(self.bitrate, *rung, self.fps));
-        self.pressure = match (self.pressure, ratio, above) {
-            (Pressure::Falling(since), r, _) if r < STARVED => Pressure::Falling(since),
-            (_, r, _) if r < STARVED => Pressure::Falling(now),
-            (Pressure::Rising(since), _, Some(r)) if r > COMFORTABLE => Pressure::Rising(since),
-            (_, _, Some(r)) if r > COMFORTABLE => Pressure::Rising(now),
-            _ => Pressure::Settled,
-        };
-
-        let rested = self
-            .last_resolution_change
-            .is_none_or(|last| now.duration_since(last) >= RESOLUTION_DWELL);
-        if rested {
-            match self.pressure {
-                Pressure::Falling(since)
-                    if now.duration_since(since) >= FALL_DWELL && self.rung > 0 =>
-                {
-                    self.rung -= 1;
-                    self.settle(now);
-                }
-                Pressure::Rising(since)
-                    if now.duration_since(since) >= RISE_DWELL
-                        && self.rung + 1 < self.rungs.len() =>
-                {
-                    self.rung += 1;
-                    self.settle(now);
-                }
-                _ => {}
-            }
+        if applied != self.applied {
+            self.changed = Some(now);
+            self.history.clear();
         }
-
-        let after = self.settings();
-        (after != before).then_some(after)
+        self.applied = applied;
     }
 
-    fn settle(&mut self, now: Instant) {
-        self.pressure = Pressure::Settled;
-        self.last_resolution_change = Some(now);
+    /// Feeds the ladder the controller's target and what the encoder has done.
+    ///
+    /// Returns the settings to apply when they differ from what the encoder is
+    /// known to hold, and keeps reporting the same want until it is
+    /// acknowledged, so a refused change is asked for again rather than
+    /// forgotten.
+    pub fn observe(&mut self, target: u32, produced: Produced, now: Instant) -> Option<Settings> {
+        self.history.push_back((now, produced));
+        while self
+            .history
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > PRODUCTION_WINDOW)
+            && self.history.len() > 2
+        {
+            self.history.pop_front();
+        }
+
+        let target = target.min(self.ceiling).max(1);
+        if self.rested(now) {
+            self.retarget(target);
+            self.step(target, now);
+        }
+        let want = self.settings();
+        (want != self.applied).then_some(want)
+    }
+
+    /// Moves the encoder's operating point when the target has left the band it
+    /// was set for.
+    ///
+    /// The property setter has no equality guard of its own, so writing an
+    /// unchanged bitrate still costs a key frame: measured on a running
+    /// pipeline, writing 20000 over 20000 produced an IDR. Nothing here writes
+    /// one that has not moved outside the band.
+    fn retarget(&mut self, target: u32) {
+        let held = f64::from(self.bitrate);
+        let wanted = f64::from(target);
+        if wanted < RETARGET_DOWN * held || wanted > RETARGET_UP * held {
+            self.bitrate = target;
+        }
+    }
+
+    /// Closes the loop on what the rate limiter is actually doing.
+    fn step(&mut self, target: u32, now: Instant) {
+        if self.refusing() {
+            self.down(now);
+        } else if self.starved(target) {
+            self.up(now);
+        }
+    }
+
+    /// Whether the rate limiter refused more than its share of the frames it
+    /// was offered.
+    fn refusing(&self) -> bool {
+        let Some((offered, refused, _)) = self.over(REFUSAL_WINDOW) else {
+            return false;
+        };
+        if offered == 0 {
+            return false;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a frame count over two seconds is a few hundred"
+        )]
+        {
+            refused as f64 > REFUSAL_SHARE * offered as f64
+        }
+    }
+
+    /// Whether the encoder is producing so far under the target that a larger
+    /// picture or a faster one would fit.
+    fn starved(&self, target: u32) -> bool {
+        let Some((_, refused, bits)) = self.over(PRODUCTION_WINDOW) else {
+            return false;
+        };
+        let Some(seconds) = self.span(PRODUCTION_WINDOW) else {
+            return false;
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a bit count over five seconds is far below the exact integer range of a double"
+        )]
+        {
+            refused == 0 && bits as f64 / seconds < PRODUCTION_SHARE * f64::from(target)
+        }
+    }
+
+    /// Frame rate first, resolution last.
+    fn down(&mut self, now: Instant) {
+        if self.stride < MAX_STRIDE {
+            self.stride += 1;
+        } else if self.rung > 0 && self.resolution_rested(now) {
+            self.rung -= 1;
+            self.stride = 1;
+        }
+    }
+
+    fn up(&mut self, now: Instant) {
+        if self.stride > 1 {
+            self.stride -= 1;
+        } else if self.rung + 1 < self.rungs.len() && self.resolution_rested(now) {
+            self.rung += 1;
+            // Four times the pixels at half the rate is twice the demand, not
+            // four times it, so the climb into a larger rung lands somewhere it
+            // has a chance of affording rather than at the top of it.
+            self.stride = 2;
+        }
+    }
+
+    fn rested(&self, now: Instant) -> bool {
+        self.changed
+            .is_none_or(|last| now.duration_since(last) >= DWELL)
+    }
+
+    fn resolution_rested(&self, now: Instant) -> bool {
+        self.resized
+            .is_none_or(|last| now.duration_since(last) >= RESOLUTION_DWELL)
+    }
+
+    /// Offered, refused and bits produced over the last `window`, taken as the
+    /// difference between the cumulative counters at each end of it.
+    ///
+    /// `None` while the history covers less than half of what was asked for: a
+    /// window that has not run yet has not measured what it claims to.
+    fn over(&self, window: Duration) -> Option<(u64, u64, u64)> {
+        let (end, last) = self.history.back()?;
+        let (at, first) = self
+            .history
+            .iter()
+            .find(|(at, _)| end.duration_since(*at) <= window)?;
+        if end.duration_since(*at) * 2 < window {
+            return None;
+        }
+        Some((
+            last.offered.saturating_sub(first.offered),
+            last.refused.saturating_sub(first.refused),
+            last.bits.saturating_sub(first.bits),
+        ))
+    }
+
+    /// Seconds the window actually spans.
+    fn span(&self, window: Duration) -> Option<f64> {
+        let (end, _) = self.history.back()?;
+        let (start, _) = self
+            .history
+            .iter()
+            .find(|(at, _)| end.duration_since(*at) <= window)?;
+        let span = end.duration_since(*start).as_secs_f64();
+        (span > 0.0).then_some(span)
     }
 }
 
-/// Whether moving the encoder's target from `held` to `wanted` buys enough to
-/// be worth the key frame it costs.
+/// The largest rung, and the smallest stride, whose worst case fits `target`.
 ///
-/// Setting the bitrate marks the encoder for reconfiguration and
-/// reconfiguration resets its state, so every step is a full IDR out of the
-/// budget the client's own requests are drawn from. The estimate is a live
-/// measurement of a Wi-Fi path and never repeats, so a ladder that followed it
-/// exactly asked for a key frame on every tick of the rate controller and left
-/// the budget empty when a client that had lost a frame needed one.
-///
-/// An eighth: two steps cover a link that halves, which is faster than any
-/// congestion event this reacts to, and nothing smaller than that changes the
-/// picture enough to see.
-fn worth_a_key_frame(held: u32, wanted: u32) -> bool {
-    held.abs_diff(wanted) > held / 8
+/// Worked through at 74.983 Hz on a 3440x1440 capture, this puts 2 Mbit/s at
+/// 1720x720 and 25 frames a second, 8 Mbit/s at 3440x1440 and 25, 20 Mbit/s at
+/// 3440x1440 and 37.5, and 25 Mbit/s at the full size and rate. Native
+/// resolution at 25 frames a second on 8 Mbit/s is the right answer for a
+/// desktop, and it is what the session that provoked this design should have
+/// produced.
+fn opening(rungs: &[Size], refresh: u32, target: u32) -> (usize, u32) {
+    for (index, rung) in rungs.iter().enumerate().rev() {
+        for stride in 1..=MAX_STRIDE {
+            if worst_case(*rung, refresh, stride) <= f64::from(target) {
+                return (index, stride);
+            }
+        }
+    }
+    (0, MAX_STRIDE)
+}
+
+/// Bits a second the busiest desktop content measured would cost at this
+/// operating point.
+fn worst_case(rung: Size, refresh: u32, stride: u32) -> f64 {
+    OPENING_QUALITY * f64::from(rung.pixels()) * declared(refresh, stride)
+}
+
+/// The frame rate a stride declares, in frames a second.
+fn declared(refresh: u32, stride: u32) -> f64 {
+    f64::from(refresh) / 1000.0 / f64::from(stride.max(1))
+}
+
+fn settings(rungs: &[Size], refresh: u32, rung: usize, stride: u32, bitrate: u32) -> Settings {
+    Settings {
+        size: rungs[rung],
+        millihertz: (refresh / stride.max(1)).max(1),
+        bitrate,
+    }
 }
 
 /// Rounds down to an even number.
@@ -267,239 +427,235 @@ fn round_to_even(value: u32) -> u16 {
 mod tests {
     use super::*;
 
+    /// The output every measurement in `spec/findings.md` was taken on.
     const NATIVE: Size = Size {
-        width: 2880,
-        height: 1800,
+        width: 3440,
+        height: 1440,
     };
+    const REFRESH: u32 = 74_983;
+    const CEILING: u32 = 20_000_000;
 
-    fn ladder() -> Ladder {
-        Ladder::new(NATIVE, 60, 40_000_000)
+    fn ladder(target: u32) -> Ladder {
+        Ladder::new(NATIVE, REFRESH, target, CEILING)
+    }
+
+    /// A session in which the encoder produces exactly `bits` a second and the
+    /// rate limiter refuses nothing, sampled four times a second.
+    fn steady(ladder: &mut Ladder, target: u32, bits: u64, seconds: u32) -> Vec<Settings> {
+        let start = Instant::now();
+        let mut produced = Produced::default();
+        let mut applied = Vec::new();
+        for tick in 1..=seconds * 4 {
+            let now = start + Duration::from_millis(u64::from(tick) * 250);
+            produced.offered += 19;
+            produced.bits += bits / 4;
+            if let Some(want) = ladder.observe(target, produced, now) {
+                ladder.acknowledge(want, now);
+                applied.push(want);
+            }
+        }
+        applied
     }
 
     #[test]
-    fn every_rung_is_even_in_both_axes() {
-        for rung in ladder().rungs {
+    fn every_rung_is_a_halving_and_even_in_both_axes() {
+        let ladder = ladder(8_000_000);
+        for rung in &ladder.rungs {
             assert_eq!(rung.width % 2, 0, "{rung:?}");
             assert_eq!(rung.height % 2, 0, "{rung:?}");
-        }
-    }
-
-    #[test]
-    fn the_capture_size_is_offered_even_when_it_is_not_a_multiple_of_sixteen() {
-        // The encoder codes 1800 as 1808 and attaches a crop, so the size a
-        // client is told to display and the size actually coded are reported
-        // separately rather than the ladder refusing the size people asked for.
-        assert_ne!(NATIVE.height % 16, 0);
-        assert!(ladder().rungs.contains(&NATIVE));
-    }
-
-    #[test]
-    fn the_rungs_are_halvings_and_nothing_between() {
-        // Measured: scaling to three quarters costs more than not scaling at
-        // all, so an intermediate rung would buy a smaller picture for more
-        // latency. Any rung that is not a power-of-two fraction is a bug.
-        let ladder = ladder();
-        for rung in &ladder.rungs {
             let ratio = f64::from(NATIVE.width) / f64::from(rung.width);
             assert!(
                 (ratio - ratio.round()).abs() < 0.01 && ratio.round().log2().fract() == 0.0,
                 "{rung:?} is not a halving of {NATIVE:?}"
             );
-        }
-    }
-
-    #[test]
-    fn the_ladder_starts_at_the_capture_size() {
-        assert_eq!(ladder().settings().size, NATIVE);
-    }
-
-    #[test]
-    fn every_rung_keeps_the_capture_aspect_ratio() {
-        let native = f64::from(NATIVE.width) / f64::from(NATIVE.height);
-        for rung in ladder().rungs {
-            let ratio = f64::from(rung.width) / f64::from(rung.height);
+            let shape = f64::from(rung.width) / f64::from(rung.height);
             assert!(
-                (ratio - native).abs() < 0.02,
+                (shape - f64::from(NATIVE.width) / f64::from(NATIVE.height)).abs() < 0.02,
                 "{rung:?} would make the scaler stretch the picture"
             );
         }
     }
 
     #[test]
-    fn the_estimate_can_lower_the_bitrate_but_never_raise_it_past_the_ceiling() {
-        let mut ladder = ladder();
-        let ceiling = ladder.settings().bitrate;
-        let now = Instant::now();
-
-        ladder.observe(u32::MAX, now);
-        assert_eq!(
-            ladder.settings().bitrate,
-            ceiling,
-            "a fast link must not raise the encoder above what was asked for"
-        );
-
-        ladder.observe(ceiling / 4, now);
-        assert_eq!(
-            ladder.settings().bitrate,
-            ceiling / 4,
-            "a slow link must still lower it"
-        );
+    fn the_opening_point_is_the_largest_picture_the_target_can_carry() {
+        // The worked table in `spec/congestion.md`, on this output.
+        for (target, width, fps) in [
+            (2_000_000, 1720, 24),
+            (8_000_000, 3440, 24),
+            (20_000_000, 3440, 37),
+            (25_000_000, 3440, 74),
+        ] {
+            let opened = Ladder::new(NATIVE, REFRESH, target, 40_000_000).settings();
+            assert_eq!(opened.size.width, width, "at {target} bit/s");
+            assert_eq!(opened.millihertz / 1000, fps, "at {target} bit/s");
+        }
     }
 
     #[test]
-    fn bitrate_follows_the_estimate_without_waiting() {
-        let mut ladder = ladder();
-        let now = Instant::now();
-        let applied = ladder
-            .observe(30_000_000, now)
-            .expect("a bitrate change applies at once");
-        assert_eq!(applied.bitrate, 30_000_000);
-        assert_eq!(applied.size, NATIVE, "resolution must not move this fast");
+    fn a_session_opens_sharp_and_slow_rather_than_soft_and_fast() {
+        // Sharp text at 25 Hz beats soft text at 75, and eight megabits buys
+        // the whole picture at 25 rather than a quarter of it at 75.
+        let opened = ladder(8_000_000).settings();
+        assert_eq!(opened.size, NATIVE);
+        assert!(opened.millihertz < REFRESH / 2);
     }
 
     #[test]
-    fn a_starved_link_steps_the_resolution_down_but_only_after_the_dwell() {
-        let mut ladder = ladder();
+    fn a_want_nobody_applied_is_asked_for_again() {
+        // Every change costs a key frame out of a budget that refuses. A ladder
+        // that recorded what it asked for would believe the encoder had moved
+        // and would never ask again, and the two would stay apart for the rest
+        // of the session.
+        let mut ladder = ladder(2_000_000);
+        let now = Instant::now() + DWELL;
+        let want = ladder
+            .observe(12_000_000, Produced::default(), now)
+            .expect("a six-fold rise asks for a change");
+        assert_eq!(
+            ladder.observe(12_000_000, Produced::default(), now),
+            Some(want),
+            "a want nobody acknowledged is still a want"
+        );
+        ladder.acknowledge(want, now);
+        assert_eq!(
+            ladder.observe(12_000_000, Produced::default(), now),
+            None,
+            "and once applied it is not asked for again"
+        );
+        assert_eq!(ladder.applied(), want);
+    }
+
+    #[test]
+    fn the_bitrate_moves_only_when_it_leaves_the_band() {
+        let mut ladder = ladder(8_000_000);
         let start = Instant::now();
-        ladder.observe(2_000_000, start);
-        assert_eq!(ladder.settings().size, NATIVE, "the dwell has not elapsed");
+        let held = ladder.applied().bitrate;
 
-        let settled = ladder
-            .observe(2_000_000, start + FALL_DWELL)
-            .expect("a sustained shortfall steps down");
+        // Writing an unchanged bitrate is not free: the setter has no equality
+        // guard, so the write alone costs a key frame.
+        for target in [held * 9 / 10, held * 6 / 5] {
+            assert_eq!(
+                ladder
+                    .observe(target, Produced::default(), start + DWELL)
+                    .map(|want| want.bitrate),
+                None,
+                "{target} is inside the band around {held}"
+            );
+        }
+        assert_eq!(
+            ladder
+                .observe(held / 2, Produced::default(), start + DWELL)
+                .map(|want| want.bitrate),
+            Some(held / 2),
+            "a link that halved must be followed"
+        );
+    }
+
+    #[test]
+    fn the_ladder_never_asks_for_more_than_the_ceiling() {
+        let mut ladder = ladder(2_000_000);
+        for applied in steady(&mut ladder, u32::MAX, 40_000_000, 60) {
+            assert!(applied.bitrate <= CEILING, "{applied:?}");
+        }
+        assert_eq!(ladder.applied().bitrate, CEILING);
+    }
+
+    /// The rate limiter refusing a fifth of what it is offered, sampled four
+    /// times a second, for `seconds`.
+    fn refusing(ladder: &mut Ladder, target: u32, seconds: u32) -> Vec<Settings> {
+        let start = Instant::now();
+        let mut produced = Produced::default();
+        let mut applied = Vec::new();
+        for tick in 1..=seconds * 4 {
+            let now = start + Duration::from_millis(u64::from(tick) * 250);
+            produced.offered += 19;
+            produced.refused += 4;
+            produced.bits += 250_000;
+            if let Some(want) = ladder.observe(target, produced, now) {
+                ladder.acknowledge(want, now);
+                applied.push(want);
+            }
+        }
+        applied
+    }
+
+    #[test]
+    fn refusals_step_the_frame_rate_down_before_the_resolution() {
+        let mut ladder = Ladder::new(NATIVE, REFRESH, 25_000_000, 40_000_000);
+        assert_eq!(ladder.applied().size, NATIVE, "the whole picture at 75 Hz");
+        let opened = ladder.applied().millihertz;
+
+        let applied = refusing(&mut ladder, 25_000_000, 4);
         assert!(
-            settled.size.pixels() < NATIVE.pixels(),
-            "expected a smaller rung, got {settled:?}"
+            applied.iter().all(|want| want.size == NATIVE),
+            "the picture shrank while the frame rate still had room: {applied:?}"
+        );
+        assert!(
+            ladder.applied().millihertz * 4 <= opened,
+            "four steps of stride must be spent first, and left {}",
+            ladder.applied().millihertz
         );
     }
 
     #[test]
-    fn a_brief_dip_does_not_move_the_resolution() {
-        let mut ladder = ladder();
-        let start = Instant::now();
-        ladder.observe(2_000_000, start);
-        ladder.observe(40_000_000, start + Duration::from_millis(500));
-        ladder.observe(40_000_000, start + FALL_DWELL + Duration::from_secs(1));
+    fn a_link_that_refuses_even_the_slowest_rate_gives_up_the_picture() {
+        let mut ladder = Ladder::new(NATIVE, REFRESH, 25_000_000, 40_000_000);
+        let applied = refusing(&mut ladder, 25_000_000, 12);
+        let shrank = applied.iter().position(|want| want.size != NATIVE);
+        assert!(
+            shrank.is_some_and(|at| at >= 4),
+            "the picture must be the last thing spent, and went at change {shrank:?}"
+        );
+        assert!(ladder.applied().size.pixels() < NATIVE.pixels());
+    }
+
+    #[test]
+    fn a_link_with_room_to_spare_climbs_back_to_the_whole_picture() {
+        let mut ladder = ladder(2_000_000);
+        assert!(ladder.applied().size.pixels() < NATIVE.pixels());
+        // Twenty megabits, and an encoder producing four, which is well under
+        // the sixty percent that says a larger picture would fit.
+        steady(&mut ladder, 20_000_000, 4_000_000, 120);
         assert_eq!(
-            ladder.settings().size,
+            ladder.applied().size,
             NATIVE,
-            "a transient dip must not cost a key frame"
+            "a link that carries the whole picture must be used for it"
         );
     }
 
     #[test]
-    fn the_ladder_cannot_oscillate_between_two_rungs() {
-        let mut ladder = ladder();
-        let mut now = Instant::now();
-        for _ in 0..40 {
-            now += Duration::from_millis(500);
-            ladder.observe(2_000_000, now);
-        }
-        let bottom = ladder.settings().size;
-
-        let mut changes = 0;
-        for _ in 0..40 {
-            now += Duration::from_millis(500);
-            // A reading that sits exactly between the two thresholds.
-            let between = bits_per_pixel_per_frame(1, bottom, 60);
-            #[expect(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "a contrived bitrate for one assertion"
-            )]
-            let bits = (f32::midpoint(STARVED, COMFORTABLE) / between) as u32;
-            if ladder.observe(bits, now).is_some_and(|s| s.size != bottom) {
-                changes += 1;
-            }
-        }
-        assert_eq!(
-            changes, 0,
-            "a reading inside the hysteresis band must settle"
+    fn an_encoder_spending_its_whole_budget_is_left_alone() {
+        let mut ladder = Ladder::new(NATIVE, REFRESH, 8_000_000, CEILING);
+        let opened = ladder.applied();
+        let changes = steady(&mut ladder, 8_000_000, 8_000_000, 60);
+        assert!(
+            changes.is_empty(),
+            "a session spending its budget must not be reconfigured: {changes:?}"
         );
-    }
-
-    /// A steady link, read four times a second, with the one per cent jitter a
-    /// live estimator has. Nothing about the path is changing.
-    fn jittering(tick: u32) -> u32 {
-        12_000_000 + (tick.wrapping_mul(7919) % 240_000)
+        assert_eq!(ladder.applied(), opened);
     }
 
     #[test]
-    fn a_jittering_estimate_does_not_retarget_the_encoder_on_every_tick() {
-        // Every bitrate change costs a key frame: the property setter marks the
-        // encoder for reconfiguration and reconfiguration resets its state. The
-        // host draws that key frame from the same budget the client's own
-        // requests draw from, so a ladder that followed the estimate exactly
-        // would spend the whole budget on itself and leave a client that lost a
-        // frame with nothing to recover from.
-        let mut ladder = ladder();
-        let mut now = Instant::now();
+    fn a_jittering_target_does_not_retarget_the_encoder_on_every_tick() {
+        // Every change costs a key frame, drawn from the same budget a client
+        // that lost a frame draws from.
+        let mut ladder = ladder(12_000_000);
+        let start = Instant::now();
+        let mut produced = Produced::default();
         let mut changes = 0;
-        for tick in 0..240u32 {
-            now += Duration::from_millis(250);
-            if ladder.observe(jittering(tick), now).is_some() {
+        for tick in 1..=240u32 {
+            let now = start + Duration::from_millis(u64::from(tick) * 250);
+            produced.offered += 19;
+            produced.bits += 3_000_000;
+            let target = 12_000_000 + (tick.wrapping_mul(7919) % 240_000);
+            if let Some(want) = ladder.observe(target, produced, now) {
+                ladder.acknowledge(want, now);
                 changes += 1;
             }
         }
         assert!(
-            changes <= 4,
-            "a minute on an unchanging link must not cost {changes} key frames"
-        );
-    }
-
-    #[test]
-    fn a_link_that_sits_between_two_rungs_settles_on_one_of_them() {
-        // The hysteresis band is a factor of two and a rung is a factor of four
-        // in pixels, so judging a climb by the rung the ladder is standing on
-        // lets it climb into a rung it cannot afford. It is starved there, falls
-        // out, is comfortable again, and climbs back. Each pass costs two key
-        // frames, drawn from the same budget a client's own request draws from.
-        //
-        // Nine megabits is starved at the full size and comfortable at a quarter
-        // of it, which is the whole width of the trap.
-        const BETWEEN: u32 = 9_000_000;
-        let mut ladder = ladder();
-        let mut now = Instant::now();
-        for _ in 0..60 {
-            now += Duration::from_millis(500);
-            ladder.observe(BETWEEN, now);
-        }
-        let settled = ladder.settings().size;
-
-        let mut changes = 0;
-        for _ in 0..60 {
-            now += Duration::from_millis(500);
-            if ladder
-                .observe(BETWEEN, now)
-                .is_some_and(|s| s.size != settled)
-            {
-                changes += 1;
-            }
-        }
-        assert_eq!(
-            changes, 0,
-            "an unchanging link must not move the resolution at all, and moved it {changes} times"
-        );
-    }
-
-    #[test]
-    fn recovery_climbs_back_up() {
-        let mut ladder = ladder();
-        let mut now = Instant::now();
-        for _ in 0..20 {
-            now += Duration::from_secs(1);
-            ladder.observe(1_000_000, now);
-        }
-        let bottom = ladder.settings().size;
-        assert!(bottom.pixels() < NATIVE.pixels());
-
-        for _ in 0..40 {
-            now += Duration::from_secs(1);
-            ladder.observe(60_000_000, now);
-        }
-        assert!(
-            ladder.settings().size.pixels() > bottom.pixels(),
-            "a link that recovered must be used"
+            changes <= 8,
+            "a minute on an unchanging link cost {changes} key frames"
         );
     }
 }

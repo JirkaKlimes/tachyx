@@ -578,7 +578,10 @@ async fn a_matching_version_negotiates_and_carries_input_and_heartbeats() {
         last_frame: Some(FrameId(41)),
         frames_sent: 42,
         frames_gated: 1,
+        frames_refused: 0,
         pacing_rate: host.video.pacing_rate(),
+        estimate: Some(8_000_000),
+        padding_sent: 0,
         pipeline_micros: 7300,
     });
     let input = ClientMessage::Input(InputBatch {
