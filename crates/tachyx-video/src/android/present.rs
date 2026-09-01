@@ -166,12 +166,21 @@ impl VideoTexture {
         self.shared.wake.notify_one();
     }
 
-    /// The first thing that went wrong, if anything has.
+    /// The first thing that went wrong, or why nothing is being decoded.
     ///
-    /// A client showing no picture otherwise gives no reason for it.
+    /// A client showing no picture otherwise gives no reason for it, and on this
+    /// path there are two reasons that are not failures and clear by themselves:
+    /// no parameter set has arrived yet, and Flutter is offering no surface to
+    /// draw into. Both leave every access unit on the floor, and a viewer looking
+    /// at a black rectangle cannot tell either from a decoder that has crashed.
+    /// A real failure outranks them and is reported for good.
     #[must_use]
     pub fn failure(&self) -> Option<String> {
-        self.shared.failure.get().cloned()
+        self.shared
+            .failure
+            .get()
+            .cloned()
+            .or_else(|| self.shared.locked().stalled.clone())
     }
 
     /// What the path has done so far.
@@ -226,6 +235,9 @@ struct State {
     /// key frame arrives, because a picture whose references were discarded
     /// decodes to nothing at best and to a smear at worst.
     resyncing: bool,
+    /// Why the last access unit was thrown away, cleared by the next frame that
+    /// decodes.
+    stalled: Option<String>,
     stopping: bool,
     pushed: u64,
     decoded: u64,
@@ -291,10 +303,18 @@ impl Shared {
         state.resyncing
     }
 
+    /// Why the last access unit could not be used. Not a failure: both reasons
+    /// clear by themselves, one at the next key frame and one when the
+    /// application is in front again.
+    fn stall(&self, reason: impl Into<String>) {
+        self.locked().stalled = Some(reason.into());
+    }
+
     /// One frame out of the decoder, `drawn` if it went to the screen.
     fn decoded(&self, pushed: Duration, drawn: bool) {
         let latency = self.start.elapsed().saturating_sub(pushed);
         let mut state = self.locked();
+        state.stalled = None;
         state.decoded += 1;
         state.decode.record(latency);
         if drawn {
@@ -381,16 +401,30 @@ impl<'a> Decoding<'a> {
             self.coded = Some(coded);
         }
         if self.shared.skipping(read.key) {
+            self.shared
+                .stall("the decoder is waiting for a key frame to start again from");
             return Ok(Took::Dropped);
         }
         // Nothing has said how large the pictures are, which is the one thing
         // the decoder cannot be started without. The next key frame carries it,
         // because the host repeats the parameter sets before every one.
         let Some(coded) = self.coded else {
+            self.shared
+                .stall("no sequence parameter set has arrived, so the picture size is unknown");
             return Ok(Took::Dropped);
         };
-        self.prepare(coded)?;
+        // A decoder that will not start is not the end of the path. The surface
+        // it is offered is replaced whenever the producer is resized, and one
+        // that has just been abandoned refuses every codec until the next
+        // arrives. So this is said rather than raised, and the next key frame
+        // tries again.
+        if let Err(refused) = self.prepare(coded) {
+            self.shared.stall(refused.to_string());
+            return Ok(Took::Dropped);
+        }
         let Some(decoder) = self.decoder.as_mut() else {
+            self.shared
+                .stall("Flutter is offering no surface for the decoder to draw into");
             return Ok(Took::Dropped);
         };
         Ok(match decoder.feed(unit, at)? {

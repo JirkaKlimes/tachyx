@@ -136,6 +136,8 @@ enum Command {
     Input(Timestamp, InputEvent),
     /// The client can take something different now.
     Viewport(Capabilities),
+    /// Complete pictures go here from now on.
+    Present(Arc<dyn FrameSink>),
 }
 
 /// A live session with a host.
@@ -225,9 +227,11 @@ impl Link {
     ///
     /// Separate from [`Link::connect`] because a Flutter texture can only be
     /// registered from the platform thread, which is not the thread a connection
-    /// can be opened on.
+    /// can be opened on. That gap is why this goes through the loop rather than
+    /// writing the sink here: the loop also has to tell the host that a decoder
+    /// now exists which has decoded nothing.
     pub fn present_on(&self, sink: Arc<dyn FrameSink>) {
-        self.shared.state().sink = Some(sink);
+        let _ = self.commands.send(Command::Present(sink));
     }
 
     /// Records what the user did at `at` on the client's session clock.

@@ -286,6 +286,20 @@ impl Session {
             .push_back(ClientMessage::ViewportChanged(capabilities));
     }
 
+    /// Says a decoder has appeared after pictures were already thrown away.
+    ///
+    /// Those pictures reached the client whole, so reassembly saw nothing wrong
+    /// and has no reason to ask for anything; only the caller knows they went
+    /// nowhere. Without this a session whose decoder arrived one picture late
+    /// shows nothing until the next key frame, and on a stream that is losing
+    /// nothing the next key frame can be minutes away.
+    pub fn decoder_started_late(&mut self, now: Instant) {
+        self.outgoing
+            .push_back(ClientMessage::KeyframeRequest { after: None });
+        self.asked_for_key = true;
+        self.ask_again_at = now + KEYFRAME_REQUEST_GAP;
+    }
+
     /// Asks for a key frame on the edge where the decoder becomes stuck, and
     /// arms the next request on the edge where it is unstuck again.
     ///

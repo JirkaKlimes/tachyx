@@ -15,7 +15,7 @@ use tachyx_transport::{Client, ClientSession, ControlError, ControlReader, Contr
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
-use crate::{Command, Shared, GOODBYE};
+use crate::{Command, GOODBYE, Shared};
 
 /// How long input is collected before a batch goes out.
 ///
@@ -47,6 +47,8 @@ pub(crate) async fn session(
 
     let mut to_host = to_host;
     let mut flush_at: Option<Instant> = None;
+    // Whether a complete picture has been thrown away for want of a decoder.
+    let mut unshown = false;
     let ended = loop {
         let expiry = session.next_deadline();
         let ended = tokio::select! {
@@ -60,8 +62,13 @@ pub(crate) async fn session(
                             // takes, and the statistics panel reads this same
                             // lock from the thread that draws the application.
                             let sink = shared.state().sink.clone();
-                            if let Some(sink) = sink {
-                                sink.push(frame.data);
+                            match sink {
+                                Some(sink) => sink.push(frame.data),
+                                // Nothing is presenting yet, so this picture is
+                                // gone and every picture after it refers back to
+                                // one no decoder has seen. Only this loop knows:
+                                // reassembly saw the picture arrive whole.
+                                None => unshown = true,
                             }
                         }
                         Ok(None) => {}
@@ -89,6 +96,13 @@ pub(crate) async fn session(
                 }
                 Some(Command::Viewport(capabilities)) => {
                     session.capabilities_changed(capabilities);
+                    None
+                }
+                Some(Command::Present(sink)) => {
+                    shared.state().sink = Some(sink);
+                    if std::mem::take(&mut unshown) {
+                        session.decoder_started_late(Instant::now());
+                    }
                     None
                 }
                 // The handle is gone, so the user has left.
