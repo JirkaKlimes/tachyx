@@ -24,6 +24,17 @@ use crate::ladder::{Ladder, Settings, Size as RungSize};
 /// How often the rate controller looks at what the link is carrying.
 const RATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The longest a picture may stay wrong before a key frame repairs it.
+///
+/// The encoder's own key frame interval counts FRAMES, which is the wrong unit
+/// for this. Capture blocks until the screen changes, so a desktop nobody is
+/// touching produces a couple of frames a second, and an interval of a hundred
+/// and twenty frames is two seconds of a busy screen but a minute of a quiet
+/// one. A frame lost during a quiet period would leave the picture frozen for
+/// that minute, and the less that is happening the longer the freeze: the
+/// opposite of what anyone would expect.
+const KEY_FRAME_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How often the send gate is re-examined while nothing is being encoded.
 ///
 /// Short enough that a gate which shut on a burst reopens within a frame or two
@@ -196,6 +207,7 @@ async fn run(
     budget.request(Reason::Startup, Instant::now());
     let started = Instant::now();
     let sent_frames = Arc::new(AtomicU64::new(0));
+    let mut last_key = Instant::now();
 
     let pump = {
         let sent_frames = Arc::clone(&sent_frames);
@@ -248,6 +260,7 @@ async fn run(
     // liveness from a beat that did not arrive, so it has to expect the same
     // one the host keeps.
     let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut key_frame_tick = tokio::time::interval(KEY_FRAME_MAX_AGE / 4);
     let connection = session.connection.clone();
 
     let outcome = loop {
@@ -264,8 +277,10 @@ async fn run(
                     }
                 }
                 Ok(ClientMessage::KeyframeRequest { .. }) => {
-                    if budget.request(Reason::ClientRequest, Instant::now()) == Verdict::Allow {
+                    let now = Instant::now();
+                    if budget.request(Reason::ClientRequest, now) == Verdict::Allow {
                         encoder.force_keyframe();
+                        last_key = now;
                     }
                 }
                 Ok(ClientMessage::ViewportChanged(changed)) => {
@@ -291,18 +306,11 @@ async fn run(
                     apply(&encoder, &mut budget, size, bits, &mut session.to_client).await?;
                 }
             }
+            _ = key_frame_tick.tick() => {
+                repair_if_stale(&encoder, &mut budget, &mut last_key);
+            }
             _ = heartbeat_tick.tick() => {
-                let stats = capture.stats();
-                let beat = Heartbeat {
-                    sent: Timestamp::from_session_micros(
-                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    ),
-                    last_frame: None,
-                    frames_sent: sent_frames.load(Ordering::Relaxed),
-                    frames_gated: stats.dropped,
-                    pacing_rate: connection.congestion_state().metrics().pacing_rate,
-                    pipeline_micros: 0,
-                };
+                let beat = beat(&capture, &connection, started, &sent_frames);
                 if session.to_client.send(&HostMessage::Heartbeat(beat)).await.is_err() {
                     break Ok(());
                 }
@@ -391,6 +399,44 @@ fn stream_config(encoder: &Encoder, bitrate: Bitrate) -> Result<StreamConfig, Se
         bitrate: std::num::NonZeroU32::new(bitrate.kbps() * 1000)
             .ok_or(SessionError::Unsendable)?,
     })
+}
+
+/// Asks for a key frame when the last one is old enough that a loss nobody
+/// reported would still be showing.
+///
+/// On a clock rather than a frame count. The encoder applies the request to the
+/// next picture it encodes, so a screen producing nothing pays nothing: the cost
+/// lands on the first frame after the quiet, which is exactly the frame a client
+/// needs to be able to decode.
+/// What the host has been doing, for a client that cannot tell a still screen
+/// from a host that has gone away.
+fn beat(
+    capture: &Capture,
+    connection: &quinn::Connection,
+    started: Instant,
+    sent_frames: &AtomicU64,
+) -> Heartbeat {
+    let stats = capture.stats();
+    Heartbeat {
+        sent: Timestamp::from_session_micros(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        ),
+        last_frame: None,
+        frames_sent: sent_frames.load(Ordering::Relaxed),
+        frames_gated: stats.dropped,
+        pacing_rate: connection.congestion_state().metrics().pacing_rate,
+        pipeline_micros: 0,
+    }
+}
+
+fn repair_if_stale(encoder: &Encoder, budget: &mut Budget, last_key: &mut Instant) {
+    let now = Instant::now();
+    if now.duration_since(*last_key) >= KEY_FRAME_MAX_AGE
+        && budget.request(Reason::Periodic, now) == Verdict::Allow
+    {
+        encoder.force_keyframe();
+        *last_key = now;
+    }
 }
 
 fn rung(size: tachyx_media::Size) -> RungSize {

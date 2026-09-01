@@ -28,6 +28,9 @@ pub enum Reason {
     Resolution,
     /// The client lost a frame and cannot continue from what it has.
     ClientRequest,
+    /// Enough time has passed that a picture damaged by a loss nobody reported
+    /// should be repaired anyway.
+    Periodic,
 }
 
 /// What a request for a key frame is worth against the budget.
@@ -132,6 +135,18 @@ mod tests {
             budget.request(Reason::Startup, now),
             Verdict::Allow,
             "refusing here leaves the client with nothing to decode"
+        );
+    }
+
+    #[test]
+    fn a_periodic_repair_draws_from_the_same_budget_as_everything_else() {
+        let mut budget = Budget::new(TARGET);
+        let now = Instant::now();
+        assert_eq!(budget.request(Reason::Periodic, now), Verdict::Allow);
+        assert_eq!(
+            budget.request(Reason::ClientRequest, now),
+            Verdict::Refuse,
+            "a repair the host scheduled must not be free of the shared allowance"
         );
     }
 

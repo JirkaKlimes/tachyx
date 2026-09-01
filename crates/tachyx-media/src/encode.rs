@@ -41,6 +41,14 @@ const MIN_KEYFRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// The NAL unit type that carries padding and nothing else.
 const NAL_FILLER: u8 = 12;
 
+/// How long a lost frame may leave the picture wrong.
+///
+/// The scheduled key frame is the only thing that ends the damage: this encoder
+/// offers neither intra refresh nor long-term reference frames, so there is no
+/// cheaper repair. A client that notices asks for one sooner; this bounds the
+/// case where it does not notice, or where its request was refused.
+const KEY_FRAME_INTERVAL_SECONDS: u32 = 2;
+
 /// What to encode, and at what rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeConfig {
@@ -584,7 +592,14 @@ fn configure_encoder(encoder: &gst::Element) {
     // Measured: at a hundred the requested buffer is honoured and no filler
     // returns.
     encoder.set_property("target-percentage", 100u32);
-    encoder.set_property("key-int-max", 1024u32);
+    // Two seconds, not the seventeen that a thousand frames comes to at sixty
+    // hertz. This is the ceiling on how long a picture stays wrong: with one
+    // reference frame and no intra refresh, a single frame lost on the wire
+    // leaves every frame after it undecodable until the next key frame, and
+    // measured on a phone that cost nine hundred frames out of two thousand
+    // eight hundred. Key frames are cheap enough to spend now that parity
+    // carries them and the picture is scaled to what the client shows.
+    encoder.set_property("key-int-max", KEY_FRAME_INTERVAL_SECONDS * 60u32);
     encoder.set_property("b-frames", 0u32);
     encoder.set_property("ref-frames", 1u32);
     encoder.set_property("aud", true);
