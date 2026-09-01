@@ -184,6 +184,15 @@ rate, and caps declaring 30 while capture delivers 120 produces four times it.
 Bitrate and frame rate are therefore one setting, not two, and the declared rate
 must track the output's refresh rate rather than a nominal figure.
 
+### The scaler does not convert frame rate
+
+Asking it to is a negotiation failure, not a conversion: a pipeline placing a
+different frame rate downstream of the scaler refuses to link at all.
+
+So the two halves of the encoder's bit budget are set in different places. The
+declared frame rate belongs on the source caps, and the filter between the scaler
+and the encoder carries geometry alone.
+
 ### Coded size is not always the size that was asked for
 
 The encoder codes 1080 as 1088 and 1800 as 1808, attaching a crop. 720 and 1440
