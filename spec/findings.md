@@ -364,26 +364,44 @@ datagrams, nothing discarded.
 180 frames at 60 Hz, one key frame every 60, real sockets, real handshake,
 1418-byte payloads.
 
+Three runs, the third with the machine busy compiling, which is where the wider
+figures come from.
+
 | | |
 |---|---|
-| Delivered | 180 of 180, 2400 datagrams, none evicted, none lost |
+| Delivered | 180 of 180, every run. 2400 datagrams, none evicted, none lost |
 | Carried | 26.74 Mbit in 2.985 s, 8.96 Mbit/s |
-| Capture to delivery | 1.42 ms median, 2.56 ms at the 99th percentile, 2.80 ms worst |
-| Round trip | 193 µs, quinn's own path estimate |
-| BBR pacing rate | 670 Mbit/s |
+| Capture to delivery | median 1.42, 1.45, 2.41 ms |
+| | 99th percentile 2.56, 2.42, 7.85 ms |
+| | worst 2.80, 3.51, 10.54 ms |
+| Round trip | 193, 154, 814 µs, quinn's own path estimate |
+| BBR pacing rate | 670, 721, 280 Mbit/s |
 | Congestion events | 0 |
 
-The same link driven as hard as the gate allows for 1.5 seconds: 34,850 frames
-offered, 30,357 queued, 4493 refused whole by the gate, 2.99 Gbit/s carried,
-33 µs round trip, BBR pacing rate 3.39 Gbit/s. Of 397,373 datagrams received,
-4911 were lost, which is the kernel dropping UDP at three gigabits and not the
-transport evicting: eviction would have killed the connection outright.
+Capture to delivery is measured from the moment the frame was due to be sent, so
+it holds the sender's own scheduling and none of the encoder. On an idle machine
+the transport costs about one and a half milliseconds of the ten to twenty
+millisecond budget. Under load it costs as much as ten, and every millisecond of
+that is scheduling rather than network: the round trip moves with it.
 
-Capture to delivery is measured from when the frame was due to be sent, so it
-includes the sender's own scheduling and the encoder is not in it. The pacing
-rate is only ever `Some` under BBR. Cubic and NewReno report `None`, so choosing
-BBR is the precondition for having a bandwidth estimate at all rather than a
-preference between controllers.
+The same link driven as hard as the gate allows, for 1.5 seconds: 1.1 to
+3.3 Gbit/s carried, round trip 29 to 209 µs, BBR pacing rate 2.9 to 3.4 Gbit/s.
+Of the datagrams that arrive, about 1% are lost, which is the kernel dropping UDP
+at gigabit rates and not the transport evicting: an eviction would have ended the
+connection instead.
+
+That run also shows the frame identifier rule doing its work. Of 15,968 frames
+offered, the gate refused 4616 whole, and the client counted 4704 frames missing:
+the refusals, plus the handful the kernel dropped entirely. Every one of those
+refusals is an encoded picture the encoder's reference chain has already moved
+past, so the client is right to count them as loss, and the 4679 complete frames
+it then threw away are the delta frames that referred back to them. On a link that
+is not being deliberately overrun, the gate refuses nothing and none of this
+happens.
+
+The pacing rate is only ever `Some` under BBR. Cubic and NewReno report `None`, so
+choosing BBR is the precondition for having a bandwidth estimate at all rather
+than a preference between controllers.
 
 Datagram frames are written into a packet before stream frames, so control traffic
 cannot starve video within a packet, though the two still share the window.
