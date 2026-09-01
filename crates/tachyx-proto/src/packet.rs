@@ -700,9 +700,35 @@ struct Partial {
     capture: Timestamp,
     kind: FrameKind,
     deadline: Instant,
+    /// A hole in this frame is already known, or its repair has started
+    /// arriving. Such a frame is decided within [`REORDER_WINDOW`] of its last
+    /// datagram instead of waiting the full deadline, because what it is
+    /// waiting for is a retransmission that never comes.
+    armed: bool,
     last_slice: Option<u8>,
     slices: BTreeMap<u8, PartialSlice>,
     parity: Option<ParityBlock>,
+}
+
+impl Partial {
+    /// Restarts the wait, now that a datagram of this frame has arrived.
+    ///
+    /// The wait is for a frame that has stopped arriving, not for one that is
+    /// still arriving. A key frame is far larger than the link delivers inside
+    /// one deadline: 254 kB measured at 3440x1440, which is 234 datagrams and
+    /// 134 ms of wire time at 20 Mbit/s against a 50 ms deadline. Timed from
+    /// its first datagram it is abandoned while its own packets are still in
+    /// flight, every time, so the client never regains a reference frame and
+    /// only the macroblocks a delta frame carries ever refresh.
+    fn refresh(&mut self, now: Instant, stall: Duration) {
+        self.deadline = now + if self.armed { REORDER_WINDOW } else { stall };
+    }
+
+    /// Marks a hole known and restarts the shorter wait for its repair.
+    fn arm(&mut self, now: Instant) {
+        self.armed = true;
+        self.deadline = now + REORDER_WINDOW;
+    }
 }
 
 /// Fragments of one slice, keyed by index so that nothing is allocated for a
@@ -882,8 +908,13 @@ impl Reassembler {
             // The missing packets sit between two packets of this frame, so
             // they were this frame's. The packet in hand is still kept: it may
             // be the reordered one that fills the hole.
+            //
+            // Timed from this packet rather than shortening what is already
+            // set, because the repair for a hole travels behind the rest of the
+            // frame: a large frame is still sending when the hole appears, and
+            // an absolute cap set here would expire it mid-transmission.
             if let Some(partial) = self.open.get_mut(&header.frame.0) {
-                partial.deadline = partial.deadline.min(now + REORDER_WINDOW);
+                partial.arm(now);
             }
         }
         Ok(header.seq)
@@ -903,7 +934,12 @@ impl Reassembler {
         };
         // Parity arrives behind the picture it repairs, so a frame still open
         // when it lands is a frame with a hole in it.
-        partial.deadline = partial.deadline.min(now + REORDER_WINDOW);
+        //
+        // Timed from this shard rather than shortening what is already set. A
+        // key frame carries its parity in scores of shards, 54 of them at
+        // 3440x1440, and they take longer to arrive than the reorder window: a
+        // cap fixed by the first shard would discard the rest of the repair.
+        partial.arm(now);
         let block = partial.parity.get_or_insert_with(|| ParityBlock {
             data_shards: shard.data_shards,
             parity_shards: shard.shard.count(),
@@ -933,12 +969,18 @@ impl Reassembler {
         payload: &[u8],
         now: Instant,
     ) {
+        let stall = self.deadline;
         let partial = match self.open.entry(frame.0) {
-            Entry::Occupied(open) => open.into_mut(),
+            Entry::Occupied(open) => {
+                let partial = open.into_mut();
+                partial.refresh(now, stall);
+                partial
+            }
             Entry::Vacant(slot) => slot.insert(Partial {
                 capture: picture.capture,
                 kind,
-                deadline: now + self.deadline,
+                deadline: now + stall,
+                armed: false,
                 last_slice: None,
                 slices: BTreeMap::new(),
                 parity: None,
@@ -1298,6 +1340,41 @@ mod tests {
         assert_eq!(reassembler.stats().frames_dropped, 1);
         assert_eq!(reassembler.stats().packets_lost, 1);
         assert!(reassembler.needs_keyframe());
+    }
+
+    /// A key frame is larger than the link carries inside one deadline: 254 kB
+    /// measured at 3440x1440, 234 datagrams, 134 ms of wire time at 20 Mbit/s
+    /// against a 50 ms deadline. Timed from its first datagram every one of
+    /// them is abandoned mid-flight, the client never regains a reference, and
+    /// only the macroblocks a delta frame carries ever refresh.
+    #[test]
+    fn a_frame_slower_to_arrive_than_the_deadline_still_lands() {
+        let key = picture(60_000, 9);
+        let mut packetiser = bare(PAYLOAD);
+        let mut out = Vec::new();
+        packetiser.packetise(&unit(0, FrameKind::Key, &[&key]), &mut out);
+
+        let start = Instant::now();
+        let spacing = Duration::from_millis(1);
+        // Longer than the deadline, spread over the frame's own datagrams.
+        assert!(
+            spacing * u32::try_from(out.len()).expect("a small count") > Duration::from_millis(50)
+        );
+
+        let mut reassembler = Reassembler::new(Duration::from_millis(50));
+        let mut frames = Vec::new();
+        for (index, datagram) in out.iter().enumerate() {
+            let now = start + spacing * u32::try_from(index).expect("a small count");
+            reassembler.expire(now);
+            reassembler.push(datagram, now).expect("well formed");
+            while let Some(frame) = reassembler.pop() {
+                frames.push(frame);
+            }
+        }
+        assert_eq!(frames.len(), 1, "the key frame was abandoned mid-flight");
+        assert_eq!(frames[0].data, key);
+        assert_eq!(reassembler.stats().frames_dropped, 0);
+        assert!(!reassembler.needs_keyframe());
     }
 
     #[test]
