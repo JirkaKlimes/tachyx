@@ -1,0 +1,21 @@
+[package]
+name = "tachyx-transport"
+description = "QUIC transport: video datagrams and the reliable control stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tachyx-proto.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

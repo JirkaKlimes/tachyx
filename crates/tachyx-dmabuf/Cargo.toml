@@ -1,0 +1,24 @@
+[package]
+name = "tachyx-dmabuf"
+description = "The one place in tachyx where unsafe is permitted: handing a buffer descriptor to GStreamer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gstreamer.workspace = true
+gstreamer-allocators.workspace = true
+
+# This crate cannot take the workspace lints, because they forbid unsafe and a
+# `forbid` cannot be lifted from inside the crate it applies to. The set below is
+# the workspace set with that one line changed, so nothing else is lost.
+[lints.rust]
+unsafe_code = "warn"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

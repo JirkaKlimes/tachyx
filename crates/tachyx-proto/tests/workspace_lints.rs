@@ -22,11 +22,34 @@ fn every_crate_opts_in_to_the_workspace_lints() {
         }
         let text = std::fs::read_to_string(&manifest).expect("manifest is readable");
         let normalised: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            normalised.contains("[lints] workspace = true"),
-            "{} does not opt in to the workspace lints, so it is not linted at all",
-            manifest.display()
-        );
+        let name = manifest
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            .expect("crate directory name");
+
+        if name == UNSAFE_EXCEPTION {
+            // The one crate that cannot take the workspace table, because that
+            // table forbids unsafe. It must still carry the rest of the set.
+            for lint in [
+                "missing_docs = \"deny\"",
+                "missing_debug_implementations = \"deny\"",
+                "unreachable_pub = \"deny\"",
+                "pedantic = { level = \"deny\", priority = -1 }",
+            ] {
+                assert!(
+                    text.contains(lint),
+                    "{} is exempt from the workspace lint table but drops `{lint}` with it",
+                    manifest.display()
+                );
+            }
+        } else {
+            assert!(
+                normalised.contains("[lints] workspace = true"),
+                "{} does not opt in to the workspace lints, so it is not linted at all",
+                manifest.display()
+            );
+        }
         checked += 1;
     }
     assert!(checked > 0, "no crates were checked");
