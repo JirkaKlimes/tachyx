@@ -26,7 +26,7 @@ use tachyx_proto::media::{FrameId, FrameKind, HEADER_LEN, Timestamp};
 use tachyx_proto::packet::{AccessUnit, Frame, Reassembler, ReassemblyStats};
 use tachyx_transport::{
     Client, ClientSession, ControlError, ControlReader, ControlWriter, Host, HostIdentity,
-    HostSession, PinStore, Sent, TransportError, Tuning, video_send_buffer,
+    HostSession, PinStore, Sent, TransportError, Tuning, VideoSender, video_send_buffer,
 };
 
 /// How long the receiver waits for a frame that nothing follows.
@@ -58,6 +58,11 @@ impl Video {
     /// its deadline passes rather than waiting behind it.
     async fn next_frame(&mut self) -> Result<Frame, quinn::ConnectionError> {
         loop {
+            // Popped before reading as well as after, because a picture can be
+            // completed by parity rather than by the datagram that was pushed.
+            if let Some(frame) = self.reassembler.pop() {
+                return Ok(frame);
+            }
             let datagram = match self.reassembler.next_deadline() {
                 Some(at) => {
                     let read = self.connection.read_datagram();
@@ -70,9 +75,22 @@ impl Video {
                 }
                 None => self.connection.read_datagram().await?,
             };
-            if let Ok(Some(frame)) = self.reassembler.push(&datagram, Instant::now()) {
-                return Ok(frame);
-            }
+            let _ = self.reassembler.push(&datagram, Instant::now());
+        }
+    }
+
+    /// Reads until nothing has arrived for `patience`.
+    ///
+    /// A frame is delivered by its last picture datagram and its parity is sent
+    /// behind it, so the tail of a stream is still in flight at the moment the
+    /// last picture is complete. A test counting datagrams has to wait for it.
+    async fn drain(&mut self, patience: Duration) {
+        loop {
+            let read = self.connection.read_datagram();
+            let Ok(Ok(datagram)) = tokio::time::timeout(patience, read).await else {
+                return;
+            };
+            let _ = self.reassembler.push(&datagram, Instant::now());
         }
     }
 
@@ -188,7 +206,7 @@ fn frame_len(id: u32, key_interval: u32) -> usize {
 }
 
 /// Sends one picture of the measured size for its position in the group.
-fn send_frame(session: &mut HostSession, id: u32, key_interval: u32) -> Sent {
+fn send_frame(video: &mut VideoSender, id: u32, key_interval: u32) -> Sent {
     let picture = picture(id, frame_len(id, key_interval));
     let slices: [&[u8]; 1] = [&picture];
     let unit = AccessUnit::new(
@@ -198,7 +216,7 @@ fn send_frame(session: &mut HostSession, id: u32, key_interval: u32) -> Sent {
         &slices,
     )
     .expect("a well formed picture");
-    session.video.send(&unit).expect("the connection is live")
+    video.send(&unit).expect("the connection is live")
 }
 
 /// What the receiving end saw.
@@ -233,6 +251,7 @@ async fn receive(
         report.frames += 1;
         report.bytes += frame.data.len();
     }
+    video.drain(Duration::from_millis(200)).await;
     report.stats = video.stats();
     report
 }
@@ -266,7 +285,7 @@ async fn video_moves_over_a_real_socket_at_the_measured_frame_sizes() {
     let mut bytes = 0usize;
     for id in 0..FRAMES {
         tokio::time::sleep_until(start + PERIOD * id).await;
-        match send_frame(&mut host, id, KEY_INTERVAL) {
+        match send_frame(&mut host.video, id, KEY_INTERVAL) {
             Sent::Queued { datagrams: sent } => {
                 datagrams += sent;
                 bytes += frame_len(id, KEY_INTERVAL);
@@ -362,7 +381,7 @@ async fn a_saturated_link_reports_what_it_carried() {
     let mut offered = 0u32;
     let mut bytes = 0usize;
     while start.elapsed() < RUN {
-        if let Sent::Queued { .. } = send_frame(&mut host, offered, KEY_INTERVAL) {
+        if let Sent::Queued { .. } = send_frame(&mut host.video, offered, KEY_INTERVAL) {
             bytes += frame_len(offered, KEY_INTERVAL);
         }
         offered += 1;
@@ -413,7 +432,7 @@ async fn the_gate_refuses_a_frame_the_queue_cannot_hold_whole() {
     let (mut host, _client) = link.sessions().await;
 
     assert_eq!(
-        send_frame(&mut host, 0, 1),
+        send_frame(&mut host.video, 0, 1),
         Sent::Refused,
         "a key frame is twenty times the queue this host was given"
     );
@@ -442,7 +461,7 @@ async fn the_gate_charges_the_queue_accounting_once_per_queued_datagram() {
     // A single-threaded runtime and nothing awaited from here on, so nothing
     // drains the queue while it is being measured. This is the state a real
     // key frame leaves behind: ninety-two entries queued at once.
-    let Sent::Queued { datagrams } = send_frame(&mut host, 0, 1) else {
+    let Sent::Queued { datagrams } = send_frame(&mut host.video, 0, 1) else {
         panic!("the queue holds a key frame")
     };
     let space = host.connection.datagram_send_buffer_space();
@@ -488,7 +507,7 @@ async fn a_receive_buffer_smaller_than_a_key_frame_shreds_it() {
     let (mut host, client) = link.sessions().await;
     let payload = host.video.payload_len().expect("the handshake has settled");
 
-    let queued = send_frame(&mut host, 0, 1);
+    let queued = send_frame(&mut host.video, 0, 1);
     let Sent::Queued { datagrams } = queued else {
         panic!("the host's own queue holds a key frame")
     };
@@ -512,7 +531,7 @@ async fn the_configured_buffers_hold_a_key_frame_the_client_is_slow_to_read() {
     let (mut host, client) = link.sessions().await;
     let mut video = Video::new(&client);
 
-    let Sent::Queued { datagrams } = send_frame(&mut host, 0, 1) else {
+    let Sent::Queued { datagrams } = send_frame(&mut host.video, 0, 1) else {
         panic!("the queue holds a key frame")
     };
     // The receiving application is busy: nothing reads the datagrams while the
@@ -525,6 +544,7 @@ async fn the_configured_buffers_hold_a_key_frame_the_client_is_slow_to_read() {
         .expect("the connection is live");
     assert_eq!(frame.data, picture(0, KEY_FRAME));
     assert_eq!(frame.kind, FrameKind::Key);
+    video.drain(Duration::from_millis(200)).await;
     assert_eq!(video.stats().packets_received, datagrams as u64);
     assert_eq!(video.stats().packets_lost, 0);
     assert!(!video.needs_keyframe());
@@ -757,5 +777,135 @@ async fn a_reader_in_a_select_survives_a_message_that_arrives_in_two_pieces() {
     assert_eq!(
         received.expect("the message survives the cancellations"),
         message
+    );
+}
+
+/// Long enough to tell one picture's datagrams from the next picture's, and
+/// far longer than any picture here is paced over.
+const BETWEEN_PICTURES: Duration = Duration::from_millis(200);
+
+/// Splits a run of arrivals into one group per picture, at the pauses between
+/// them.
+fn pictures(arrivals: &[Instant]) -> Vec<Vec<Instant>> {
+    let mut groups: Vec<Vec<Instant>> = Vec::new();
+    for &at in arrivals {
+        match groups.last_mut() {
+            Some(last)
+                if at.duration_since(*last.last().expect("a group is never empty"))
+                    < BETWEEN_PICTURES / 2 =>
+            {
+                last.push(at);
+            }
+            _ => groups.push(vec![at]),
+        }
+    }
+    groups
+}
+
+/// First arrival to last, which is what the receiver's frame deadline is
+/// measured over.
+fn span(arrivals: &[Instant]) -> Duration {
+    match (arrivals.first(), arrivals.last()) {
+        (Some(first), Some(last)) => last.duration_since(*first),
+        _ => Duration::ZERO,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_frame_leaves_paced_and_a_delta_frame_leaves_at_once() {
+    let tuning = Tuning::for_stream(hd());
+    let link = Link::open("pacing", tuning, tuning);
+    let (host, client) = link.sessions().await;
+    let mut video = host.video;
+
+    // Every datagram of the session, stamped as it arrives. Reading them raw
+    // rather than through the reassembler is the point: what is being checked
+    // is when they leave, not that they add up to a picture.
+    let receiving = tokio::spawn(async move {
+        let mut arrivals = Vec::new();
+        while tokio::time::timeout(BETWEEN_PICTURES * 2, client.connection.read_datagram())
+            .await
+            .is_ok_and(|datagram| datagram.is_ok())
+        {
+            arrivals.push(Instant::now());
+        }
+        arrivals
+    });
+
+    // On a thread of its own, because `send` blocks until the pacer has
+    // released the whole picture. This is the shape the daemon's pump uses.
+    let sending = tokio::task::spawn_blocking(move || {
+        let mut sent = Vec::new();
+        // What the session configures the encoder for. The pacing rate is
+        // derived from it and from the key frame the sender has measured.
+        video.set_target_bitrate(NonZeroU32::new(8_000_000).expect("nonzero"));
+        let paced = video.release_rate();
+        // A key frame, then a delta frame, then the same key frame again with
+        // the pacer set so far above what is being sent that it never engages,
+        // which is what the transport did before it had one.
+        for (id, key_interval) in [(0, 1), (1, 60), (2, 1)] {
+            if id == 2 {
+                video.set_target_bitrate(NonZeroU32::MAX);
+            }
+            let started = Instant::now();
+            let Sent::Queued { datagrams } = send_frame(&mut video, id, key_interval) else {
+                panic!("frame {id} was refused on an idle loopback link")
+            };
+            sent.push((datagrams, started.elapsed()));
+            std::thread::sleep(BETWEEN_PICTURES);
+        }
+        (paced, video.release_rate(), sent)
+    });
+
+    let (paced, unpaced, sent) = sending.await.expect("the sender did not panic");
+    let arrivals = receiving.await.expect("the receiver did not panic");
+    let groups = pictures(&arrivals);
+    assert_eq!(groups.len(), 3, "three pictures were sent");
+    let [key, delta, burst] = [&groups[0], &groups[1], &groups[2]];
+
+    println!(
+        "\n  paced at           {paced} bit/s, and {unpaced} bit/s for the burst\n  \
+           key frame          {} datagrams, {:?} to leave, arriving over {:?}\n  \
+           delta frame        {} datagrams, {:?} to leave, arriving over {:?}\n  \
+           key frame unpaced  {} datagrams, {:?} to leave, arriving over {:?}\n",
+        sent[0].0,
+        sent[0].1,
+        span(key),
+        sent[1].0,
+        sent[1].1,
+        span(delta),
+        sent[2].0,
+        sent[2].1,
+        span(burst),
+    );
+
+    for (index, (datagrams, _)) in sent.iter().enumerate() {
+        assert_eq!(
+            groups[index].len(),
+            *datagrams,
+            "every datagram of picture {index} reached the client"
+        );
+    }
+    assert!(
+        span(key) > Duration::from_millis(5),
+        "a key frame is released over a span, not at once: {:?}",
+        span(key)
+    );
+    assert!(
+        span(key) < FRAME_DEADLINE,
+        "a paced key frame still has to arrive inside the receiver's deadline: {:?}",
+        span(key)
+    );
+    assert!(
+        span(delta) < Duration::from_millis(2),
+        "a delta frame fits the burst allowance and is not paced at all: {:?}",
+        span(delta)
+    );
+    assert!(
+        span(burst) < span(key) / 4,
+        "with the pacer set above what is being sent the same key frame goes \
+         out as a burst: {:?} against {:?}",
+        span(burst),
+        span(key)
     );
 }

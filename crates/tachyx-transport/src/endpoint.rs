@@ -155,7 +155,16 @@ impl Host {
             }
         };
         Ok(HostSession {
-            video: VideoSender::new(connection.clone(), self.tuning.video_buffer),
+            // The ceiling the client announced, until the session says what it
+            // actually configured the encoder for. It is an over-estimate of
+            // the real operating point, which is the safe direction: pacing
+            // above what is being sent costs nothing, and pacing below it would
+            // throttle the encoder from inside the transport.
+            video: VideoSender::new(
+                connection.clone(),
+                self.tuning.video_buffer,
+                hello.capabilities.bitrate_ceiling,
+            ),
             to_client,
             from_client,
             hello,

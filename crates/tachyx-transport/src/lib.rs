@@ -20,13 +20,20 @@
 //! [`identity::PinnedServer`] remembers the key a host presented the first time
 //! and refuses anything else afterwards, rather than accepting whatever
 //! certificate arrives.
+//!
+//! [`pace::Pacer`] releases a picture's datagrams at a byte rate rather than
+//! handing them all to quinn at once. quinn's own pacer applies to datagrams
+//! but never engages at these rates, and the burst it lets through is what
+//! overruns the buffer at the far end.
 
 pub mod control;
 pub mod endpoint;
 pub mod identity;
+pub mod pace;
 pub mod video;
 
 pub use control::{ControlError, ControlReader, ControlWriter};
 pub use endpoint::{Client, ClientSession, Host, HostSession, TransportError, Tuning};
 pub use identity::{Fingerprint, HostIdentity, IdentityError, PinStore};
+pub use pace::{PACE_PERCENT, Pacer, rate_for};
 pub use video::{Sent, VideoError, VideoSender, video_send_buffer};

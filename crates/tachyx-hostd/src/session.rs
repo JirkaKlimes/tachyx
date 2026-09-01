@@ -80,6 +80,13 @@ pub async fn serve(
     } = start(config, &session)?;
     let admission = encoder.admission();
 
+    // The pacer releases datagrams at a rate derived from this. Without it the
+    // transport falls back to the ceiling the client announced, which is an
+    // over-estimate and paces looser than the session actually needs.
+    session.video.set_target_bitrate(
+        std::num::NonZeroU32::new(bitrate.kbps() * 1000).ok_or(SessionError::Unsendable)?,
+    );
+
     session
         .to_client
         .send(&HostMessage::Stream(stream_config(&encoder, bitrate)?))

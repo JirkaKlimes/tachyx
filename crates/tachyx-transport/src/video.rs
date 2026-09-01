@@ -18,15 +18,22 @@
 //! The whole of this module exists to make that path unreachable. A frame is
 //! offered only when the queue provably has room for all of it, and is
 //! otherwise refused whole, by us, before it is sent.
+//!
+//! The datagrams of a frame that is accepted are then released at a byte rate
+//! rather than handed over back to back. Why, and at what rate, is in
+//! [`crate::pace`].
 
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::Connection;
 use tachyx_proto::control::CodedSize;
 use tachyx_proto::media::{FrameKind, HEADER_LEN};
-use tachyx_proto::packet::{AccessUnit, Packetiser};
+use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
+
+use crate::pace::{Pacer, rate_for};
 
 /// Bytes of accounting quinn charges for each queued datagram, on top of its
 /// payload.
@@ -53,6 +60,13 @@ const MEASURED_KEY_FRAME_PIXELS: u64 = 1920 * 1080;
 /// [`quinn::Connection::max_datagram_size`] instead.
 const NOMINAL_PAYLOAD: NonZeroUsize = NonZeroUsize::new(1418).unwrap();
 
+/// The longest the send path sleeps without looking at the connection.
+///
+/// Only reached at rates where one datagram is worth more than this, which is
+/// under about 6 Mbit/s. Everywhere above it a datagram's own wait is shorter
+/// and the sleep is the whole of it.
+const WAIT_SLICE: Duration = Duration::from_millis(2);
+
 /// Bytes of queued video the transport should be allowed to hold at `coded`.
 ///
 /// Sizing this by "two frames" is ambiguous in a way that decides whether the
@@ -69,6 +83,9 @@ const NOMINAL_PAYLOAD: NonZeroUsize = NonZeroUsize::new(1418).unwrap();
 /// second key frame is never in flight beside the first: the encoder emits one
 /// and then delta frames, and a buffer deep enough for two would be a buffer
 /// deep enough to hold a key frame's worth of latency.
+///
+/// The key frame's parity is counted with it. It goes on this same queue and
+/// the gate must be able to admit the frame whole, repair included.
 #[must_use]
 pub fn video_send_buffer(coded: CodedSize) -> usize {
     let scaled = usize::try_from(
@@ -76,8 +93,11 @@ pub fn video_send_buffer(coded: CodedSize) -> usize {
             / MEASURED_KEY_FRAME_PIXELS,
     )
     .unwrap_or(usize::MAX);
-    let datagrams = scaled.div_ceil(NOMINAL_PAYLOAD.get());
-    (scaled + datagrams * (HEADER_LEN + QUEUE_OVERHEAD)) * 3 / 2
+    let data = scaled.div_ceil(NOMINAL_PAYLOAD.get());
+    let parity = Parity::fixed(Parity::CEILING).shards(FrameKind::Key, data);
+    let queued =
+        scaled + parity * NOMINAL_PAYLOAD.get() + (data + parity) * (HEADER_LEN + QUEUE_OVERHEAD);
+    queued * 3 / 2
 }
 
 /// What became of a picture handed to the transport.
@@ -107,15 +127,20 @@ pub struct VideoSender {
     /// ones quinn is known to have taken.
     outstanding: VecDeque<usize>,
     key_frame_bytes: usize,
+    /// What the session is configured to send, in bits a second. The rate a
+    /// picture is released at is derived from it and from that picture's own
+    /// size on the wire.
+    target: NonZeroU32,
+    pacer: Pacer,
     frames_sent: u64,
     frames_refused: u64,
 }
 
 impl VideoSender {
     /// Starts sending on `connection`, whose outgoing datagram queue holds
-    /// `buffer` bytes.
+    /// `buffer` bytes, for a session configured to send `target` bits a second.
     #[must_use]
-    pub fn new(connection: Connection, buffer: usize) -> Self {
+    pub fn new(connection: Connection, buffer: usize, target: NonZeroU32) -> Self {
         Self {
             connection,
             packetiser: Packetiser::new(NOMINAL_PAYLOAD),
@@ -123,9 +148,31 @@ impl VideoSender {
             buffer,
             outstanding: VecDeque::new(),
             key_frame_bytes: MEASURED_KEY_FRAME_BYTES,
+            target,
+            pacer: Pacer::new(rate_for(target, MEASURED_KEY_FRAME_BYTES), Instant::now()),
             frames_sent: 0,
             frames_refused: 0,
         }
+    }
+
+    /// Sets the bitrate the session is configured to send, in bits a second.
+    ///
+    /// The transport does not decide this and cannot: it is the encoder's
+    /// operating point, chosen by whatever policy runs the session. What the
+    /// transport does with it is release datagrams at a multiple of it, so that
+    /// pacing never becomes the bottleneck. See [`crate::pace::rate_for`].
+    pub const fn set_target_bitrate(&mut self, target: NonZeroU32) {
+        self.target = target;
+    }
+
+    /// The rate the last picture was released at, in bits a second.
+    ///
+    /// Not one rate for the session. Every picture is paced at what its own
+    /// size on the wire asks for, so a key frame is released faster than a
+    /// delta frame in order to reach the receiver inside the same deadline.
+    #[must_use]
+    pub const fn release_rate(&self) -> NonZeroU32 {
+        self.pacer.rate()
     }
 
     /// Bytes of video one datagram carries right now.
@@ -220,7 +267,11 @@ impl VideoSender {
         let Some(payload) = self.payload_len() else {
             return false;
         };
-        self.can_send_frame(bytes.div_ceil(payload.get()), payload.get())
+        // Charged its parity as well, at the key frame rate, because the caller
+        // asking this is the one about to ask for a key frame.
+        let data = bytes.div_ceil(payload.get());
+        let parity = self.packetiser.parity().shards(FrameKind::Key, data);
+        self.can_send_frame(data + parity, payload.get())
     }
 
     /// Bytes to expect the next key frame to occupy.
@@ -274,6 +325,14 @@ impl VideoSender {
 
     /// Sends one picture, or refuses it whole.
     ///
+    /// **This blocks** until the last datagram of the picture has been released
+    /// at the pacing rate, which for a key frame is tens of milliseconds. It is
+    /// meant to be called from a thread of its own, as
+    /// `tachyx_hostd::session`'s pump does. Nothing that produces frames is
+    /// held while it waits: capture writes into a slot that displaces rather
+    /// than queues, and the encoder's own output channel is bounded, so a slow
+    /// consumer here costs dropped capture frames and never a stalled capture.
+    ///
     /// A caller that gated before encoding will rarely see
     /// [`Sent::Refused`] here: this is the second check, against the queue as
     /// it stands now rather than as it stood when the encoder was asked.
@@ -284,7 +343,10 @@ impl VideoSender {
         let payload = self.payload_len().ok_or(VideoError::NoDatagrams)?;
         self.packetiser.set_payload_len(payload);
         self.forget_sent();
-        let datagrams = unit.datagrams(payload);
+        // The packetiser's count, not the picture's: parity is real bytes on
+        // this same queue, and a gate that counted only the picture would
+        // under-estimate by a fifth and reach the eviction path above.
+        let datagrams = self.packetiser.datagrams(unit);
         if !self.can_send_frame(datagrams, payload.get()) {
             self.frames_refused += 1;
             return Ok(Sent::Refused);
@@ -294,10 +356,40 @@ impl VideoSender {
                 .encoded_len()
                 .max(self.key_frame_bytes - self.key_frame_bytes / 16);
         }
-        self.datagrams.clear();
-        self.packetiser.packetise(unit, &mut self.datagrams);
-        for datagram in self.datagrams.drain(..) {
+        // Taken out of `self` for the release loop, which needs the rest of
+        // `self` for the pacer, the queue record and the connection, and put
+        // back after it so the allocation outlives the frame.
+        let mut queue = std::mem::take(&mut self.datagrams);
+        queue.clear();
+        self.packetiser.packetise(unit, &mut queue);
+        // Paced at the rate this picture's own weight on the wire asks for,
+        // parity and per-datagram headers included. Measured against the
+        // encoded length instead, a key frame carrying parity is understated by
+        // about a third and leaves over half as long again as intended.
+        self.pacer
+            .set_rate(rate_for(self.target, queue.iter().map(Vec::len).sum()));
+        let sent = self.release(&mut queue, datagrams);
+        queue.clear();
+        self.datagrams = queue;
+        sent
+    }
+
+    /// Puts a packetised picture on the wire at the pacing rate.
+    ///
+    /// `datagrams` is what the picture is reported as having taken, which is
+    /// not the length of `queue`: the queue also carries whatever parity the
+    /// packetiser added.
+    fn release(&mut self, queue: &mut Vec<Vec<u8>>, datagrams: usize) -> Result<Sent, VideoError> {
+        for datagram in queue.drain(..) {
             let queued = datagram.len();
+            let wait = self.pacer.release(queued, Instant::now());
+            if !wait.is_zero() {
+                self.wait(wait)?;
+                // The queue drained while this frame was being released, so the
+                // record of what quinn still holds is stale by now. Squaring it
+                // is what keeps the gate exact for the next frame.
+                self.forget_sent();
+            }
             match self.connection.send_datagram(Bytes::from(datagram)) {
                 Ok(()) => self.outstanding.push_back(queued),
                 // The path's measured size can shrink underneath a frame: the
@@ -318,6 +410,23 @@ impl VideoSender {
         }
         self.frames_sent += 1;
         Ok(Sent::Queued { datagrams })
+    }
+
+    /// Sleeps out a datagram's turn, in slices short enough that a connection
+    /// which ends is noticed rather than slept through.
+    ///
+    /// A frame paced at a low rate is tens of milliseconds of waiting, and a
+    /// client that disconnects in the middle of one should end the send rather
+    /// than have the rest of the picture pushed at a connection that is gone.
+    fn wait(&self, wait: Duration) -> Result<(), VideoError> {
+        let due = Instant::now() + wait;
+        while let Some(left) = due.checked_duration_since(Instant::now()) {
+            if let Some(reason) = self.connection.close_reason() {
+                return Err(VideoError::Connection(reason));
+            }
+            std::thread::sleep(left.min(WAIT_SLICE));
+        }
+        Ok(())
     }
 }
 
@@ -344,11 +453,18 @@ mod tests {
         let coded = CodedSize::new(1920, 1088).expect("a codeable size");
         let buffer = video_send_buffer(coded);
         let key_frame = MEASURED_KEY_FRAME_BYTES;
-        let datagrams = key_frame.div_ceil(NOMINAL_PAYLOAD.get());
-        let queued = key_frame + datagrams * (HEADER_LEN + QUEUE_OVERHEAD);
+        let data = key_frame.div_ceil(NOMINAL_PAYLOAD.get());
+        // Charged at the ceiling rather than at the level a session opens on,
+        // because the level rises with loss and a key frame that no longer fits
+        // is a key frame the gate refuses for ever.
+        let parity = Parity::fixed(Parity::CEILING).shards(FrameKind::Key, data);
+        let queued = key_frame
+            + parity * NOMINAL_PAYLOAD.get()
+            + (data + parity) * (HEADER_LEN + QUEUE_OVERHEAD);
         assert!(
             buffer > queued,
-            "a measured key frame takes {queued} bytes of queue and the buffer is {buffer}"
+            "a measured key frame and its parity take {queued} bytes of queue and the \
+             buffer is {buffer}"
         );
         assert!(
             buffer < queued * 2,
