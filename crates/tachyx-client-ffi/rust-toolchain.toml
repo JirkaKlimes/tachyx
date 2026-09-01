@@ -1,0 +1,14 @@
+# The Flutter build runs cargo from this directory, so this file and not the one
+# at the workspace root decides which toolchain it gets. It names the toolchain
+# the dev shell links into rustup rather than a version number, because a version
+# number makes rustup download a second toolchain into the home directory that is
+# a copy of the one the store already provides.
+#
+# `channel = "nix"` therefore requires the dev shell: `nix develop` links it.
+[toolchain]
+channel = "nix"
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-linux-android",
+  "x86_64-linux-android",
+]

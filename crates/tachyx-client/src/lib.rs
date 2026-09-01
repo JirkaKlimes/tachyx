@@ -1,8 +1,9 @@
 //! The tachyx client core.
 //!
 //! Everything the client does that is not drawing or touching the screen: the
-//! control-stream framing, the session state machine, and the batching that
-//! turns a touch sample rate into a packet rate.
+//! control-stream framing, the session state machine, the batching that turns a
+//! touch sample rate into a packet rate, and the video reassembly that
+//! `tachyx-proto` supplies.
 //!
 //! None of it performs I/O. [`Session`] is given the bytes that arrived and
 //! asked for the bytes to write, so the protocol behaviour is testable with no
@@ -12,8 +13,8 @@
 
 #![forbid(unsafe_code)]
 
-pub mod control;
+pub mod framing;
 pub mod input;
 pub mod session;
 
-pub use session::{Phase, Session, SessionError, Update};
+pub use session::{Phase, Session, Update};

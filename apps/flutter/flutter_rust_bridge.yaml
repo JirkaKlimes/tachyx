@@ -1,0 +1,3 @@
+rust_input: crate::api
+rust_root: ../../crates/tachyx-client-ffi
+dart_output: lib/src/rust

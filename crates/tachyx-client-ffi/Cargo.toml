@@ -1,0 +1,33 @@
+[package]
+name = "tachyx-client-ffi"
+description = "The flutter_rust_bridge boundary: translates between Dart and tachyx-client, and holds no logic of its own"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# staticlib for the platforms that link the client in, cdylib for the ones that
+# load it at run time. Native assets picks whichever the target needs.
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+tachyx-client.workspace = true
+tachyx-proto.workspace = true
+anyhow.workspace = true
+flutter_rust_bridge = "=2.13.0"
+
+# This crate cannot take the workspace lints, because they forbid unsafe and
+# `frb_generated.rs` is full of it: every call across the Dart boundary reads a
+# pointer Dart wrote. The set below is the workspace set with that one line
+# changed, so nothing else is lost.
+[lints.rust]
+unsafe_code = "warn"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

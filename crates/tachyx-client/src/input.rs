@@ -4,16 +4,16 @@
 //! on a 120 Hz phone is 120 events a second that all mean the same thing: the
 //! pointer moved. Sending each one costs a packet and a wake-up on both ends, and
 //! the host cannot act on them separately anyway, because it adds the deltas
-//! together before injecting anything.
+//! together before it injects anything.
 //!
 //! So consecutive events of the same continuous kind are merged as they arrive,
 //! and the result is handed over once a tick. Nothing else is merged: a button
 //! press between two motions is a boundary, and merging across it would move the
 //! pointer to the wrong place before the click.
 
+use tachyx_proto::control::{InputBatch, TimedInput};
 use tachyx_proto::input::InputEvent;
-
-use crate::control::{ClientTime, TimedInput};
+use tachyx_proto::media::Timestamp;
 
 /// Collects input events and hands them over a batch at a time.
 #[derive(Debug, Default)]
@@ -33,7 +33,7 @@ impl InputQueue {
     ///
     /// The merged event carries the later timestamp, because that is when the
     /// displacement it describes was complete.
-    pub fn push(&mut self, at: ClientTime, event: InputEvent) {
+    pub fn push(&mut self, at: Timestamp, event: InputEvent) {
         if let Some(last) = self.pending.last_mut()
             && merge(&mut last.event, &event)
         {
@@ -44,11 +44,13 @@ impl InputQueue {
     }
 
     /// Takes everything recorded since the last call, or `None` if nothing was.
-    pub fn take(&mut self) -> Option<Vec<TimedInput>> {
+    pub fn take(&mut self) -> Option<InputBatch> {
         if self.pending.is_empty() {
             None
         } else {
-            Some(std::mem::take(&mut self.pending))
+            Some(InputBatch {
+                events: std::mem::take(&mut self.pending),
+            })
         }
     }
 
@@ -59,10 +61,10 @@ impl InputQueue {
     }
 }
 
-/// Folds `next` into `into` when the two are one continuous motion, reporting
+/// Folds `more` into `into` when the two are one continuous motion, reporting
 /// whether it did.
-fn merge(into: &mut InputEvent, next: &InputEvent) -> bool {
-    match (into, next) {
+fn merge(into: &mut InputEvent, more: &InputEvent) -> bool {
+    match (into, more) {
         (InputEvent::PointerMotion { dx, dy }, InputEvent::PointerMotion { dx: nx, dy: ny })
         | (InputEvent::Wheel { dx, dy }, InputEvent::Wheel { dx: nx, dy: ny })
         | (InputEvent::FingerScroll { dx, dy }, InputEvent::FingerScroll { dx: nx, dy: ny }) => {
@@ -80,8 +82,8 @@ fn merge(into: &mut InputEvent, next: &InputEvent) -> bool {
             *y = *ny;
             true
         }
-        // Text is appended, so that a fast typist's keystrokes cost one event
-        // rather than one each. The host inserts the string as a whole.
+        // Text is appended, so that a fast typist costs one event rather than one
+        // each. The host inserts the string as a whole.
         (InputEvent::Text(held), InputEvent::Text(more)) => {
             held.push_str(more);
             true
@@ -96,8 +98,8 @@ mod tests {
 
     use super::*;
 
-    fn at(micros: u64) -> ClientTime {
-        ClientTime(micros)
+    fn at(micros: u64) -> Timestamp {
+        Timestamp::from_session_micros(micros)
     }
 
     #[test]
@@ -111,7 +113,7 @@ mod tests {
         }
         let batch = queue.take().expect("ten pushes produce a batch");
         assert_eq!(
-            batch,
+            batch.events,
             vec![TimedInput {
                 at: at(80_000),
                 event: InputEvent::PointerMotion {
@@ -126,19 +128,23 @@ mod tests {
     #[test]
     fn a_click_between_two_motions_is_a_boundary() {
         let mut queue = InputQueue::new();
-        queue.push(at(1), InputEvent::PointerMotion { dx: 1.0, dy: 0.0 });
+        queue.push(at(1_000), InputEvent::PointerMotion { dx: 1.0, dy: 0.0 });
         queue.push(
-            at(2),
+            at(2_000),
             InputEvent::PointerButton {
                 button: PointerButton::Left,
                 press: Press::Down,
             },
         );
-        queue.push(at(3), InputEvent::PointerMotion { dx: 5.0, dy: 0.0 });
+        queue.push(at(3_000), InputEvent::PointerMotion { dx: 5.0, dy: 0.0 });
         let batch = queue.take().expect("three pushes produce a batch");
-        assert_eq!(batch.len(), 3, "merging across a click would misplace it");
         assert_eq!(
-            batch[2].event,
+            batch.events.len(),
+            3,
+            "merging across a click would misplace it"
+        );
+        assert_eq!(
+            batch.events[2].event,
             InputEvent::PointerMotion { dx: 5.0, dy: 0.0 }
         );
     }
@@ -146,12 +152,16 @@ mod tests {
     #[test]
     fn scrolling_and_its_end_stay_separate() {
         let mut queue = InputQueue::new();
-        queue.push(at(1), InputEvent::FingerScroll { dx: 0.0, dy: 12.0 });
-        queue.push(at(2), InputEvent::FingerScroll { dx: 0.0, dy: 8.0 });
-        queue.push(at(3), InputEvent::FingerScrollEnd);
+        queue.push(at(1_000), InputEvent::FingerScroll { dx: 0.0, dy: 12.0 });
+        queue.push(at(2_000), InputEvent::FingerScroll { dx: 0.0, dy: 8.0 });
+        queue.push(at(3_000), InputEvent::FingerScrollEnd);
         let batch = queue.take().expect("three pushes produce a batch");
         assert_eq!(
-            batch.iter().map(|t| t.event.clone()).collect::<Vec<_>>(),
+            batch
+                .events
+                .iter()
+                .map(|timed| timed.event.clone())
+                .collect::<Vec<_>>(),
             vec![
                 InputEvent::FingerScroll { dx: 0.0, dy: 20.0 },
                 InputEvent::FingerScrollEnd
@@ -162,21 +172,27 @@ mod tests {
     #[test]
     fn motion_and_scroll_are_not_the_same_motion() {
         let mut queue = InputQueue::new();
-        queue.push(at(1), InputEvent::PointerMotion { dx: 4.0, dy: 0.0 });
-        queue.push(at(2), InputEvent::FingerScroll { dx: 4.0, dy: 0.0 });
-        assert_eq!(queue.take().expect("two pushes").len(), 2);
+        queue.push(at(1_000), InputEvent::PointerMotion { dx: 4.0, dy: 0.0 });
+        queue.push(at(2_000), InputEvent::FingerScroll { dx: 4.0, dy: 0.0 });
+        assert_eq!(queue.take().expect("two pushes").events.len(), 2);
     }
 
     #[test]
     fn an_absolute_position_replaces_rather_than_accumulates() {
         let mut queue = InputQueue::new();
-        queue.push(at(1), InputEvent::PointerMotionAbsolute { x: 0.1, y: 0.1 });
-        queue.push(at(2), InputEvent::PointerMotionAbsolute { x: 0.9, y: 0.4 });
+        queue.push(
+            at(1_000),
+            InputEvent::PointerMotionAbsolute { x: 0.1, y: 0.1 },
+        );
+        queue.push(
+            at(2_000),
+            InputEvent::PointerMotionAbsolute { x: 0.9, y: 0.4 },
+        );
         let batch = queue.take().expect("two pushes produce a batch");
         assert_eq!(
-            batch,
+            batch.events,
             vec![TimedInput {
-                at: at(2),
+                at: at(2_000),
                 event: InputEvent::PointerMotionAbsolute { x: 0.9, y: 0.4 },
             }]
         );
@@ -190,21 +206,21 @@ mod tests {
             id: 0x04,
         };
         queue.push(
-            at(1),
+            at(1_000),
             InputEvent::Key {
                 usage,
                 press: Press::Down,
             },
         );
         queue.push(
-            at(2),
+            at(2_000),
             InputEvent::Key {
                 usage,
                 press: Press::Up,
             },
         );
         assert_eq!(
-            queue.take().expect("two pushes").len(),
+            queue.take().expect("two pushes").events.len(),
             2,
             "a key that goes down and up must not collapse into one event"
         );
