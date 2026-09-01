@@ -4,13 +4,13 @@
 //! functions over the sixteen-byte header of [`crate::media`], and because the
 //! client reassembles video without wanting a QUIC server linked in to do it.
 
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use crate::media::{
-    Fragment, FrameId, FrameKind, MalformedPacket, PacketHeader, Seq, Timestamp, HEADER_LEN,
+    Fragment, FrameId, FrameKind, HEADER_LEN, MalformedPacket, PacketHeader, Seq, Timestamp,
 };
 
 /// Slices one access unit may hold.
@@ -788,11 +788,12 @@ mod tests {
         }
 
         // A deterministic cull and a deterministic shuffle: every fifty-third
-        // packet is lost, and every seventh neighbouring pair is swapped.
+        // packet is lost, every ninth frame is lost whole, and every seventh
+        // neighbouring pair is swapped.
         let mut damaged = Vec::new();
         let mut kept: Vec<(u32, Vec<u8>)> = Vec::new();
         for (index, packet) in wire.into_iter().enumerate() {
-            if index % 53 == 17 {
+            if index % 53 == 17 || packet.0 % 9 == 4 {
                 damaged.push(packet.0);
             } else {
                 kept.push(packet);
@@ -803,6 +804,7 @@ mod tests {
         }
 
         let mut delivered = 0u64;
+        let mut previous: Option<u32> = None;
         for (_, datagram) in &kept {
             if let Some(frame) = reassembler.push(datagram, start).expect("well formed") {
                 assert_eq!(
@@ -816,6 +818,20 @@ mod tests {
                     "frame {} lost a packet and was delivered anyway",
                     frame.id.0
                 );
+                // What a delta frame refers to is the frame before it, so a
+                // delta may only be delivered when that frame was delivered
+                // too. This is the property a wholly lost frame breaks: it
+                // takes every packet with it, so nothing but the hole in the
+                // identifiers says the reference is gone.
+                if matches!(frame.kind, FrameKind::Delta) {
+                    assert_eq!(
+                        previous,
+                        frame.id.0.checked_sub(1),
+                        "delta frame {} was decoded without the frame it refers to",
+                        frame.id.0
+                    );
+                }
+                previous = Some(frame.id.0);
                 delivered += 1;
             }
         }

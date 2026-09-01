@@ -158,7 +158,7 @@ All fields are little-endian.
 
 | Offset | Size | Field | Purpose |
 |---|---|---|---|
-| 0 | 4 | `frame_id` | Reassembly key, and what a recovery request names. |
+| 0 | 4 | `frame_id` | Reassembly key, and what a recovery request names. Counts encoded pictures and skips none. |
 | 4 | 4 | `capture` | When the frame was captured, in units of 100 microseconds since the session began. |
 | 8 | 2 | `seq` | Session-wide datagram counter, so a gap is visible across a frame boundary. Compared circularly, in the manner of RFC 1982. |
 | 10 | 2 | `slice_pkts` | Packets in this slice. Every packet carries it, so any one of them can size the reassembly buffer. |
@@ -168,6 +168,43 @@ All fields are little-endian.
 
 The payload follows immediately. At the 1434-byte datagram this transport reaches
 on a 1500-byte path, that leaves 1418 bytes of video, or 94.5% of the wire frame.
+
+### The frame identifier counts encoded pictures, and skips none
+
+This is a requirement on the host, not a description of it, and the receiver
+depends on it.
+
+A frame that loses one packet announces itself: the sequence number has a gap
+between two packets of the same frame, or the frame is still open when the next
+frame's packets arrive. A frame that loses *every* packet announces nothing. It
+leaves no trace at all except the hole it makes in the frame identifiers, so
+that hole is what the receiver reads: a delivered frame whose identifier is not
+one above the last one delivered means the frames in between are gone, the
+reference chain is broken, and nothing may be decoded until the next key frame.
+
+That reading is only correct if the host never skips an identifier for a reason
+of its own. The rule that makes it correct is that the identifier follows the
+encoder's chain of reference frames rather than the capture clock:
+
+- A frame the host declines **before** encoding costs no identifier. The encoder
+  never saw the picture, so its reference chain is unbroken, and the client has
+  nothing to recover from. This is what the send gate asks about, and it is the
+  cheap case.
+- A frame the host declines **after** encoding — the send gate's second check,
+  or any encoded picture thrown away — keeps its identifier and leaves a gap.
+  The encoder's reference chain has already advanced past it, so every later
+  frame refers to a picture the client will never hold. The gap is not an
+  accounting artefact; it is the signal that a key frame is needed, and it is
+  indistinguishable from wire loss because the consequence is identical.
+
+Numbering by capture instead would make the two cases identical on the wire.
+With one reference frame and a key frame interval of 1024 at 60 Hz, that is up
+to seventeen seconds of silently wrong picture, which is why no field was added
+to say which case occurred: the identifier already says it, and a second field
+saying the same thing would be a second thing to get wrong.
+
+Identifiers do not restart within a connection. A resolution change is made on a
+filter without restarting the encoder, so the sequence carries across it.
 
 The timestamp counts 100-microsecond ticks rather than microseconds because
 microseconds overflow four bytes after 71 minutes, and a remote desktop session
