@@ -67,11 +67,32 @@ impl ControlWriter {
     }
 }
 
+/// Bytes of length prefix in front of each message.
+const HEADER: usize = 4;
+
 /// The receiving half of the control stream.
+///
+/// [`ControlReader::recv`] is cancel-safe, which is what lets it sit in a
+/// `select!` beside a timer. That is not free and it is not incidental: a
+/// message is a length and then the body it announces, quinn's `read_exact` is
+/// documented as *not* cancel-safe, and a read cancelled between the two would
+/// take the bytes it had already consumed with it. The next length would then be
+/// read out of the middle of a message and the framing would never square again.
+/// The connection survives that, because keepalives and datagrams are on other
+/// paths, so the symptom is not a disconnection but a control stream that goes
+/// silent for the rest of the session.
+///
+/// So bytes come off the stream a chunk at a time, into a buffer that outlives
+/// any one call, and framing is done over that buffer rather than over the
+/// stream.
 #[derive(Debug)]
 pub struct ControlReader {
     stream: RecvStream,
-    buffer: Vec<u8>,
+    /// Bytes taken off the stream and not yet framed, including any tail of the
+    /// next message that arrived with this one.
+    pending: Vec<u8>,
+    /// The body of the message last framed.
+    message: Vec<u8>,
 }
 
 impl ControlReader {
@@ -80,11 +101,15 @@ impl ControlReader {
     pub const fn new(stream: RecvStream) -> Self {
         Self {
             stream,
-            buffer: Vec::new(),
+            pending: Vec::new(),
+            message: Vec::new(),
         }
     }
 
     /// Reads one message.
+    ///
+    /// Cancel-safe: a dropped future leaves the stream where it found it. See
+    /// [`ControlReader`].
     ///
     /// # Errors
     /// If the stream ends, the peer announces a message longer than
@@ -107,18 +132,45 @@ impl ControlReader {
         Ok(H::decode(bytes)?)
     }
 
-    /// Reads one length-prefixed frame into the buffer.
+    /// Takes the next whole frame out of the buffer, reading more when the
+    /// buffer does not hold one yet.
     async fn frame(&mut self) -> Result<&[u8], ControlError> {
-        let mut header = [0u8; 4];
-        self.stream.read_exact(&mut header).await?;
-        let len = u32::from_be_bytes(header) as usize;
+        loop {
+            if let Some(len) = self.announced()?
+                && self.pending.len() >= HEADER + len
+            {
+                self.message.clear();
+                self.message
+                    .extend_from_slice(&self.pending[HEADER..HEADER + len]);
+                self.pending.drain(..HEADER + len);
+                return Ok(&self.message);
+            }
+            // The one await, and the only place bytes leave the stream.
+            // `read_chunk` is cancel-safe: it reports data only once it has
+            // taken it, so a future dropped here has consumed nothing.
+            let chunk = self
+                .stream
+                .read_chunk(MAX_MESSAGE, true)
+                .await?
+                .ok_or(ControlError::Ended)?;
+            self.pending.extend_from_slice(&chunk.bytes);
+        }
+    }
+
+    /// The body length the buffered header announces, once there is one.
+    ///
+    /// # Errors
+    /// If the peer announces a message longer than [`MAX_MESSAGE`]. Reading it
+    /// would mean allocating on a stranger's say-so.
+    fn announced(&self) -> Result<Option<usize>, ControlError> {
+        let Some(header) = self.pending.get(..HEADER) else {
+            return Ok(None);
+        };
+        let len = u32::from_be_bytes(header.try_into().expect("four bytes")) as usize;
         if len > MAX_MESSAGE {
             return Err(ControlError::TooLong { len });
         }
-        self.buffer.clear();
-        self.buffer.resize(len, 0);
-        self.stream.read_exact(&mut self.buffer).await?;
-        Ok(&self.buffer)
+        Ok(Some(len))
     }
 }
 
@@ -128,9 +180,12 @@ pub enum ControlError {
     /// The peer speaks another version of the protocol, or sent no hello.
     #[error(transparent)]
     Handshake(#[from] HandshakeError),
-    /// The stream ended, or the peer reset it.
+    /// The peer finished the stream, part way through a message or between two.
     #[error("the control stream ended")]
-    Ended(#[from] quinn::ReadExactError),
+    Ended,
+    /// The stream would not take a read.
+    #[error("the control stream would not take a read")]
+    Read(#[from] quinn::ReadError),
     /// The stream would not take a write.
     #[error("the control stream would not take a write")]
     Write(#[from] quinn::WriteError),

@@ -672,3 +672,90 @@ async fn a_client_of_another_version_is_refused_by_name() {
         "the client is told why the connection closed, and got {reason}"
     );
 }
+
+/// Frames one control message the way [`ControlWriter`] does, so a test can put
+/// the length and the body on the wire separately.
+fn framed<M: serde::Serialize>(message: &M) -> (Vec<u8>, Vec<u8>) {
+    let body = postcard::to_stdvec(message).expect("a message that encodes");
+    let header = u32::try_from(body.len()).expect("a short message");
+    (header.to_be_bytes().to_vec(), body)
+}
+
+/// A raw client, so the test owns the send stream rather than a `ControlWriter`.
+///
+/// The hello is written by hand in the same framing the writer uses, because
+/// what is being tested is a message arriving in two pieces and the writer has
+/// no way to say that.
+async fn raw_session(
+    link: &Link,
+) -> (
+    HostSession,
+    quinn::Connection,
+    quinn::SendStream,
+    quinn::RecvStream,
+) {
+    let dial = async {
+        let connection = link
+            .client
+            .endpoint()
+            .connect(link.address, HOST_NAME)
+            .expect("a dialable address")
+            .await
+            .expect("the handshake succeeds");
+        let (mut send, recv) = connection.open_bi().await.expect("the stream opens");
+        let (header, body) = framed(&ClientHello::new(capabilities()));
+        send.write_all(&header).await.expect("the write lands");
+        send.write_all(&body).await.expect("the write lands");
+        (connection, send, recv)
+    };
+    let (host, (connection, send, recv)) = tokio::join!(link.host.accept(), dial);
+    (host.expect("the host accepts"), connection, send, recv)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_in_a_select_survives_a_message_that_arrives_in_two_pieces() {
+    // The daemon reads the control stream as one arm of a `select!` beside two
+    // timers. Every tick therefore drops a half-finished read, and a reader that
+    // took its bytes off the stream and then lost them leaves the framing cut in
+    // the wrong place: the next length is read out of the middle of a message
+    // and never squares again. Input stops for the rest of the session while the
+    // connection stays up, because keepalives and heartbeats are on other paths.
+    let tuning = Tuning::for_stream(hd());
+    let link = Link::open("cancel", tuning, tuning);
+    // The connection and the reading half are held for the test's whole life:
+    // dropping either closes what is being measured.
+    let (mut host, _connection, mut send, _recv) = raw_session(&link).await;
+
+    let message = ClientMessage::KeyframeRequest {
+        after: Some(FrameId(41)),
+    };
+    let (header, body) = framed(&message);
+    send.write_all(&header).await.expect("the write lands");
+
+    // The body follows far enough behind that the reader is cancelled many
+    // times between the two.
+    let write = async {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        send.write_all(&body).await.expect("the write lands");
+    };
+    let read = async {
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        loop {
+            tokio::select! {
+                message = host.from_client.recv::<ClientMessage>() => break message,
+                _ = tick.tick() => {}
+            }
+        }
+    };
+
+    let received = tokio::time::timeout(Duration::from_secs(3), async {
+        let (received, ()) = tokio::join!(read, write);
+        received
+    })
+    .await
+    .expect("a reader in a select must not lose the framing");
+    assert_eq!(
+        received.expect("the message survives the cancellations"),
+        message
+    );
+}
