@@ -178,14 +178,28 @@ impl Ladder {
         // Wi-Fi 6 link reported 216 Mbit/s, and encoding at that produces key
         // frames too large for a client to reassemble before its deadline. The
         // ceiling is what the user asked for and the estimate can only lower it.
-        self.bitrate = available_bits.min(self.ceiling);
+        let wanted = available_bits.min(self.ceiling);
+        if worth_a_key_frame(self.bitrate, wanted) {
+            self.bitrate = wanted;
+        }
 
         let ratio = bits_per_pixel_per_frame(self.bitrate, self.rungs[self.rung], self.fps);
-        self.pressure = match (ratio, self.pressure) {
-            (r, Pressure::Falling(since)) if r < STARVED => Pressure::Falling(since),
-            (r, _) if r < STARVED => Pressure::Falling(now),
-            (r, Pressure::Rising(since)) if r > COMFORTABLE => Pressure::Rising(since),
-            (r, _) if r > COMFORTABLE => Pressure::Rising(now),
+        // The climb is judged at the rung it would climb into, not at the one it
+        // is standing on. A rung is a factor of four in pixels and the band
+        // between the two thresholds is a factor of two, so a ladder that asked
+        // "is this comfortable here?" would climb into a rung it cannot afford,
+        // starve there, fall back out, and repeat for the rest of the session.
+        // Asking "would it still be comfortable there?" makes the two decisions
+        // the same decision and settles by construction.
+        let above = self
+            .rungs
+            .get(self.rung + 1)
+            .map(|rung| bits_per_pixel_per_frame(self.bitrate, *rung, self.fps));
+        self.pressure = match (self.pressure, ratio, above) {
+            (Pressure::Falling(since), r, _) if r < STARVED => Pressure::Falling(since),
+            (_, r, _) if r < STARVED => Pressure::Falling(now),
+            (Pressure::Rising(since), _, Some(r)) if r > COMFORTABLE => Pressure::Rising(since),
+            (_, _, Some(r)) if r > COMFORTABLE => Pressure::Rising(now),
             _ => Pressure::Settled,
         };
 
@@ -219,6 +233,23 @@ impl Ladder {
         self.pressure = Pressure::Settled;
         self.last_resolution_change = Some(now);
     }
+}
+
+/// Whether moving the encoder's target from `held` to `wanted` buys enough to
+/// be worth the key frame it costs.
+///
+/// Setting the bitrate marks the encoder for reconfiguration and
+/// reconfiguration resets its state, so every step is a full IDR out of the
+/// budget the client's own requests are drawn from. The estimate is a live
+/// measurement of a Wi-Fi path and never repeats, so a ladder that followed it
+/// exactly asked for a key frame on every tick of the rate controller and left
+/// the budget empty when a client that had lost a frame needed one.
+///
+/// An eighth: two steps cover a link that halves, which is faster than any
+/// congestion event this reacts to, and nothing smaller than that changes the
+/// picture enough to see.
+fn worth_a_key_frame(held: u32, wanted: u32) -> bool {
+    held.abs_diff(wanted) > held / 8
 }
 
 /// Rounds down to an even number.
@@ -384,6 +415,70 @@ mod tests {
         assert_eq!(
             changes, 0,
             "a reading inside the hysteresis band must settle"
+        );
+    }
+
+    /// A steady link, read four times a second, with the one per cent jitter a
+    /// live estimator has. Nothing about the path is changing.
+    fn jittering(tick: u32) -> u32 {
+        12_000_000 + (tick.wrapping_mul(7919) % 240_000)
+    }
+
+    #[test]
+    fn a_jittering_estimate_does_not_retarget_the_encoder_on_every_tick() {
+        // Every bitrate change costs a key frame: the property setter marks the
+        // encoder for reconfiguration and reconfiguration resets its state. The
+        // host draws that key frame from the same budget the client's own
+        // requests draw from, so a ladder that followed the estimate exactly
+        // would spend the whole budget on itself and leave a client that lost a
+        // frame with nothing to recover from.
+        let mut ladder = ladder();
+        let mut now = Instant::now();
+        let mut changes = 0;
+        for tick in 0..240u32 {
+            now += Duration::from_millis(250);
+            if ladder.observe(jittering(tick), now).is_some() {
+                changes += 1;
+            }
+        }
+        assert!(
+            changes <= 4,
+            "a minute on an unchanging link must not cost {changes} key frames"
+        );
+    }
+
+    #[test]
+    fn a_link_that_sits_between_two_rungs_settles_on_one_of_them() {
+        // The hysteresis band is a factor of two and a rung is a factor of four
+        // in pixels, so judging a climb by the rung the ladder is standing on
+        // lets it climb into a rung it cannot afford. It is starved there, falls
+        // out, is comfortable again, and climbs back. Each pass costs two key
+        // frames, drawn from the same budget a client's own request draws from.
+        //
+        // Nine megabits is starved at the full size and comfortable at a quarter
+        // of it, which is the whole width of the trap.
+        const BETWEEN: u32 = 9_000_000;
+        let mut ladder = ladder();
+        let mut now = Instant::now();
+        for _ in 0..60 {
+            now += Duration::from_millis(500);
+            ladder.observe(BETWEEN, now);
+        }
+        let settled = ladder.settings().size;
+
+        let mut changes = 0;
+        for _ in 0..60 {
+            now += Duration::from_millis(500);
+            if ladder
+                .observe(BETWEEN, now)
+                .is_some_and(|s| s.size != settled)
+            {
+                changes += 1;
+            }
+        }
+        assert_eq!(
+            changes, 0,
+            "an unchanging link must not move the resolution at all, and moved it {changes} times"
         );
     }
 
