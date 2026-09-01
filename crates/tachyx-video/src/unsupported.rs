@@ -75,6 +75,12 @@ impl VideoTexture {
         match self.0 {}
     }
 
+    /// The first thing that went wrong, if anything has.
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        match self.0 {}
+    }
+
     /// What the path has done so far.
     #[must_use]
     pub fn stats(&self) -> Stats {
