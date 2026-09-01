@@ -8,7 +8,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{AckFrequencyConfig, Connection, Endpoint, IdleTimeout, TransportConfig, VarInt};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
-use tachyx_proto::control::ClientHello;
+use tachyx_proto::control::{ClientHello, HostHello};
 
 use crate::control::{ControlError, ControlReader, ControlWriter};
 use crate::identity::{HostIdentity, IdentityError, PinStore, PinnedServer};
@@ -19,7 +19,10 @@ use crate::video::{VideoReceiver, VideoSender};
 /// The protocol version is not folded into this. A version mismatch belongs in
 /// the hello, where it is reported by name, rather than in the handshake, where
 /// it would surface as an opaque TLS alert.
-const ALPN: &[u8] = b"tachyx";
+pub const ALPN: &[u8] = b"tachyx";
+
+/// The close code for a peer whose hello this build will not accept.
+const REFUSED: VarInt = VarInt::from_u32(1);
 
 /// Settings the defaults get wrong for a local network, and by large factors.
 #[derive(Debug, Clone, Copy)]
@@ -130,7 +133,13 @@ impl Host {
         Ok(self.endpoint.local_addr()?)
     }
 
-    /// Waits for a client, completes the handshake, and reads its hello.
+    /// Waits for a client, completes the handshake, and exchanges hellos.
+    ///
+    /// The host's own hello goes out before the client's is read, so a client
+    /// this build cannot talk to is told which version the host speaks rather
+    /// than left with a connection that closed for no stated reason. For the
+    /// same reason a refusal closes the connection with the refusal as its
+    /// reason instead of dropping it.
     ///
     /// # Errors
     /// If the endpoint is closed, the connection fails, or the client's hello
@@ -141,11 +150,19 @@ impl Host {
         // The client opens the stream, so the host waits for it rather than
         // racing to open one of its own.
         let (send, recv) = connection.accept_bi().await?;
+        let mut to_client = ControlWriter::new(send);
         let mut from_client = ControlReader::new(recv);
-        let hello = from_client.recv_hello().await?;
+        to_client.send(&HostHello::new()).await?;
+        let hello = match from_client.recv_hello::<ClientHello>().await {
+            Ok(hello) => hello,
+            Err(refused) => {
+                connection.close(REFUSED, refused.to_string().as_bytes());
+                return Err(refused.into());
+            }
+        };
         Ok(HostSession {
             video: VideoSender::new(connection.clone()),
-            to_client: ControlWriter::new(send),
+            to_client,
             from_client,
             hello,
             connection,
@@ -237,11 +254,16 @@ impl Client {
         let connection = self.endpoint.connect(address, &server_name)?.await?;
         let (send, recv) = connection.open_bi().await?;
         let mut to_host = ControlWriter::new(send);
+        // The stream reaches the host only when something is written on it, so
+        // the client speaks first and the host answers.
         to_host.send(hello).await?;
+        let mut from_host = ControlReader::new(recv);
+        let greeting = from_host.recv_hello::<HostHello>().await?;
         Ok(ClientSession {
             video: VideoReceiver::new(connection.clone(), self.tuning.frame_deadline),
             to_host,
-            from_host: ControlReader::new(recv),
+            from_host,
+            greeting,
             connection,
         })
     }
@@ -252,6 +274,9 @@ impl Client {
 pub struct ClientSession {
     /// The connection itself, for statistics and for closing it.
     pub connection: Connection,
+    /// What the host said before it read the hello. Its version has already
+    /// been checked against this build's.
+    pub greeting: HostHello,
     /// Encoded pictures in.
     pub video: VideoReceiver,
     /// Input and key frame requests out.

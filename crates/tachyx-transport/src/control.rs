@@ -9,7 +9,7 @@
 use quinn::{RecvStream, SendStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tachyx_proto::control::{ClientHello, HandshakeError};
+use tachyx_proto::control::{HandshakeError, Hello};
 
 /// The largest message either end will read.
 ///
@@ -94,7 +94,7 @@ impl ControlReader {
         postcard::from_bytes(bytes).map_err(|_| ControlError::Undecodable)
     }
 
-    /// Reads the client's hello, which carries the protocol version.
+    /// Reads the peer's hello, which carries the protocol version.
     ///
     /// Separate from [`ControlReader::recv`] because the version is checked
     /// before the rest of the message, rather than after a decode that a
@@ -102,9 +102,9 @@ impl ControlReader {
     ///
     /// # Errors
     /// If the stream ends, or the peer speaks another version of the protocol.
-    pub async fn recv_hello(&mut self) -> Result<ClientHello, ControlError> {
+    pub async fn recv_hello<H: Hello>(&mut self) -> Result<H, ControlError> {
         let bytes = self.frame().await?;
-        Ok(ClientHello::decode(bytes)?)
+        Ok(H::decode(bytes)?)
     }
 
     /// Reads one length-prefixed frame into the buffer.

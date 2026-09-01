@@ -18,11 +18,20 @@ input event, and an input event must not delay a frame.
 
 ### Security, currently
 
-There is none. The host presents a self-signed certificate and the client accepts
-any certificate. This is a deliberate, temporary state for latency work on a
-trusted LAN. The certificate machinery is already in place so that pinning the
-peer's Ed25519 key becomes a change to one verifier, not a change to the
-transport.
+The host presents a self-signed certificate derived from a key it keeps, and the
+client pins the SHA-256 of that certificate's subject public key info the first
+time it sees a host under a given name. Afterwards a different key under the same
+name is refused. The pin is over the public key rather than the certificate
+because the host derives a fresh certificate from the stored key on every start,
+and a certificate is not byte-stable across those starts.
+
+Validity dates and the subject name are deliberately not checked. The certificate
+is self-signed, so a forger writes whatever it likes into both; the pin is the
+only thing an attacker has to break.
+
+What is missing is the first meeting. A host the client has not met is accepted
+and remembered, so an attacker present at that moment is pinned instead of the
+host. Pairing closes that hole, and it is one verifier away.
 
 ## Control stream framing
 
@@ -35,8 +44,20 @@ plane is Rust, so a schema compiler would buy nothing but a second set of weaker
 types and the conversion layer between them.
 
 `postcard` varint-encodes integers and lengths, needs no allocator, and has a
-published wire specification. It is not self-describing, so the first message
-carries the protocol version and a mismatch is reported rather than misparsed.
+published wire specification. It is not self-describing, so the first message in
+each direction carries the protocol version as its first field, and each end
+reads that field before it decodes anything after it. A mismatch is then reported
+by name rather than misparsed.
+
+Both directions, because a check in one direction only leaves the other end
+decoding a message a later version reshaped, and those bytes do not fail to
+parse. They parse into something else.
+
+The host writes its hello before it reads the client's. Its version does not
+depend on the client's, and sending it first means a client of the wrong version
+is told which version the host speaks. A refusal then closes the connection with
+the reason attached, so neither end is left with a connection that ended for no
+stated reason.
 
 The video path does not use this encoding, or serde at all. See below.
 
@@ -72,8 +93,12 @@ The video path does not use this encoding, or serde at all. See below.
 
 ### Host to client
 
-`HostHello`
-: Encoders and capture formats the host has, and the list of monitors.
+`HostHello` — first message on the stream, sent before the client's is read.
+: The protocol version, and at draft 0 nothing else. There is nothing else for
+  the host to announce at this point: the host decides how to encode, not the
+  client, and it says so in `StreamConfig` once it has read what the client can
+  drive. Encoders, capture formats and the list of monitors join it when
+  choosing a monitor is a thing a client can do.
 
 `StreamConfig`
 : The host's decision: codec, encoded resolution, frame rate, target bitrate, and

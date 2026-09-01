@@ -120,7 +120,34 @@ pub struct Capabilities {
     pub bitrate_ceiling: NonZeroU32,
 }
 
-/// The first message on the control stream.
+/// A first message, which carries the protocol version ahead of everything
+/// else.
+///
+/// Both ends send one and both check the other's. Checking in one direction
+/// only leaves the end that did not check decoding a message a later version
+/// reshaped: `postcard` writes neither field names nor framing, so those bytes
+/// do not fail to parse, they parse into something else.
+pub trait Hello: Sized {
+    /// Reads the message, checking the version before anything after it.
+    ///
+    /// # Errors
+    /// If the version does not match this build, or the bytes are not this
+    /// message.
+    fn decode(bytes: &[u8]) -> Result<Self, HandshakeError>;
+}
+
+/// Reads a message whose first field is the protocol version, and refuses it by
+/// name before a mismatch can be decoded into plausible nonsense.
+fn decode_versioned<M: for<'a> Deserialize<'a>>(bytes: &[u8]) -> Result<M, HandshakeError> {
+    let (version, _) =
+        postcard::take_from_bytes::<u16>(bytes).map_err(|_| HandshakeError::Malformed)?;
+    if version != VERSION {
+        return Err(HandshakeError::Version { theirs: version });
+    }
+    postcard::from_bytes(bytes).map_err(|_| HandshakeError::Malformed)
+}
+
+/// The client's first message on the control stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
     /// Read before anything after it. Private so that a hello cannot be built
@@ -145,22 +172,55 @@ impl ClientHello {
     pub const fn version(&self) -> u16 {
         self.version
     }
+}
 
-    /// Reads a hello, checking the version before the rest of the message.
-    ///
-    /// `postcard` has no framing between fields, so a peer built against a
-    /// different version would otherwise be reported as a corrupt message, or
-    /// worse, parsed into plausible nonsense.
-    ///
-    /// # Errors
-    /// If the version does not match this build, or the bytes are not a hello.
-    pub fn decode(bytes: &[u8]) -> Result<Self, HandshakeError> {
-        let (version, _) =
-            postcard::take_from_bytes::<u16>(bytes).map_err(|_| HandshakeError::Malformed)?;
-        if version != VERSION {
-            return Err(HandshakeError::Version { theirs: version });
-        }
-        postcard::from_bytes(bytes).map_err(|_| HandshakeError::Malformed)
+impl Hello for ClientHello {
+    fn decode(bytes: &[u8]) -> Result<Self, HandshakeError> {
+        decode_versioned(bytes)
+    }
+}
+
+/// The host's answer to a [`ClientHello`], and the first thing it says.
+///
+/// It carries the version and nothing else. There is nothing else for the host
+/// to announce at this point: the host, not the client, decides how to encode,
+/// and it says so in [`StreamConfig`] once it has read what the client can
+/// drive. What this message exists for is the version, which the client
+/// otherwise has no way to check.
+///
+/// The host sends it before it has read the client's hello, so a client of the
+/// wrong version is told which version the host speaks rather than being left
+/// with a connection that closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostHello {
+    /// Read before anything after it, and private for the same reason as
+    /// [`ClientHello::version`].
+    version: u16,
+}
+
+impl HostHello {
+    /// Announces this build's protocol version.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { version: VERSION }
+    }
+
+    /// The version the peer claims.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+}
+
+impl Default for HostHello {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Hello for HostHello {
+    fn decode(bytes: &[u8]) -> Result<Self, HandshakeError> {
+        decode_versioned(bytes)
     }
 }
 
@@ -291,6 +351,14 @@ mod tests {
     }
 
     #[test]
+    fn a_host_hello_survives_the_round_trip() {
+        let hello = HostHello::new();
+        assert_eq!(hello.version(), VERSION);
+        let bytes = postcard::to_stdvec(&hello).unwrap();
+        assert_eq!(HostHello::decode(&bytes), Ok(hello));
+    }
+
+    #[test]
     fn a_version_mismatch_is_named_rather_than_misparsed() {
         #[derive(Serialize)]
         struct Later {
@@ -302,12 +370,14 @@ mod tests {
             anything: [1, 2, 3],
         })
         .unwrap();
-        assert_eq!(
-            ClientHello::decode(&bytes),
-            Err(HandshakeError::Version {
-                theirs: VERSION + 7
-            })
-        );
+        let mismatch = HandshakeError::Version {
+            theirs: VERSION + 7,
+        };
+        // Both directions, because a client that cannot check the host's
+        // version decodes whatever a later host sends into something that looks
+        // like a message of its own.
+        assert_eq!(ClientHello::decode(&bytes), Err(mismatch));
+        assert_eq!(HostHello::decode(&bytes), Err(mismatch));
     }
 
     #[test]
