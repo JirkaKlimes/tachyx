@@ -4,6 +4,7 @@
 //! composition: it owns the session, the pipeline that serves it, and the policy
 //! that decides what the encoder is asked for.
 
+pub mod config;
 pub mod idle;
 pub mod idr;
 pub mod ladder;
