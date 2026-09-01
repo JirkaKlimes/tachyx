@@ -50,8 +50,15 @@ class VideoSurface(private val textures: TextureRegistry) : MethodChannel.Method
 
     private fun size(call: MethodCall, name: String) = call.argument<Number>(name)?.toInt() ?: 1
 
-    /** Opens a producer sized for a [width] by [height] decoded picture. */
-    private fun open(width: Int, height: Int): Long {
+    /**
+     * Opens a producer sized for a [width] by [height] decoded picture.
+     *
+     * Reports whether it applies the bitstream's crop rectangle itself. The
+     * image reader does not, and the surface texture the engine falls back to on
+     * a device whose hardware buffers are defective does, so the client cannot
+     * assume either and has to be told.
+     */
+    private fun open(width: Int, height: Int): Map<String, Any> {
         val producer = textures.createSurfaceProducer()
         val id = producer.id()
         producer.setSize(width, height)
@@ -72,7 +79,7 @@ class VideoSurface(private val textures: TextureRegistry) : MethodChannel.Method
             },
         )
         VideoSurfaceNative.attach(id, producer.surface)
-        return id
+        return mapOf("id" to id, "appliesCrop" to producer.handlesCropAndRotation())
     }
 
     /**

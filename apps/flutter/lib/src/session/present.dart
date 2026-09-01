@@ -72,34 +72,42 @@ final class _Registered extends Presentation {
 
 /// A surface producer the platform decoder writes into.
 ///
-/// The producer draws the decoder's buffer as it stands and applies no crop, so
-/// the rows and columns the macroblock grid added have to be taken off here.
+/// The image reader behind it draws the decoder's buffer as it stands and
+/// applies no crop, so the rows and columns the macroblock grid added have to be
+/// taken off here. The surface texture the engine falls back to on a device
+/// whose hardware buffers are defective does apply it, and says so, in which
+/// case taking them off again would enlarge the picture past its own edges.
 final class _Produced extends Presentation {
-  const _Produced(super.textureId);
+  const _Produced(super.textureId, {required this.appliesCrop});
 
   static Future<Presentation> open(
     Session session, {
     required int width,
     required int height,
   }) async {
-    final int id =
-        await _video.invokeMethod<int>('open', <String, int>{
+    final Map<String, Object?> opened =
+        await _video.invokeMapMethod<String, Object?>('open', <String, int>{
           'width': width,
           'height': height,
         }) ??
-        -1;
+        const <String, Object?>{};
+    final int id = opened['id'] as int? ?? -1;
     try {
       session.presentOn(engineHandle: id);
     } on Object {
       await _video.invokeMethod<void>('close', <String, int>{'id': id});
       rethrow;
     }
-    return _Produced(id);
+    return _Produced(id, appliesCrop: opened['appliesCrop'] as bool? ?? false);
   }
 
+  /// Whether the producer has already taken the crop off.
+  final bool appliesCrop;
+
   @override
-  VideoCrop crop(Encoding? encoding) =>
-      encoding == null ? VideoCrop.whole : VideoCrop.of(encoding);
+  VideoCrop crop(Encoding? encoding) => encoding == null || appliesCrop
+      ? VideoCrop.whole
+      : VideoCrop.of(encoding);
 
   @override
   Future<void> resize(Encoding encoding) => _video.invokeMethod<void>(

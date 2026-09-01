@@ -16,6 +16,9 @@
 //! the tests at the bottom against sequence parameter sets taken off this host's
 //! own encoder.
 
+/// A coded slice of a picture that refers back to others.
+const NAL_SLICE: u8 = 1;
+
 /// A coded slice of an instantaneous decoding refresh picture.
 const NAL_IDR_SLICE: u8 = 5;
 
@@ -122,7 +125,11 @@ impl<'a> AccessUnit<'a> {
     /// Reads what an Annex B access unit contains.
     ///
     /// Only the two facts above are wanted, so this walks the start codes and
-    /// looks at one byte of each unit. It never copies and never allocates.
+    /// looks at one byte of each unit. It never copies and never allocates, and
+    /// it stops at the first coded slice: the parameter sets come before the
+    /// picture and the picture is the end of the unit, so nothing past there can
+    /// change either answer. That is what keeps a scan for start codes off the
+    /// two hundred kilobytes of a key frame.
     pub(super) fn of(bytes: &'a [u8]) -> Self {
         let mut unit = Self {
             parameters: None,
@@ -131,7 +138,11 @@ impl<'a> AccessUnit<'a> {
         for nal in Nals::of(bytes) {
             match nal.first().map(|header| header & 0x1f) {
                 Some(NAL_SPS) => unit.parameters = Some(nal),
-                Some(NAL_IDR_SLICE) => unit.key = true,
+                Some(NAL_IDR_SLICE) => {
+                    unit.key = true;
+                    break;
+                }
+                Some(NAL_SLICE) => break,
                 _ => {}
             }
         }
@@ -403,6 +414,22 @@ mod tests {
         let mut stream = vec![0, 0, 1];
         stream.extend_from_slice(SPS_1920X1088);
         stream.extend_from_slice(&[0, 0, 1, 0x25, 0x88]);
+        let unit = AccessUnit::of(&stream);
+        assert!(unit.key);
+        assert_eq!(
+            unit.parameters.and_then(Coded::of),
+            Coded::of(SPS_1920X1088)
+        );
+    }
+
+    #[test]
+    fn reading_stops_at_the_picture_and_does_not_walk_it() {
+        // A slice several hundred kilobytes long is the ordinary case, and
+        // walking it for start codes would be the whole cost of reading a unit.
+        // Whatever follows one cannot change either answer, so a second
+        // parameter set behind the slice is never seen.
+        let mut stream = annex_b(&[&[0x09, 0x10], SPS_1920X1088, PPS, &[0x25, 0x88, 0x80]]);
+        stream.extend_from_slice(&annex_b(&[SPS_3440X1440]));
         let unit = AccessUnit::of(&stream);
         assert!(unit.key);
         assert_eq!(

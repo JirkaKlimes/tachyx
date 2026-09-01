@@ -148,7 +148,16 @@ class _SessionScreenState extends State<SessionScreen>
   /// asked for it.
   Future<void> _present(Session session) async {
     try {
-      final (int width, int height) = viewportOf(View.of(context));
+      // The size the host says it is coding, when it has said, so that the
+      // first picture lands in a surface already the right shape. It says so on
+      // the control stream, which does not wait for a decoder to exist, so this
+      // is usually already known. The client's own surface is the fallback, and
+      // the next sample corrects it.
+      final Encoding? declared = session.stats().encoding;
+      _sized = declared;
+      final (int width, int height) = declared == null
+          ? viewportOf(View.of(context))
+          : (declared.codedWidth, declared.codedHeight);
       final Presentation opened = await Presentation.open(
         session,
         width: width,
