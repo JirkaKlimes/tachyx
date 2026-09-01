@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
+use jni::JNIEnv;
 use jni::objects::{JClass, JObject};
 use jni::sys::jlong;
-use jni::JNIEnv;
 use ndk::native_window::NativeWindow;
 
 /// Every surface producer the Kotlin half has opened, by the identifier Flutter

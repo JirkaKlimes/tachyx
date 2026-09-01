@@ -22,7 +22,7 @@
 mod android;
 
 #[cfg(target_os = "android")]
-pub use android::{producer, Producer, Surface};
+pub use android::{Producer, Surface, producer};
 
 // The three entry points the Kotlin half calls. They are named here as well as
 // defined, because a symbol the Java virtual machine looks up is not reachable
