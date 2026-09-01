@@ -10,7 +10,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use crate::media::{
-    Fragment, FrameId, FrameKind, MalformedPacket, PacketHeader, Seq, Timestamp, HEADER_LEN,
+    Fragment, FrameId, FrameKind, HEADER_LEN, MalformedPacket, PacketHeader, Seq, Timestamp,
 };
 
 /// Slices one access unit may hold.

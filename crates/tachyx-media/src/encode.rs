@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -211,7 +211,11 @@ impl Encoder {
     /// If the source caps cannot be rebuilt.
     pub fn set_rate(&self, rate: Rate) -> Result<(), Error> {
         {
-            let mut settings = self.control.settings.lock().expect("settings mutex");
+            let mut settings = self
+                .control
+                .settings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             settings.rate = rate;
         }
         self.control.apply_rate(rate)
@@ -225,7 +229,11 @@ impl Encoder {
     /// If the filter caps cannot be built.
     pub fn set_resolution(&self, size: EncodeSize) -> Result<(), Error> {
         {
-            let mut settings = self.control.settings.lock().expect("settings mutex");
+            let mut settings = self
+                .control
+                .settings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             settings.size = size;
         }
         self.control.apply_size(size);
@@ -315,7 +323,7 @@ impl Control {
         scaler.set_property("add-borders", true);
         let filter = make("capsfilter")?;
         let encoder = make("vah264enc")?;
-        configure_encoder(&encoder)?;
+        configure_encoder(&encoder);
         let sink = AppSink::builder()
             .sync(false)
             .max_buffers(1u32)
@@ -468,7 +476,7 @@ fn make(element: &'static str) -> Result<gst::Element, Error> {
         .map_err(|_| Error::MissingElement(element))
 }
 
-fn configure_encoder(encoder: &gst::Element) -> Result<(), Error> {
+fn configure_encoder(encoder: &gst::Element) {
     // Variable bitrate rather than constant: constant pads every picture to the
     // target with filler, which was 87% of a static desktop's bitstream, and a
     // stream that is mostly padding makes the transport's bandwidth estimator
@@ -487,7 +495,6 @@ fn configure_encoder(encoder: &gst::Element) -> Result<(), Error> {
         "min-force-key-unit-interval",
         u64::try_from(MIN_KEYFRAME_INTERVAL.as_nanos()).unwrap_or(u64::MAX),
     );
-    Ok(())
 }
 
 /// What the scaler will import, as modifiers per DRM format.

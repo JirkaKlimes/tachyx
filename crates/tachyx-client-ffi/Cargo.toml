@@ -20,10 +20,13 @@ flutter_rust_bridge = "=2.13.0"
 
 # This crate cannot take the workspace lints, because they forbid unsafe and
 # `frb_generated.rs` is full of it: every call across the Dart boundary reads a
-# pointer Dart wrote. The set below is the workspace set with that one line
-# changed, so nothing else is lost.
+# pointer Dart wrote. That file is generated and rewritten on every codegen run,
+# so there is nowhere durable to record an exception and nothing a warning would
+# prompt anyone to fix. The crate earns the exemption by carrying no logic: it
+# translates between the protocol types and the generated boundary, nothing more.
+# The rest of the set below matches the workspace.
 [lints.rust]
-unsafe_code = "warn"
+unsafe_code = "allow"
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"

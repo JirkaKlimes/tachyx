@@ -188,7 +188,7 @@ impl EncodeSize {
     /// # Errors
     /// If either dimension is odd or falls outside the encoder's range.
     pub fn new(width: u32, height: u32) -> Result<Self, BadEncodeSize> {
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(BadEncodeSize::Odd);
         }
         let range = Self::MIN..=Self::MAX;
@@ -217,10 +217,15 @@ impl EncodeSize {
     /// # Errors
     /// If the result would fall outside the encoder's range.
     pub fn fit(source: Size, height: u32) -> Result<Self, BadEncodeSize> {
-        let height = (height / 16) * 16;
+        // Rounded to even rather than to a macroblock. The crop that H.264
+        // attaches is expressed in chroma samples, which are half a pixel apart
+        // in each axis under 4:2:0, so even is the real constraint. Forcing a
+        // multiple of sixteen here would distort the picture to avoid a crop
+        // that costs nothing, and `coded` already accounts for the macroblocks.
+        let height = (height / 2) * 2;
         let width = u64::from(source.width()) * u64::from(height) / u64::from(source.height());
-        let width = u32::try_from(width).unwrap_or(Self::MAX);
-        Self::new((width / 16) * 16, height)
+        let width = u32::try_from(width).unwrap_or(Self::MAX) / 2 * 2;
+        Self::new(width, height)
     }
 
     /// The size a decoder must show.
@@ -233,6 +238,10 @@ impl EncodeSize {
     ///
     /// H.264 codes whole macroblocks, so 1080 travels as 1088 rows with eight
     /// of them cropped away and 1800 travels as 1808.
+    ///
+    /// # Panics
+    /// If the visible size is within fifteen pixels of the encoder's ceiling in
+    /// either axis, which [`EncodeSize::new`] rejects.
     #[must_use]
     pub fn coded(self) -> Size {
         let round = |value: u32| value.div_ceil(16) * 16;
@@ -383,9 +392,28 @@ mod tests {
         let source = Size::new(2880, 1800).unwrap();
         let fitted = EncodeSize::fit(source, 1080).unwrap();
         assert_eq!(fitted.visible(), Size::new(1728, 1080).unwrap());
-        assert_eq!(fitted.display_aspect(), (8, 5));
-        assert_eq!(fitted.visible().width() % 16, 0);
-        assert_eq!(fitted.visible().height() % 16, 0);
+        assert_eq!(
+            fitted.display_aspect(),
+            source_aspect(source),
+            "a fitted size that changes the shape would make the scaler stretch"
+        );
+        assert_eq!(fitted.coded(), Size::new(1728, 1088).unwrap());
+    }
+
+    #[test]
+    fn a_fitted_size_is_always_even_in_both_axes() {
+        let source = Size::new(2880, 1800).unwrap();
+        for height in [1080u32, 900, 810, 722, 540, 400] {
+            let fitted = EncodeSize::fit(source, height).unwrap();
+            assert_eq!(fitted.visible().width() % 2, 0, "height {height}");
+            assert_eq!(fitted.visible().height() % 2, 0, "height {height}");
+        }
+    }
+
+    fn source_aspect(source: Size) -> (u32, u32) {
+        EncodeSize::new(source.width(), source.height())
+            .unwrap()
+            .display_aspect()
     }
 
     #[test]

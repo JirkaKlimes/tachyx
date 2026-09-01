@@ -6,18 +6,18 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use gbm::{BufferObject, BufferObjectFlags, Format, Modifier};
-use rustix::event::{poll, PollFd, PollFlags};
+use rustix::event::{PollFd, PollFlags, poll};
 use tachyx_proto::media::Timestamp;
 use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm};
 use wayland_client::protocol::{wl_shm_pool, wl_surface};
-use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::ext::image_capture_source::v1::client::{
     ext_image_capture_source_v1::ExtImageCaptureSourceV1,
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
@@ -289,9 +289,12 @@ impl Capture {
     /// The pointer as it was last reported.
     #[must_use]
     pub fn cursor(&self) -> Cursor {
+        // A poisoned lock means the capture thread panicked while updating the
+        // cursor. What is behind it is still a valid cursor, so reading a
+        // slightly stale position beats failing the call over it.
         self.cursor
             .lock()
-            .expect("the cursor mutex is never held across a panic")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -435,17 +438,16 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
             wl_output::Event::Name { name } => {
                 state.names.insert(id, name);
             }
-            wl_output::Event::Mode { flags, refresh, .. } => {
+            wl_output::Event::Mode { flags, refresh, .. }
                 if flags
                     .into_result()
-                    .is_ok_and(|f| f.contains(wl_output::Mode::Current))
-                {
-                    #[expect(
-                        clippy::cast_sign_loss,
-                        reason = "a mode line never reports a negative refresh"
-                    )]
-                    state.refresh.insert(id, refresh.max(0) as u32);
-                }
+                    .is_ok_and(|f| f.contains(wl_output::Mode::Current)) =>
+            {
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "a mode line never reports a negative refresh"
+                )]
+                state.refresh.insert(id, refresh.max(0) as u32);
             }
             _ => {}
         }
@@ -470,14 +472,17 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, Target> for State {
             E::BufferSize { width, height } => session.size = Some((width, height)),
             E::DmabufDevice { device } => session.device = read_u64(&device),
             E::DmabufFormat { format, modifiers } => {
-                let modifiers = modifiers.chunks_exact(8).filter_map(read_u64).collect();
+                let modifiers = modifiers
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|bytes| u64::from_ne_bytes(*bytes))
+                    .collect();
                 session.formats.push((format, modifiers));
             }
-            E::ShmFormat { format } => {
-                if let WEnum::Value(format) = format {
-                    session.shm_formats.push(format);
-                }
-            }
+            E::ShmFormat {
+                format: WEnum::Value(format),
+            } => session.shm_formats.push(format),
             E::Done => session.done = true,
             E::Stopped => session.stopped = true,
             _ => {}
@@ -1010,11 +1015,7 @@ impl Slab {
                 plane as u32,
                 object.offset(plane),
                 object.stride_for_plane(plane),
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "the protocol carries a modifier as two halves"
-                )]
-                ((modifier >> 32) as u32),
+                (modifier >> 32) as u32,
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "the protocol carries a modifier as two halves"

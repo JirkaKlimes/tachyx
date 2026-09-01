@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
@@ -384,9 +384,11 @@ mod tests {
         let identity = HostIdentity::load_or_create(&scratch("display")).unwrap();
         let short = identity.fingerprint().to_string();
         assert_eq!(short.len(), 19, "eight bytes in four groups");
-        assert!(identity
-            .fingerprint()
-            .to_hex()
-            .starts_with(&short.replace('-', "")));
+        assert!(
+            identity
+                .fingerprint()
+                .to_hex()
+                .starts_with(&short.replace('-', ""))
+        );
     }
 }

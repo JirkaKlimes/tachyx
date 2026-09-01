@@ -7,8 +7,8 @@
 //! event, and an input event must not delay a frame.
 
 use quinn::{RecvStream, SendStream};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tachyx_proto::control::{ClientHello, HandshakeError};
 
 /// The largest message either end will read.

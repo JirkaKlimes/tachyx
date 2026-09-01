@@ -9,9 +9,9 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use serde::{Deserialize, Serialize};
 
+use crate::VERSION;
 use crate::input::InputEvent;
 use crate::media::{FrameId, Timestamp};
-use crate::VERSION;
 
 /// A picture size in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

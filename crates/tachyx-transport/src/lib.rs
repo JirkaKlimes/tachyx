@@ -27,4 +27,4 @@ pub mod video;
 pub use control::{ControlError, ControlReader, ControlWriter};
 pub use endpoint::{Client, ClientSession, Host, HostSession, TransportError, Tuning};
 pub use identity::{Fingerprint, HostIdentity, IdentityError, PinStore};
-pub use video::{video_send_buffer, Sent, VideoError, VideoReceiver, VideoSender};
+pub use video::{Sent, VideoError, VideoReceiver, VideoSender, video_send_buffer};

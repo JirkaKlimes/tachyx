@@ -25,6 +25,10 @@ pub fn wrap_plane(
     fd: OwnedFd,
     size: usize,
 ) -> Result<gstreamer::Memory, gstreamer::glib::BoolError> {
+    #[expect(
+        unsafe_code,
+        reason = "the one call this crate exists to make; the lint stays on so a second one is caught"
+    )]
     // SAFETY: GStreamer takes ownership of the descriptor and closes it when the
     // memory is released. An `OwnedFd` owns its descriptor exclusively and gives
     // it up here, so nothing else can close it or use it afterwards, which is
@@ -34,5 +38,7 @@ pub fn wrap_plane(
     // bare integer descriptor, for which ownership cannot be established. Taking
     // `OwnedFd` by value is what discharges it, so this signature is the safety
     // proof rather than a restatement of it.
-    unsafe { allocator.alloc_dmabuf(fd, size) }
+    unsafe {
+        allocator.alloc_dmabuf(fd, size)
+    }
 }
