@@ -227,3 +227,92 @@ applications, so the application needs no permission for it. Requesting the
 multicast permission directly would add an implied hardware requirement that
 filters the application out of the store listing for devices without Wi-Fi, and a
 held lock keeps the radio waking on every beacon interval.
+
+## Client
+
+There is no prior art. No Flutter Moonlight or Sunshine client exists, and every
+Flutter video plugin surveyed assumes a URL or a file as its source. RustDesk is
+the closest working system and takes the opposite approach to ours: on Android it
+decodes into a byte buffer, converts on the CPU, and rebuilds an image in Dart
+every frame.
+
+The decode and present path is therefore different on each platform, and the split
+is forced by measurable costs rather than taste.
+
+### Android
+
+Decode with the platform decoder through the `ndk` crate, whose media API is safe
+and was compiled for `aarch64-linux-android` under `forbid(unsafe_code)`. It
+decodes straight into a surface, so no frame ever passes through our code.
+
+Presentation uses Flutter's newer surface producer, reached through about sixty
+lines of Kotlin. On current Android that path hands the decoder's buffers to the
+compositor's Vulkan backend directly. The alternative, `irondash_texture`, uses
+the older surface texture API, and Flutter's own source describes the resulting
+OpenGL-to-Vulkan interop as costing one device-to-device copy per frame and
+existing only as a migration fallback. Sixty lines of Kotlin is the cheaper price.
+
+One unavoidable unsafe call: turning the Java surface object into something the
+decoder can use. Nothing in the type system can prove a Java object reference is a
+live surface. It is isolated in a leaf crate, as agreed for the host's descriptor
+import.
+
+### Linux
+
+Decode with GStreamer, which is the same stack the host already uses to encode, so
+the dependency is already paid for. The decoded frame is uploaded and converted on
+the GPU by existing GStreamer elements and handed to Flutter as a texture, so we
+write no graphics code.
+
+Flutter's Linux embedder has no interface for accepting a shared buffer directly,
+and no proposal to add one. It works anyway, because the callback that supplies a
+texture runs on the rendering thread with Flutter's own graphics context already
+current. Two calls hand raw display and context handles across that boundary, and
+they are the only unsafe on the Linux client.
+
+The client must run on Wayland. Under X11 the embedder reads the entire window
+back from the GPU every frame before presenting, which is several megabytes and a
+pipeline stall per frame, entirely independent of anything we do.
+
+This is the riskiest part of the whole project. The Linux texture path depends on a
+crate whose graphics payload has roughly eleven thousand lifetime downloads, a
+single maintainer, a stable release from 2023, and not one issue ever filed about
+its OpenGL support, working or broken. It is about a hundred lines and we should be
+prepared to take ownership of it.
+
+### Consequences for the host
+
+Three requirements land on the encoder, and all three are cheap if done from the
+start and expensive to retrofit.
+
+Encoded dimensions must be multiples of sixteen. Flutter's Android present path
+does not apply the crop rectangle that H.264 uses to express sizes like 1080, which
+the codec must round up to 1088. Every rung of the resolution ladder is therefore
+chosen from multiples of sixteen.
+
+The parameter sets are repeated in the stream before every key frame rather than
+sent once out of band. The client then needs no separate configuration step,
+survives a reconnect and a resolution change without one, and recovers by itself if
+a parameter set is lost on a path that does not retransmit.
+
+The sequence parameter set must declare that the stream reorders nothing. Without
+it a decoder buffers frames before emitting them, which adds latency that no client
+setting can remove. We control the encoder, so we state it rather than rewriting
+the bitstream on the client the way Moonlight has to.
+
+### Input
+
+Flutter's built-in gesture recogniser cannot be used for tapping. Asking it for
+both a single and a double tap makes it hold the gesture arena until the
+double-tap timer expires: a measured 310 milliseconds before a single tap is
+reported, and no single-tap callback at all when a double tap does happen. The
+client uses one raw pointer listener and its own state machine, which reports a
+tap the instant the finger lifts.
+
+Keys are read before any text field can consume them, which is also what stops the
+back gesture from leaving the session and stops tab and the arrows from moving
+focus instead of reaching the remote desktop.
+
+Text from the on-screen keyboard is taken as edit deltas rather than by watching a
+hidden text field change, so composition in a language that needs it arrives as
+one committed string rather than as a stream of half-formed guesses.
