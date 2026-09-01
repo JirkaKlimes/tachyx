@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Rate};
+use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Idle, Rate};
 use tachyx_proto::control::{
     Aspect, ClientMessage, Codec, CodedSize, HEARTBEAT_INTERVAL, Heartbeat, HostMessage,
     Size as WireSize, StreamConfig,
@@ -23,6 +23,12 @@ use crate::ladder::{Ladder, Settings, Size as RungSize};
 
 /// How often the rate controller looks at what the link is carrying.
 const RATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often the send gate is re-examined while nothing is being encoded.
+///
+/// Short enough that a gate which shut on a burst reopens within a frame or two
+/// of the queue draining.
+const GATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Why a session ended.
 #[derive(Debug, thiserror::Error)]
@@ -174,20 +180,33 @@ async fn run(
         let admission = Arc::clone(&admission);
         let mut video = session.video;
         tokio::task::spawn_blocking(move || {
-            while let Some(unit) = units.recv() {
-                let slices = unit.slices();
-                let Ok(wire) = WireUnit::new(unit.frame, unit.captured, unit.kind, &slices) else {
-                    continue;
-                };
-                if video.send(&wire).is_err() {
-                    break;
+            loop {
+                match units.recv_timeout(GATE_INTERVAL) {
+                    Ok(unit) => {
+                        let slices = unit.slices();
+                        let Ok(wire) = WireUnit::new(unit.frame, unit.captured, unit.kind, &slices)
+                        else {
+                            continue;
+                        };
+                        if video.send(&wire).is_err() {
+                            break;
+                        }
+                        sent_frames.store(video.frames_sent(), Ordering::Relaxed);
+                    }
+                    Err(Idle::Waiting) => {}
+                    Err(Idle::Ended) => break,
                 }
-                sent_frames.store(video.frames_sent(), Ordering::Relaxed);
                 // Gate the NEXT frame before it is encoded. A frame never
-                // submitted leaves the encoder's reference chain intact; a
-                // frame encoded and then dropped breaks it, and with one
-                // reference frame and a long key frame interval the picture
-                // stays wrong for many seconds.
+                // submitted leaves the encoder's reference chain intact; a frame
+                // encoded and then dropped breaks it, and with one reference
+                // frame and a long key frame interval the picture stays wrong
+                // for many seconds.
+                //
+                // Re-evaluated on the timeout as well as after a send, because a
+                // shut gate stops the encoder, and a loop that only woke for a
+                // frame would then never wake to open the gate again. That is a
+                // deadlock, and it looks exactly like the picture freezing a few
+                // seconds in.
                 admission.store(
                     video.can_send_bytes(video.key_frame_estimate()),
                     Ordering::Relaxed,
@@ -210,7 +229,12 @@ async fn run(
                 Ok(ClientMessage::Input(batch)) => {
                     let events: Vec<_> =
                         batch.events.into_iter().map(|timed| timed.event).collect();
-                    injector.apply(&events)?;
+                    // A batch that cannot be injected is one batch lost. Ending
+                    // the session over it would take the picture away as well,
+                    // which is a far worse answer to a dropped click.
+                    if let Err(error) = injector.apply(&events) {
+                        tracing::warn!(%error, count = events.len(), "cannot inject input");
+                    }
                 }
                 Ok(ClientMessage::KeyframeRequest { .. }) => {
                     if budget.request(Reason::ClientRequest, Instant::now()) == Verdict::Allow {

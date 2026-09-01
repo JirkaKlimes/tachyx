@@ -75,7 +75,11 @@ class HostLink extends ChangeNotifier {
   static const String _addressKey = 'tachyx.host.address';
 
   /// The port a host listens on unless told otherwise.
-  static const int defaultPort = 4433;
+  ///
+  /// Must match `tachyx_hostd::config::DEFAULT_PORT`. A client whose default
+  /// differs from the daemon's leaves every first connection failing for a
+  /// reason the person typing the address cannot see.
+  static const int defaultPort = 47989;
 
   Link _state = const Offline();
 

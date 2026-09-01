@@ -31,7 +31,7 @@ pub use capture::{
     Capture, CaptureFormat, CaptureStats, Cursor, CursorImage, Frame, Frames, Plane,
 };
 pub use encode::{
-    AccessUnit, AccessUnits, EncodeConfig, EncodeStats, Encoder, Percentiles, StreamGeometry,
+    AccessUnit, AccessUnits, EncodeConfig, EncodeStats, Encoder, Idle, Percentiles, StreamGeometry,
 };
 
 /// Why capture or encode could not be set up or carried on.

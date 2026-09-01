@@ -104,12 +104,44 @@ impl AccessUnit {
 #[derive(Debug)]
 pub struct AccessUnits(Receiver<AccessUnit>);
 
+/// Why waiting for an access unit produced none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Idle {
+    /// Nothing was encoded within the time allowed. The encoder is still there.
+    ///
+    /// This is the ordinary state of a still screen: capture blocks until
+    /// something changes, so a desktop nobody is touching produces nothing for
+    /// as long as a second and a half.
+    Waiting,
+    /// Encoding has ended and nothing further will arrive.
+    Ended,
+}
+
 impl AccessUnits {
     /// Waits for the next access unit, or returns `None` once encoding has
     /// ended.
     #[must_use]
     pub fn recv(&self) -> Option<AccessUnit> {
         self.0.recv().ok()
+    }
+
+    /// Waits for the next access unit, giving up after `timeout`.
+    ///
+    /// A caller that also has periodic work must use this rather than [`recv`].
+    /// A still screen produces no frames at all, so a loop that only wakes for a
+    /// frame does not wake, and anything it was going to do on the way round
+    /// never happens.
+    ///
+    /// [`recv`]: Self::recv
+    ///
+    /// # Errors
+    /// [`Idle::Waiting`] when the time ran out, [`Idle::Ended`] when the encoder
+    /// has stopped.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<AccessUnit, Idle> {
+        self.0.recv_timeout(timeout).map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => Idle::Waiting,
+            std::sync::mpsc::RecvTimeoutError::Disconnected => Idle::Ended,
+        })
     }
 }
 

@@ -1,4 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Flutter's template declares this only for debug and profile builds, so a
+         release build cannot open a socket at all and every connection fails
+         before it is attempted. This client is a network client in every build. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <application
         android:label="tachyx"
         android:name="${applicationName}"
