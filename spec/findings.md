@@ -136,13 +136,88 @@ size and for loss resilience, and are never a latency optimisation.
 Verified on one running pipeline with no teardown and no dropped frames.
 
 Bitrate changes take effect immediately, at the cost of the IDR noted above.
-Resolution and frame rate changes are made by pushing new caps at the source; the
-scaler renegotiates and the encoder reconfigures in place, costing one keyframe
-and one frame of delay. Driving a resolution change from a downstream filter
-instead stalls the pipeline, so it must come from the source.
+
+Resolution changes are made by setting new caps on a filter placed between the
+scaler and the encoder. Measured: the change takes 0.03 milliseconds to apply,
+takes effect on the very next frame, drops nothing, and the encoder renegotiates
+its level in place. The source keeps pushing frames at the monitor's own size and
+never changes its caps, which is the only thing a fixed-size capture source can
+do.
+
+An earlier revision of this document claimed the opposite, that a downstream
+filter stalls the pipeline and the change must come from the source. That is
+wrong. It was measured on a pipeline whose source could renegotiate its own size,
+which capture cannot.
 
 A forced keyframe takes effect on the very next frame, and re-sends the parameter
-sets with it.
+sets with it. The limit on how often one may be forced defaults to none.
+
+### Constant bitrate spends most of the stream on padding
+
+Measured on synthetic desktop content at 1080p60 with the property set above:
+
+| Content | Total | Filler | Picture |
+|---|---|---|---|
+| Static page with a moving cursor | 4.75 MB | 87.2% | 0.76 Mbit/s |
+| Full-page scrolling | 4.75 MB | 78.2% | 1.45 Mbit/s |
+| A busy quarter-screen window | 5.18 MB | 0% | 7.86 Mbit/s |
+
+In constant-bitrate mode the encoder pads every frame to the target with filler
+data. A quiet desktop therefore spends 8 Mbit/s to carry 0.76 Mbit/s of picture.
+
+The waste is the smaller problem. The larger one is that the transport's bandwidth
+estimator only refreshes while the sender is not limited by its own supply, so a
+stream that is seven-eighths padding looks like genuine demand and the estimate
+degenerates into a measurement of our own padding.
+
+Variable bitrate with a target percentage emits no filler at all and tracks
+content: 1.95, 1.98 and 6.20 Mbit/s for the same three cases.
+
+### The frame rate in the caps is the real bitrate control
+
+The encoder budgets bits per frame as the bitrate divided by the frame rate
+declared in the caps, and ignores presentation timestamps entirely. Delivery
+cadence does not enter into it.
+
+So caps declaring 60 while capture delivers 20 produces a third of the configured
+rate, and caps declaring 30 while capture delivers 120 produces four times it.
+Bitrate and frame rate are therefore one setting, not two, and the declared rate
+must track the output's refresh rate rather than a nominal figure.
+
+### Coded size is not always the size that was asked for
+
+The encoder codes 1080 as 1088 and 1800 as 1808, attaching a crop. 720 and 1440
+need no crop. A client that ignores the crop shows eight rows of encoder working
+data and a slight vertical squeeze.
+
+The scaler does not preserve aspect ratio unless told to, and when it corrects for
+that it records the correction in a form that never reaches the bitstream: the
+sequence parameter set of a 16:10 capture scaled to 16:9 declares no aspect ratio
+at all. A client cannot recover the geometry from the stream, so the coded size,
+the visible size and the display aspect all travel in the stream configuration
+message.
+
+### What the encoder tells a decoder about buffering
+
+The sequence parameter set declares that the stream reorders nothing, which is the
+property that matters: a decoder outputs each picture as soon as it is decoded.
+It also declares room for two frames in the decoded picture buffer, and no
+encoder setting changes that. Sizing the buffer does not delay output, so the
+requirement is that reordering is zero, and that is met.
+
+### The encoder imports one buffer layout, not any
+
+The scaler accepts exactly one memory layout per pixel format for shared buffers,
+the compressed one this GPU prefers, and does not accept a plain linear layout.
+Capture must therefore choose its buffer layout from the intersection of what the
+compositor offers and what the encoder will import, rather than from the
+compositor's list alone. Negotiating the two independently produces an import
+failure at run time on any machine whose lists differ.
+
+Restating the input size on a filter that does not change it is not free: it
+defeats the scaler's pass-through and doubles its cost, from 9.2 to 18.6
+milliseconds at full resolution. The filter is set only when the encode size
+genuinely differs from the capture size.
 
 ## Input injection
 
