@@ -1,0 +1,22 @@
+[package]
+name = "tachyx-input"
+description = "Pointer and keyboard injection into a wlroots compositor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tachyx-proto = { path = "../tachyx-proto" }
+keycode = "1.0"
+rustix = { version = "1.1", features = ["fs", "pipe"] }
+thiserror = "2.0"
+tracing = "0.1"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[lints]
+workspace = true
