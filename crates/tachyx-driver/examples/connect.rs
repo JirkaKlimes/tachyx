@@ -39,8 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|value| value.parse().ok())
         .unwrap_or(6);
 
-    let state = std::env::temp_dir().join("tachyx-connect-probe");
-    std::fs::create_dir_all(&state)?;
+    let pins = std::env::temp_dir().join("tachyx-connect-probe");
+    std::fs::create_dir_all(&pins)?;
 
     let capabilities = Capabilities {
         viewport: Size::new(2400, 1080).expect("a viewport"),
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let started = Instant::now();
-    let link = Link::connect(&address, &state, capabilities)?;
+    let link = Link::connect(&address, &pins, capabilities)?;
     println!("connected to {address} in {:?}", started.elapsed());
 
     let counter = Arc::new(Counter::default());
@@ -60,19 +60,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_secs(seconds));
 
     let stats = link.stats();
-    let frames = counter.frames.load(Ordering::Relaxed);
-    let bytes = counter.bytes.load(Ordering::Relaxed);
+    let decoded = counter.frames.load(Ordering::Relaxed);
+    let received = counter.bytes.load(Ordering::Relaxed);
     let elapsed = counter
         .first
         .lock()
         .expect("counter mutex")
         .map_or(Duration::ZERO, |first| first.elapsed());
 
+    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
     println!(
-        "decoded {frames} frames, {bytes} bytes in {elapsed:?} => {:.1} fps, {:.2} Mbit/s",
-        frames as f64 / elapsed.as_secs_f64().max(f64::EPSILON),
-        (bytes as f64 * 8.0) / elapsed.as_secs_f64().max(f64::EPSILON) / 1e6
+        "decoded {decoded} frames, {received} bytes in {elapsed:?} => {:.1} fps, {:.2} Mbit/s",
+        rate(decoded, seconds),
+        rate(received * 8, seconds) / 1e6
     );
     println!("{stats:#?}");
     Ok(())
+}
+
+/// A per-second rate, at the precision a report needs rather than the precision
+/// the counter holds.
+fn rate(total: u64, seconds: f64) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a frame or byte count in one probe is far below the exact integer range of a double"
+    )]
+    let total = total as f64;
+    total / seconds
 }
