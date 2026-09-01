@@ -1,0 +1,117 @@
+/// Where a decoded picture is presented, which is not one mechanism.
+library;
+
+import 'dart:io' show Platform;
+
+import 'package:flutter/services.dart';
+import 'package:irondash_engine_context/irondash_engine_context.dart';
+
+import 'package:tachyx/src/rust/api/session.dart';
+import 'package:tachyx/src/ui/video_texture_view.dart';
+
+/// Where the Android half answers.
+const MethodChannel _video = MethodChannel('tachyx/video');
+
+/// What a decoded picture is drawn through.
+///
+/// Linux registers a texture with the engine and the decode pipeline draws into
+/// it; Android opens a surface producer and the platform decoder writes into
+/// that. The difference reaches as far as the widget, because only one of the
+/// two applies the crop rectangle the bitstream carries, so it is written down
+/// here rather than tested for at each use.
+sealed class Presentation {
+  const Presentation(this.textureId);
+
+  /// Opens what this platform presents through and points [session] at it.
+  ///
+  /// [width] and [height] are the client's own surface in physical pixels,
+  /// which is the best guess at the size the decoder will write before the host
+  /// has said. [resize] corrects it as soon as the host has.
+  static Future<Presentation> open(
+    Session session, {
+    required int width,
+    required int height,
+  }) => Platform.isAndroid
+      ? _Produced.open(session, width: width, height: height)
+      : _Registered.open(session);
+
+  /// What a `Texture` widget draws.
+  final int textureId;
+
+  /// How much of that texture is the picture.
+  VideoCrop crop(Encoding? encoding);
+
+  /// Tells the platform what size the decoder is writing.
+  Future<void> resize(Encoding encoding);
+
+  /// Gives it back.
+  Future<void> close();
+}
+
+/// A texture the engine registered, which the decode pipeline draws into.
+///
+/// The pipeline hands over frames the decoder has already cropped, so the whole
+/// texture is the picture.
+final class _Registered extends Presentation {
+  const _Registered(super.textureId);
+
+  static Future<Presentation> open(Session session) async {
+    final int handle = await EngineContext.instance.getEngineHandle();
+    return _Registered(session.presentOn(engineHandle: handle));
+  }
+
+  @override
+  VideoCrop crop(Encoding? encoding) => VideoCrop.whole;
+
+  @override
+  Future<void> resize(Encoding encoding) async {}
+
+  @override
+  Future<void> close() async {}
+}
+
+/// A surface producer the platform decoder writes into.
+///
+/// The producer draws the decoder's buffer as it stands and applies no crop, so
+/// the rows and columns the macroblock grid added have to be taken off here.
+final class _Produced extends Presentation {
+  const _Produced(super.textureId);
+
+  static Future<Presentation> open(
+    Session session, {
+    required int width,
+    required int height,
+  }) async {
+    final int id =
+        await _video.invokeMethod<int>('open', <String, int>{
+          'width': width,
+          'height': height,
+        }) ??
+        -1;
+    try {
+      session.presentOn(engineHandle: id);
+    } on Object {
+      await _video.invokeMethod<void>('close', <String, int>{'id': id});
+      rethrow;
+    }
+    return _Produced(id);
+  }
+
+  @override
+  VideoCrop crop(Encoding? encoding) =>
+      encoding == null ? VideoCrop.whole : VideoCrop.of(encoding);
+
+  @override
+  Future<void> resize(Encoding encoding) => _video.invokeMethod<void>(
+    'resize',
+    <String, int>{
+      'id': textureId,
+      'width': encoding.codedWidth,
+      'height': encoding.codedHeight,
+    },
+  );
+
+  @override
+  Future<void> close() =>
+      _video.invokeMethod<void>('close', <String, int>{'id': textureId});
+}

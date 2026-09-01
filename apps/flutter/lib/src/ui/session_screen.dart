@@ -7,12 +7,12 @@ import 'dart:ui' show FlutterView;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:irondash_engine_context/irondash_engine_context.dart';
 
 import 'package:tachyx/src/input/keyboard.dart';
 import 'package:tachyx/src/input/touchpad.dart';
 import 'package:tachyx/src/rust/api/session.dart';
 import 'package:tachyx/src/session/pipe.dart';
+import 'package:tachyx/src/session/present.dart';
 import 'package:tachyx/src/session/viewport.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 import 'package:tachyx/src/ui/theme.dart';
@@ -68,7 +68,9 @@ class _SessionScreenState extends State<SessionScreen>
   Timer? _sampler;
   bool _showStats = true;
   SessionStats? _stats;
-  int? _textureId;
+  Presentation? _presentation;
+  bool _presenting = false;
+  Encoding? _sized;
   String? _videoFault;
 
   @override
@@ -77,7 +79,6 @@ class _SessionScreenState extends State<SessionScreen>
     final Session? session = widget.session;
     if (session != null) {
       _pipe.attach(session);
-      unawaited(_present(session));
     }
     _soft = SoftKeyboard(_pipe.sendUnstamped);
     _pad = Touchpad(
@@ -94,6 +95,13 @@ class _SessionScreenState extends State<SessionScreen>
   void didChangeDependencies() {
     super.didChangeDependencies();
     _rescale();
+    // Not in `initState`: opening a presentation needs the size of the view,
+    // and the view is only reachable once the widget has its dependencies.
+    final Session? session = widget.session;
+    if (session != null && !_presenting) {
+      _presenting = true;
+      unawaited(_present(session));
+    }
   }
 
   @override
@@ -129,19 +137,28 @@ class _SessionScreenState extends State<SessionScreen>
     _keys.detach();
     _soft.hide();
     _pipe.detach();
+    unawaited(_presentation?.close() ?? Future<void>.value());
     super.dispose();
   }
 
-  /// Points the session's decoder at a texture this screen draws.
+  /// Points the session's decoder at something this screen draws.
   ///
-  /// The engine handle arrives asynchronously and the registration itself has
-  /// to happen on the thread that asked for it, which is why this is not part
-  /// of connecting.
+  /// Neither half of it can be done while connecting: the engine handle arrives
+  /// asynchronously, and the registration has to happen on the thread that
+  /// asked for it.
   Future<void> _present(Session session) async {
     try {
-      final int handle = await EngineContext.instance.getEngineHandle();
-      final int id = session.presentOn(engineHandle: handle);
-      if (mounted) setState(() => _textureId = id);
+      final (int width, int height) = viewportOf(View.of(context));
+      final Presentation opened = await Presentation.open(
+        session,
+        width: width,
+        height: height,
+      );
+      if (!mounted) {
+        unawaited(opened.close());
+        return;
+      }
+      setState(() => _presentation = opened);
     } on Object catch (refused) {
       if (mounted) setState(() => _videoFault = '$refused');
     }
@@ -151,6 +168,24 @@ class _SessionScreenState extends State<SessionScreen>
     if (!mounted) return;
     setState(() => _stats = widget.session?.stats());
     _rescale();
+    _resize();
+  }
+
+  /// Keeps the presentation the size the decoder is writing.
+  ///
+  /// The host says so before the first picture and again whenever it changes
+  /// rung, and the surface the decoder draws into has to be built for the same
+  /// size or the compositor reads a buffer that is not the shape it thinks.
+  void _resize() {
+    final Encoding? encoding = _stats?.encoding;
+    final Presentation? presentation = _presentation;
+    if (encoding == null || presentation == null) return;
+    if (_sized?.codedWidth == encoding.codedWidth &&
+        _sized?.codedHeight == encoding.codedHeight) {
+      return;
+    }
+    _sized = encoding;
+    unawaited(presentation.resize(encoding));
   }
 
   /// Puts pointer deltas into the units the host injects them in.
@@ -180,16 +215,17 @@ class _SessionScreenState extends State<SessionScreen>
 
   /// The picture, or the reason there is none.
   Widget _picture() {
-    final int? id = _textureId;
-    if (id == null) {
+    final Presentation? presentation = _presentation;
+    if (presentation == null) {
       return VideoSurface(reason: _videoFault ?? _noSessionReason());
     }
     final Encoding? encoding = _stats?.encoding;
     return VideoTextureView(
-      textureId: id,
+      textureId: presentation.textureId,
       aspectRatio: encoding == null
           ? _unknownAspect
           : encoding.aspectWidth / encoding.aspectHeight,
+      crop: presentation.crop(encoding),
     );
   }
 

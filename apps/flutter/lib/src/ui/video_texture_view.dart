@@ -6,7 +6,58 @@ import 'dart:typed_data';
 import 'package:flutter/widgets.dart';
 import 'package:irondash_engine_context/irondash_engine_context.dart';
 
+import 'package:tachyx/src/rust/api/session.dart' show Encoding;
 import 'package:tachyx/src/rust/api/video.dart';
+
+/// How much of a decoded texture is the picture.
+///
+/// H.264 codes whole macroblocks, so a picture 1080 rows tall travels as 1088
+/// rows with a crop rectangle that says which eight to throw away, and 2580
+/// columns travel as 2592. Android's surface producer draws the decoder's buffer
+/// as it stands and applies no such rectangle, so the client applies it.
+///
+/// It is applied by scale rather than by layout: the texture is drawn to fill
+/// its box and then enlarged about its top left corner until the part that is
+/// the picture is the part the box shows. That is one matrix on a layer already
+/// being composited, and no second pass over the pixels.
+@immutable
+class VideoCrop {
+  /// A picture whose visible size is [scaleX] and [scaleY] times smaller than
+  /// the buffer it was decoded into.
+  const VideoCrop({required this.scaleX, required this.scaleY});
+
+  /// Every row and column of the texture is picture, which is what a decoder
+  /// that crops for itself hands over.
+  static const VideoCrop whole = VideoCrop(scaleX: 1, scaleY: 1);
+
+  /// What the host says it is coding against what it says is visible.
+  factory VideoCrop.of(Encoding encoding) => VideoCrop(
+    scaleX: _ratio(encoding.codedWidth, encoding.visibleWidth),
+    scaleY: _ratio(encoding.codedHeight, encoding.visibleHeight),
+  );
+
+  static double _ratio(int coded, int visible) =>
+      visible <= 0 || coded <= visible ? 1 : coded / visible;
+
+  /// How far the texture is enlarged across.
+  final double scaleX;
+
+  /// How far it is enlarged down.
+  final double scaleY;
+
+  /// Whether there is anything to take off at all.
+  bool get isWhole => scaleX == 1 && scaleY == 1;
+
+  @override
+  bool operator ==(Object other) =>
+      other is VideoCrop && other.scaleX == scaleX && other.scaleY == scaleY;
+
+  @override
+  int get hashCode => Object.hash(scaleX, scaleY);
+
+  @override
+  String toString() => 'VideoCrop($scaleX, $scaleY)';
+}
 
 /// Owns the native texture and the decode pipeline behind it.
 ///
@@ -49,12 +100,13 @@ class VideoTextureController {
   }
 }
 
-/// Draws the texture a [VideoTextureController] owns.
+/// Draws the texture a [Presentation] owns.
 class VideoTextureView extends StatelessWidget {
-  /// Draws `textureId`, letterboxed to `aspectRatio`.
+  /// Draws `textureId`, letterboxed to `aspectRatio` and cropped by `crop`.
   const VideoTextureView({
     required this.textureId,
     required this.aspectRatio,
+    this.crop = VideoCrop.whole,
     super.key,
   });
 
@@ -64,14 +116,31 @@ class VideoTextureView extends StatelessWidget {
   /// The stream's shape, so the picture is not stretched to the window.
   final double aspectRatio;
 
+  /// How much of the texture is picture.
+  final VideoCrop crop;
+
   @override
   Widget build(BuildContext context) => ColoredBox(
     color: const Color(0xFF000000),
     child: Center(
       child: AspectRatio(
         aspectRatio: aspectRatio,
-        child: Texture(textureId: textureId, filterQuality: FilterQuality.low),
+        child: _cropped(
+          Texture(textureId: textureId, filterQuality: FilterQuality.low),
+        ),
       ),
     ),
   );
+
+  Widget _cropped(Widget texture) => crop.isWhole
+      ? texture
+      : ClipRect(
+          child: Transform.scale(
+            scaleX: crop.scaleX,
+            scaleY: crop.scaleY,
+            alignment: Alignment.topLeft,
+            filterQuality: FilterQuality.low,
+            child: texture,
+          ),
+        );
 }

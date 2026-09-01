@@ -19,7 +19,13 @@ android {
         applicationId = "com.tachyx.tachyx"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // Above Flutter's own floor of 24, and deliberately. Below 29
+        // `createSurfaceProducer` falls back to a surface texture, whose
+        // OpenGL to Vulkan interop costs a copy on the device per frame, and
+        // the decoder reaches the NDK media interface at API 28. A remote
+        // desktop that shows sixty pictures a second cannot pay that copy, so
+        // the version that removes it is the version this client asks for.
+        minSdk = 29
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
