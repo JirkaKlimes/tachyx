@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::VERSION;
 use crate::input::InputEvent;
-use crate::media::{FrameId, Timestamp};
+use crate::media::{FrameId, Seq, Timestamp};
 
 /// A picture size in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +321,85 @@ pub struct Heartbeat {
 /// is the next signal after this one and far too late to be the first.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 
+/// When one video datagram arrived, or that it never did.
+///
+/// Deltas rather than offsets from the report's reference, because `postcard`
+/// varint-encodes and a delta between consecutive datagrams is almost always
+/// one byte where an offset would be two. Signed, because reordering is real:
+/// Wi-Fi retries and multi-queue hardware both produce it, and an unsigned
+/// delta would have to lie about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PacketArrival {
+    /// Not received when the report was built.
+    Missing,
+    /// Received this many [`FEEDBACK_TICK`]s after the previous datagram in
+    /// this report that arrived. The first arrival is measured from
+    /// [`Feedback::reference`], so its delta is zero.
+    Received(i16),
+}
+
+/// The resolution of every time in a [`Feedback`].
+///
+/// 250 microseconds is what transport-wide feedback uses, and it is what makes
+/// a signed sixteen-bit delta span 8.19 seconds, which is thirty times the
+/// longest interval between two reports.
+pub const FEEDBACK_TICK: Duration = Duration::from_micros(250);
+
+/// How often a client reports, while datagrams are arriving.
+pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How often a client reports while the host's announced bitrate is under
+/// [`FEEDBACK_SLOW_BELOW`].
+///
+/// libwebrtc computes the interval as 68 bytes of report against 5% of the
+/// estimate and clamps it to between 50 and 250 ms. On any link above 218
+/// kbit/s that formula returns something under 50 ms and the clamp decides, so
+/// carrying the formula would be carrying arithmetic with one answer. The one
+/// case where it does something is a collapsing link, and this reproduces it.
+pub const FEEDBACK_SLOW_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The announced bitrate under which reports drop to
+/// [`FEEDBACK_SLOW_INTERVAL`].
+pub const FEEDBACK_SLOW_BELOW: u32 = 250_000;
+
+/// The most datagrams one report accounts for.
+///
+/// A report describing more than this is split and the parts sent back to back,
+/// so nothing is lost by the bound. Measured with real encodings, 512 statuses
+/// come to 1041 bytes.
+pub const FEEDBACK_MAX_STATUSES: usize = 512;
+
+/// When each video datagram arrived, and which never did.
+///
+/// **No clock synchronisation is required and none is implied.** Every quantity
+/// the host's estimator takes from this is a difference between two of the
+/// client's own arrival times, so a constant offset between the two clocks
+/// cancels exactly. Rate skew between the two crystals does not cancel, but at
+/// the parts per million a real oscillator drifts it is far below the six
+/// millisecond floor the delay threshold clamps to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feedback {
+    /// The `seq` of the first datagram this report accounts for.
+    pub base: Seq,
+    /// The client's own clock at the arrival of the first datagram in
+    /// `packets` that arrived, in [`FEEDBACK_TICK`]s since the client's session
+    /// began.
+    ///
+    /// A report in which nothing arrived carries the clock at the moment it was
+    /// built, which no estimator reads: with no arrival to measure from there
+    /// is nothing to measure.
+    pub reference: u32,
+    /// One entry per sequence number from `base` upward, in order, no gaps.
+    pub packets: Vec<PacketArrival>,
+    /// Datagrams the client has never seen, since the session began.
+    ///
+    /// Cumulative rather than per interval, so that a delayed report is still
+    /// exactly right about the interval it covers.
+    pub lost: u64,
+    /// Datagrams the client has received, since the session began.
+    pub received: u64,
+}
+
 /// Anything a client sends after its hello.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -334,6 +413,15 @@ pub enum ClientMessage {
         /// The last frame the client decoded, or `None` if it has decoded none.
         after: Option<FrameId>,
     },
+    /// What the path did to the video, which is the only measurement of it the
+    /// host can have.
+    ///
+    /// quinn exposes no per-datagram acknowledgement to the application:
+    /// `Connection::on_ack_received` is private, the public event enum carries
+    /// nothing about one, and a datagram has no application-visible identity
+    /// after it is handed over. So this is not an optimisation of the
+    /// transport's own estimate. It is the whole of the host's information.
+    Feedback(Feedback),
 }
 
 /// Anything the host sends.
@@ -406,6 +494,46 @@ mod tests {
         );
     }
 
+    /// A report of `count` datagrams with every `nth` one lost, encoded as the
+    /// control stream carries it: the message plus its four byte length prefix.
+    fn report_bytes(count: usize, nth: usize) -> usize {
+        let packets = (0..count)
+            .map(|index| {
+                if nth > 0 && index.is_multiple_of(nth) {
+                    PacketArrival::Missing
+                } else {
+                    PacketArrival::Received(3)
+                }
+            })
+            .collect();
+        let message = ClientMessage::Feedback(Feedback {
+            base: Seq(40_000),
+            reference: 900_000,
+            packets,
+            lost: 24,
+            received: 859,
+        });
+        postcard::to_stdvec(&message).unwrap().len() + 4
+    }
+
+    #[test]
+    fn a_report_costs_about_two_bytes_a_datagram() {
+        // The reason the deltas are deltas. At 20 Mbit/s a 50 ms report covers
+        // 88 datagrams, so this decides whether feedback is a fifth of a
+        // percent of the link or two percent of it.
+        for (datagrams, ceiling) in [(18, 56), (88, 200), (512, 1060)] {
+            let bytes = report_bytes(datagrams, 0);
+            assert!(
+                bytes <= ceiling,
+                "a report of {datagrams} datagrams took {bytes} bytes"
+            );
+        }
+        assert!(
+            report_bytes(88, 20) < report_bytes(88, 0),
+            "a missing datagram costs less than one that arrived, not more"
+        );
+    }
+
     #[test]
     fn a_coded_size_the_client_cannot_present_cannot_be_built() {
         assert!(
@@ -453,6 +581,18 @@ mod tests {
                     at: Timestamp::from_session_micros(500),
                     event: InputEvent::PointerMotion { dx: 3.0, dy: -1.5 },
                 }],
+            }),
+            ClientMessage::Feedback(Feedback {
+                base: Seq(65_530),
+                reference: 1_234_567,
+                packets: vec![
+                    PacketArrival::Received(0),
+                    PacketArrival::Received(3),
+                    PacketArrival::Missing,
+                    PacketArrival::Received(-2),
+                ],
+                lost: 24,
+                received: 859,
             }),
         ];
         for message in messages {

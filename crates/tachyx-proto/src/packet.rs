@@ -438,6 +438,31 @@ impl Packetiser {
         self.append_parity(unit, out);
     }
 
+    /// Builds one padding datagram of `payload` bytes and stamps it with the
+    /// next sequence number.
+    ///
+    /// It carries no picture and no repair. What it is for is that a still
+    /// desktop produces no frames at all, which is precisely when a congestion
+    /// controller most needs to know whether the link has recovered, and a
+    /// sequence number the receiver reports the arrival of is the whole of what
+    /// measures that.
+    ///
+    /// It is counted in the sequence like any other datagram, because it costs
+    /// the path the same bytes and its loss is the same evidence about it.
+    pub fn padding(&mut self, payload: usize) -> Vec<u8> {
+        let header = PacketHeader {
+            frame: FrameId(0),
+            seq: self.seq,
+            kind: FrameKind::Delta,
+            role: Role::Padding,
+        };
+        self.seq = self.seq.next();
+        let mut datagram = Vec::with_capacity(HEADER_LEN + payload);
+        datagram.extend_from_slice(&header.to_bytes());
+        datagram.resize(HEADER_LEN + payload.max(1), 0);
+        datagram
+    }
+
     /// Parity shards `unit` will be sent with, given that its picture occupies
     /// `data` datagrams.
     fn parity_shards(&self, unit: &AccessUnit<'_>, data: usize) -> usize {
@@ -817,6 +842,12 @@ impl Reassembler {
         self.stats.packets_received += 1;
 
         let gap_within_frame = self.track_sequence(&header);
+        // Padding takes part in the sequence accounting above and in nothing
+        // else. Every field that would say which frame it belongs to means
+        // nothing on it, so it must not reach reassembly.
+        if matches!(header.role, Role::Padding) {
+            return Ok(());
+        }
         let parity = matches!(header.role, Role::Parity(_));
         if parity {
             self.stats.parity_received += 1;
@@ -837,6 +868,9 @@ impl Reassembler {
             Role::Picture(picture) => {
                 self.take_picture(header.frame, header.kind, picture, payload, now);
             }
+            // Decided above, where the sequence accounting it does take part in
+            // happens.
+            Role::Padding => {}
         }
         if gap_within_frame {
             // The missing packets sit between two packets of this frame, so
@@ -1166,6 +1200,38 @@ mod tests {
         assert_eq!(frames[0].id, FrameId(0));
         assert_eq!(frames[0].kind, FrameKind::Key);
         assert!(!reassembler.needs_keyframe());
+    }
+
+    #[test]
+    fn padding_is_counted_in_the_sequence_and_reaches_nothing_else() {
+        let picture = picture(200, 0x11);
+        let mut packetiser = bare(PAYLOAD);
+        let mut reassembler = Reassembler::new(Duration::from_millis(50));
+        let now = Instant::now();
+
+        let mut first = Vec::new();
+        packetiser.packetise(&unit(0, FrameKind::Key, &[&picture]), &mut first);
+        assert_eq!(deliver(&mut reassembler, &first, now).len(), 1);
+
+        // A probe between two pictures. It must leave no hole in the sequence
+        // and must not be read as a slice of either frame.
+        let padding: Vec<Vec<u8>> = (0..5).map(|_| packetiser.padding(64)).collect();
+        assert!(deliver(&mut reassembler, &padding, now).is_empty());
+
+        let mut second = Vec::new();
+        packetiser.packetise(&unit(1, FrameKind::Delta, &[&picture]), &mut second);
+        assert_eq!(deliver(&mut reassembler, &second, now).len(), 1);
+
+        let stats = reassembler.stats();
+        assert_eq!(stats.packets_lost, 0, "padding fills its own sequence");
+        assert_eq!(stats.packets_late, 0);
+        assert_eq!(stats.frames_dropped, 0);
+        assert_eq!(stats.frames_missing, 0);
+        assert_eq!(
+            stats.packets_received,
+            (first.len() + padding.len() + second.len()) as u64,
+            "padding is a datagram the path carried, so the loss rate counts it"
+        );
     }
 
     #[test]
@@ -1539,6 +1605,7 @@ mod tests {
                     assert_eq!(usize::from(parity.shard.index()), index - 10);
                     assert_eq!(payload.len(), 64, "a shard is one payload wide");
                 }
+                Role::Padding => panic!("packetising a picture produces no padding"),
             }
         }
     }

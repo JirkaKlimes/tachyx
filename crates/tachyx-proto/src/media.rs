@@ -157,7 +157,12 @@ impl SliceId {
 
 /// A datagram sequence number, counted over the whole session rather than per
 /// frame, so a gap is detectable across a frame boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// It is serialised as well as packed by hand, because the receiver report in
+/// [`crate::control::Feedback`] is keyed on it: the report names the first
+/// datagram it accounts for and counts upward from there, so nothing new has to
+/// identify a packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Seq(pub u16);
 
 impl Seq {
@@ -214,17 +219,33 @@ pub struct FrameId(pub u32);
 
 /// What a video datagram carries for its frame.
 ///
-/// The two are told apart by the slice identifier alone: [`SliceId::PARITY`]
-/// means parity, anything else means picture. The parity header reuses the four
-/// bytes a picture packet spends on its capture time, because a repair has no
-/// capture time of its own, and reuses the fragment count and index for its own
-/// count and index, because the invariant is the same one.
+/// Picture and parity are told apart by the slice identifier alone:
+/// [`SliceId::PARITY`] means parity, anything else means picture. The parity
+/// header reuses the four bytes a picture packet spends on its capture time,
+/// because a repair has no capture time of its own, and reuses the fragment
+/// count and index for its own count and index, because the invariant is the
+/// same one.
+///
+/// Padding is told apart from both by one flag bit, read before the slice
+/// identifier, because a padding datagram belongs to no frame and every field
+/// that would say which one is meaningless on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// A fragment of one slice of the picture.
     Picture(PictureHeader),
     /// One parity shard, repairing the frame's picture datagrams.
     Parity(ParityHeader),
+    /// Zeroes, carried so that the path can be timed while the picture is
+    /// supplying nothing.
+    ///
+    /// A still desktop produces no frames at all, and a controller that only
+    /// ever learns from media never learns that the link has recovered. This
+    /// carries no picture and no repair, and the only thing it takes part in is
+    /// the sequence accounting the receiver report is keyed on. It has no
+    /// payload of its own to describe, so the variant carries nothing:
+    /// [`PacketHeader::frame`] and [`PacketHeader::kind`] are whatever the
+    /// sender happened to write and mean nothing here.
+    Padding,
 }
 
 /// What a picture packet says beyond [`PacketHeader`]'s common fields.
@@ -286,6 +307,7 @@ pub struct PacketHeader {
 impl PacketHeader {
     const FLAG_KEY: u8 = 1 << 0;
     const FLAG_LAST_SLICE: u8 = 1 << 1;
+    const FLAG_PADDING: u8 = 1 << 2;
 
     /// The header as it appears on the wire.
     #[must_use]
@@ -312,6 +334,16 @@ impl PacketHeader {
                 head[14] = SliceId::PARITY;
                 parity.shard
             }
+            Role::Padding => {
+                flags |= Self::FLAG_PADDING;
+                // Written so that the fixed layout stays well formed rather
+                // than because a receiver reads them: the padding bit is
+                // checked first and everything here is skipped.
+                Fragment {
+                    count: NonZeroU16::MIN,
+                    index: 0,
+                }
+            }
         };
         head[10..12].copy_from_slice(&fragment.count.get().to_le_bytes());
         head[12..14].copy_from_slice(&fragment.index.to_le_bytes());
@@ -335,19 +367,27 @@ impl PacketHeader {
         if payload.is_empty() {
             return Err(MalformedPacket::NoPayload);
         }
-        let count = NonZeroU16::new(u16::from_le_bytes([head[10], head[11]]))
-            .ok_or(MalformedPacket::EmptySlice)?;
-        let index = u16::from_le_bytes([head[12], head[13]]);
-        let fragment = Fragment::checked(index, count).ok_or(MalformedPacket::IndexOutOfRange)?;
         let flags = head[15];
-        let role = match SliceId::new(head[14]) {
-            Some(slice) => Role::Picture(PictureHeader {
-                capture: Timestamp(u32::from_le_bytes([head[4], head[5], head[6], head[7]])),
-                fragment,
-                slice,
-                last_slice: flags & Self::FLAG_LAST_SLICE != 0,
-            }),
-            None => Role::Parity(parity(head, payload, fragment)?),
+        // Read before the fragment fields rather than after, because on a
+        // padding datagram those fields describe nothing and validating them
+        // would be validating whatever the sender left there.
+        let role = if flags & Self::FLAG_PADDING != 0 {
+            Role::Padding
+        } else {
+            let count = NonZeroU16::new(u16::from_le_bytes([head[10], head[11]]))
+                .ok_or(MalformedPacket::EmptySlice)?;
+            let index = u16::from_le_bytes([head[12], head[13]]);
+            let fragment =
+                Fragment::checked(index, count).ok_or(MalformedPacket::IndexOutOfRange)?;
+            match SliceId::new(head[14]) {
+                Some(slice) => Role::Picture(PictureHeader {
+                    capture: Timestamp(u32::from_le_bytes([head[4], head[5], head[6], head[7]])),
+                    fragment,
+                    slice,
+                    last_slice: flags & Self::FLAG_LAST_SLICE != 0,
+                }),
+                None => Role::Parity(parity(head, payload, fragment)?),
+            }
         };
         Ok((
             Self {
@@ -488,9 +528,32 @@ mod tests {
     }
 
     #[test]
+    fn a_padding_header_survives_a_round_trip_and_describes_no_frame() {
+        let padding = PacketHeader {
+            frame: FrameId(0),
+            seq: Seq(0x1234),
+            kind: FrameKind::Delta,
+            role: Role::Padding,
+        };
+        let mut buf = padding.to_bytes().to_vec();
+        buf.extend_from_slice(&[0u8; 8]);
+        let (parsed, payload) = PacketHeader::parse(&buf).unwrap();
+        assert_eq!(parsed, padding);
+        assert_eq!(payload, [0u8; 8]);
+        assert_eq!(buf[15] & 0b100, 0b100);
+
+        // Nothing in the fields a picture packet uses can turn it back into
+        // one: the padding bit is read first and they are never looked at.
+        let mut noise = buf;
+        noise[10..14].copy_from_slice(&[9, 9, 9, 9]);
+        noise[14] = SliceId::PARITY;
+        assert_eq!(PacketHeader::parse(&noise).unwrap().0.role, Role::Padding);
+    }
+
+    #[test]
     fn unknown_flag_bits_do_not_reject_a_packet() {
         let mut buf = header().to_bytes().to_vec();
-        buf[15] |= 0b1111_1100;
+        buf[15] |= 0b1111_1000;
         buf.push(1);
         let (parsed, _) = PacketHeader::parse(&buf).expect("later versions may set spare bits");
         assert_eq!(parsed.kind, FrameKind::Key);
