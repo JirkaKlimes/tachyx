@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -40,6 +40,16 @@ const MIN_KEYFRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The NAL unit type that carries padding and nothing else.
 const NAL_FILLER: u8 = 12;
+
+/// How long a still screen may bank credit for, as a fraction of a second.
+///
+/// The ceiling on the token bucket is the greater of this much of the target
+/// and the key frame it has just measured, so a desktop that has been still for
+/// a fifth of a second has banked enough to pay for a key frame outright. That
+/// is exactly the case that matters: the user comes back, the screen changes, a
+/// key frame is needed, and it must not be rationed at the moment the session
+/// becomes interactive again.
+const BUCKET_CEILING: Duration = Duration::from_millis(100);
 
 /// How long a lost frame may leave the picture wrong.
 ///
@@ -203,6 +213,67 @@ impl EncodeStats {
     }
 }
 
+/// A token bucket over the bytes the encoder actually produced.
+///
+/// This is the rate limiter, and the encoder's own `bitrate` property is not.
+/// Measured on this hardware, `vah264enc` asked for 1 Mbit/s on content it
+/// cannot compress produced 11.54, and asked for 20 Mbit/s on content it can
+/// produced 0.21: the property spans two orders of magnitude of error in each
+/// direction. **Nothing written into the encoder bounds what goes on the wire.
+/// The only thing that bounds it is refusing to give the encoder pictures.**
+///
+/// It is charged the measured size rather than a modelled one, because the
+/// model is wrong too. Measured, dropping capture frames ahead of the encoder:
+/// halving the frame rate gives 62% of the bytes and quartering it gives 41%,
+/// because the encoder lowers its quantiser when it finds itself under budget
+/// and spends the slack on the frames that do arrive. For the controller that
+/// is good news rather than bad, and it only means the bucket must be charged
+/// what actually happened.
+///
+/// A frame refused here is refused **before** the encoder sees it, so the
+/// reference chain is intact and the client is owed nothing. That is the whole
+/// difference between this and a gate that drops encoded pictures.
+#[derive(Debug)]
+struct Bucket {
+    balance: f64,
+    refilled: Instant,
+}
+
+impl Bucket {
+    const fn new(now: Instant) -> Self {
+        Self {
+            balance: 0.0,
+            refilled: now,
+        }
+    }
+
+    /// Whether the next capture frame may be given to the encoder.
+    ///
+    /// The balance may go negative by at most one frame, and the frames refused
+    /// while it recovers cost nothing but themselves.
+    fn admits(&mut self, target: u32, key_frame_bits: f64, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled).as_secs_f64();
+        self.refilled = now;
+        let target = f64::from(target);
+        self.balance += target * elapsed;
+        self.balance = self
+            .balance
+            .min((target * BUCKET_CEILING.as_secs_f64()).max(key_frame_bits));
+        self.balance >= 0.0
+    }
+
+    /// Charges what the encoder really produced.
+    fn charge(&mut self, bytes: usize) {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a frame size is far below the exact integer range of a double"
+        )]
+        {
+            self.balance -= (bytes as f64) * 8.0;
+        }
+    }
+}
+
 /// A running encode of one capture.
 ///
 /// Dropping this stops the encode thread. The capture that feeds it is stopped
@@ -212,6 +283,7 @@ pub struct Encoder {
     control: Arc<Control>,
     counters: Arc<Counters>,
     admission: Arc<AtomicBool>,
+    budget: Arc<AtomicU32>,
     source: Arc<Slot<crate::Frame>>,
     thread: Option<JoinHandle<Result<(), Error>>>,
 }
@@ -227,6 +299,11 @@ impl Encoder {
         let control = Arc::new(Control::build(frames.format(), config)?);
         let counters = Arc::new(Counters::default());
         let admission = Arc::new(AtomicBool::new(true));
+        // Starts at what the session opened on, so an encoder nobody retargets
+        // spends what it was configured for.
+        let budget = Arc::new(AtomicU32::new(
+            config.rate.bitrate.kbps().saturating_mul(1000),
+        ));
         let (sender, receiver) = sync_channel(2);
         let source = frames.slot();
 
@@ -234,9 +311,10 @@ impl Encoder {
             let control = Arc::clone(&control);
             let counters = Arc::clone(&counters);
             let admission = Arc::clone(&admission);
+            let budget = Arc::clone(&budget);
             std::thread::Builder::new()
                 .name("tachyx-encode".to_owned())
-                .spawn(move || pump(&frames, &control, &counters, &admission, &sender))?
+                .spawn(move || pump(&frames, &control, &counters, &admission, &budget, &sender))?
         };
 
         Ok((
@@ -244,11 +322,27 @@ impl Encoder {
                 control,
                 counters,
                 admission,
+                budget,
                 source,
                 thread: Some(thread),
             },
             AccessUnits(receiver),
         ))
+    }
+
+    /// The bits a second the encoder is allowed to actually produce.
+    ///
+    /// This is the rate limiter. The `bitrate` property [`Encoder::set_rate`]
+    /// writes is the operating point the encoder aims at, and it was measured
+    /// missing by two orders of magnitude in each direction; a token bucket
+    /// charged the measured size of every frame is what bounds the wire. See
+    /// [`Bucket`].
+    ///
+    /// Shared rather than set, because the encode thread owns it for the life
+    /// of the session and the controller that moves it does not.
+    #[must_use]
+    pub fn budget(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.budget)
     }
 
     /// The gate that decides whether the next frame is encoded at all.
@@ -653,18 +747,35 @@ pub(crate) fn import_layouts() -> Result<HashMap<u32, Vec<u64>>, Error> {
     Ok(layouts)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pipeline's parts, threaded into one thread body rather than bundled into a struct that exists only to be unpacked"
+)]
 fn pump(
     frames: &Frames,
     control: &Control,
     counters: &Counters,
     admission: &AtomicBool,
+    budget: &AtomicU32,
     output: &SyncSender<AccessUnit>,
 ) -> Result<(), Error> {
     let allocator = DmaBufAllocator::new();
     let mut next = 0u32;
     let mut scratch = Vec::new();
+    let mut bucket = Bucket::new(Instant::now());
+    let mut key_frame_bits = 0.0f64;
     while let Some(frame) = frames.next() {
-        if !admission.load(Ordering::Relaxed) {
+        // Two separate refusals, counted together and meaning different things.
+        // The bucket is the rate limiter and refuses because the picture would
+        // cost more than the link carries; the gate is a safety interlock
+        // against the transport's own eviction path and should never fire while
+        // the pacer is keeping its queue shallow.
+        let admitted = bucket.admits(
+            budget.load(Ordering::Relaxed),
+            key_frame_bits,
+            Instant::now(),
+        ) && admission.load(Ordering::Relaxed);
+        if !admitted {
             counters.refused.fetch_add(1, Ordering::Relaxed);
             // Dropping the frame is what returns its buffer to the ring, so a
             // refusal costs capture nothing.
@@ -702,6 +813,16 @@ fn pump(
         let Some(unit) = describe(&sample, next, &mut scratch, counters) else {
             continue;
         };
+        bucket.charge(unit.bytes.len());
+        if matches!(unit.kind, FrameKind::Key) {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a frame size is far below the exact integer range of a double"
+            )]
+            {
+                key_frame_bits = (unit.bytes.len() as f64) * 8.0;
+            }
+        }
         counters.record(elapsed);
         next = next.wrapping_add(1);
         if output.send(unit).is_err() {
@@ -861,6 +982,91 @@ impl Samples {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The measured frame sizes on this machine, at 1080p and 8 Mbit/s.
+    const KEY_FRAME: usize = 130_427;
+    const DELTA_FRAME: usize = 16_673;
+    const TARGET: u32 = 8_000_000;
+    const FRAME: Duration = Duration::from_micros(16_667);
+
+    /// Offers `frames` pictures of `bytes` each, one frame interval apart, and
+    /// reports how many the bucket admitted.
+    fn offer(bucket: &mut Bucket, target: u32, bytes: usize, frames: u32) -> u32 {
+        let start = Instant::now();
+        let mut admitted = 0;
+        for slot in 0..frames {
+            let now = start + FRAME * slot;
+            if bucket.admits(target, 0.0, now) {
+                admitted += 1;
+                bucket.charge(bytes);
+            }
+        }
+        admitted
+    }
+
+    #[test]
+    fn a_producer_inside_the_target_is_never_refused() {
+        let mut bucket = Bucket::new(Instant::now());
+        // The measured delta frame at sixty frames a second is 8.00 Mbit/s, so
+        // this is a producer just inside a nine megabit budget.
+        assert_eq!(offer(&mut bucket, 9_000_000, DELTA_FRAME, 600), 600);
+    }
+
+    #[test]
+    fn a_producer_over_the_target_is_held_to_it() {
+        let mut bucket = Bucket::new(Instant::now());
+        // The measurement that made this the rate limiter rather than the
+        // encoder's own property: content it cannot compress produced 13.68
+        // Mbit/s against 8 configured.
+        let admitted = offer(&mut bucket, TARGET, DELTA_FRAME * 2, 600);
+        assert!(
+            (280..=320).contains(&admitted),
+            "twice the target must be halved, and {admitted} of 600 got through"
+        );
+    }
+
+    #[test]
+    fn a_still_screen_banks_enough_to_pay_for_a_key_frame_outright() {
+        let start = Instant::now();
+        let mut bucket = Bucket::new(start);
+        // Nothing produced for a second: the user is reading. The ceiling is a
+        // key frame, not a hundred milliseconds of the target, so the picture
+        // that comes back is not rationed at the moment the session becomes
+        // interactive again.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a frame size is far below the exact integer range of a double"
+        )]
+        let key_frame_bits = (KEY_FRAME as f64) * 8.0;
+        assert!(bucket.admits(TARGET, key_frame_bits, start + Duration::from_secs(1)));
+        bucket.charge(KEY_FRAME);
+        assert!(
+            bucket.admits(TARGET, key_frame_bits, start + Duration::from_secs(1)),
+            "a banked key frame must not leave the bucket in debt"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_repaid_rather_than_forgiven() {
+        let start = Instant::now();
+        let mut bucket = Bucket::new(start);
+        // One picture far past the budget. The bucket goes negative and the
+        // frames refused while it recovers are refused before the encoder ever
+        // sees them, so the reference chain is intact throughout.
+        assert!(bucket.admits(TARGET, 0.0, start));
+        bucket.charge(KEY_FRAME);
+        let mut refused = 0;
+        for slot in 1..60u32 {
+            if !bucket.admits(TARGET, 0.0, start + FRAME * slot) {
+                refused += 1;
+            }
+        }
+        assert!(
+            (5..=12).contains(&refused),
+            "a 130 kB picture is 130 ms of an eight megabit link, and this \
+             refused {refused} frames of the next second"
+        );
+    }
 
     fn nal(kind: u8, len: usize) -> Vec<u8> {
         let mut unit = vec![0, 0, 0, 1, kind & 0x1f];
