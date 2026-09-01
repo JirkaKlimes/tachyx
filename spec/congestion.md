@@ -798,3 +798,47 @@ ceiling, the 0.8 and 1.3 retarget band, the 10% and 60% ladder thresholds, and
 the choice of 15 frames a second as the floor. Each is derived from something
 measured, and each is the kind of number that only a session on a real link can
 settle.
+
+## What the build does differently, and why
+
+Three places where the code departs from what is above. Each is here rather
+than only in a comment, because a reader who finds the two disagreeing should
+be able to tell a decision from a mistake.
+
+**The steady-state probe is not gated on being application-limited.** The rule
+above probes at twice the estimate "whenever the sender has been
+application-limited for 5 seconds", on the grounds that a remote desktop is
+application-limited almost all the time. The build drops the gate and probes
+whenever nothing has tested the link for five seconds. The case the gate
+excludes is the one where recovery matters most: the link recovers, the user is
+doing something, the encoder is producing exactly its target, and the
+controller sits at the depressed rate for as long as they keep working. The
+cost of removing it is fixed as a share of the link and does not depend on the
+link, which is the same argument the section already makes: 15 ms at twice the
+rate every 5 seconds is 0.6%, at 300 kbit/s or at 20 Mbit/s.
+
+This is also where `GoogCcNetworkController` cannot be held to ours.
+`NetworkControllerInterface` exposes no way to tell it the sender is
+application-limited, because that signal comes from libwebrtc's own pacer,
+which is not on the other side of that interface. Driven from a feedback trace
+alone, the reference finds the link and gives it up exactly as ours does, and
+never takes it back. The conformance test asserts the agreement and names the
+divergence.
+
+**`datagram_send_buffer_size` is unchanged.** The section above argues it can
+shrink to 64 KiB once a pacer keeps quinn's queue shallow. It cannot, because
+the gate in front of it asks whether a whole frame fits before the frame is
+encoded, and a buffer smaller than a key frame refuses every key frame for ever
+— which is the failure `findings.md` records under "two frames". With the pacer
+in front, the buffer sits nearly empty whatever its size, so the size costs
+nothing and its only effect is as a limit. Shrinking it would need the gate to
+ask per datagram, which would mean a frame could be half queued and then
+refused, and a half-sent frame is the thing the gate exists to prevent.
+
+**A probe cluster is one contiguous burst.** Media first and padding second, as
+above, but the padding that fills out a cluster goes in the *same* burst as the
+picture that started it rather than behind the next one. Measured on a shaped
+12 Mbit/s link, a cluster that straddled a frame boundary spanned the idle
+interval between the two frames, read 5.2 Mbit/s, and dragged the estimate down
+every time it fired. With the cluster contiguous the same link reads 8.3 to
+10.9 Mbit/s.
