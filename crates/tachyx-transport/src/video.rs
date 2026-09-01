@@ -499,14 +499,22 @@ impl VideoSender {
         let sent = self.release(&mut queue, datagrams);
         queue.clear();
         self.datagrams = queue;
+        // Counted here rather than in the release loop, because padding goes
+        // through the same loop and is not a picture.
+        if matches!(sent, Ok(Sent::Queued { .. })) {
+            self.frames_sent += 1;
+        }
+        // The picture was the head of a cluster and did not fill it, so the
+        // tail follows in the same burst rather than behind the next frame.
+        self.finish_cluster(payload)?;
         sent
     }
 
     /// Puts a packetised picture on the wire at the pacing rate.
     ///
-    /// `datagrams` is what the picture is reported as having taken, which is
-    /// not the length of `queue`: the queue also carries whatever parity the
-    /// packetiser added.
+    /// `datagrams` is what the caller reports the picture as having taken,
+    /// which is not the length of `queue`: the queue also carries whatever
+    /// parity the packetiser added.
     fn release(&mut self, queue: &mut Vec<Vec<u8>>, datagrams: usize) -> Result<Sent, VideoError> {
         for datagram in queue.drain(..) {
             let queued = datagram.len();
@@ -541,7 +549,6 @@ impl VideoSender {
                 Err(other) => return Err(other.into()),
             }
         }
-        self.frames_sent += 1;
         Ok(Sent::Queued { datagrams })
     }
 
@@ -592,43 +599,65 @@ impl VideoSender {
         }
     }
 
-    /// Finishes an armed cluster with padding, when no picture came along to be
-    /// it.
+    /// Finishes an armed cluster with padding.
     ///
-    /// This is the case that matters rather than an afterthought: a desktop
-    /// nobody is touching produces no frames for seconds at a time, and a
+    /// A cluster has to leave back to back or it measures nothing: a cluster
+    /// that straddles two frames spans the idle interval between them, and both
+    /// its send spacing and its arrival spacing are then a measurement of the
+    /// encoder rather than of the path. Measured on a shaped 12 Mbit/s link, a
+    /// cluster spanning a frame boundary read 5.2 Mbit/s and dragged the
+    /// estimate down with it.
+    ///
+    /// So a picture is the head of its cluster and padding is the tail, and the
+    /// two go out in one burst. Padding is also the whole of a cluster when no
+    /// picture came along to be one, which on a desktop nobody is touching is
+    /// the ordinary case: a still screen produces no frames at all, and a
     /// controller that only ever learns from media never learns that the link
-    /// has recovered. A padding datagram carries the ordinary header with the
-    /// padding bit set and a payload of zeroes, and the only thing it takes
-    /// part in is the sequence accounting the receiver report is keyed on.
+    /// has recovered.
     ///
     /// # Errors
     /// If the connection has ended, or the peer will not take datagrams.
-    pub fn pad(&mut self) -> Result<usize, VideoError> {
-        let payload = self.payload_len().ok_or(VideoError::NoDatagrams)?;
-        self.take_probe(payload);
-        self.forget_sent();
+    fn finish_cluster(&mut self, payload: NonZeroUsize) -> Result<usize, VideoError> {
         let Some(probe) = self.armed else {
             return Ok(0);
         };
+        self.forget_sent();
         if !self.can_send_frame(probe.left, payload.get()) {
             self.armed = None;
             return Ok(0);
         }
-        self.pacer.set_rate(probe.rate);
         let mut queue = std::mem::take(&mut self.datagrams);
         queue.clear();
         for _ in 0..probe.left {
             queue.push(self.packetiser.padding(payload.get()));
         }
-        let sent = queue.len();
-        let released = self.release(&mut queue, sent);
-        // Padding is not a picture, so it must not be counted as one.
-        self.frames_sent -= 1;
-        self.padding_sent += sent as u64;
+        let offered = queue.len();
+        let released = self.release(&mut queue, offered);
         queue.clear();
         self.datagrams = queue;
-        released.map(|_| sent)
+        match released? {
+            Sent::Queued { datagrams } => {
+                self.padding_sent += datagrams as u64;
+                Ok(datagrams)
+            }
+            Sent::Refused => Ok(0),
+        }
+    }
+
+    /// Releases a cluster of padding, when no picture came along to be one.
+    ///
+    /// Called on the send path's idle tick. See [`VideoSender::finish_cluster`].
+    ///
+    /// # Errors
+    /// If the connection has ended, or the peer will not take datagrams.
+    pub fn pad(&mut self) -> Result<usize, VideoError> {
+        let payload = self.payload_len().ok_or(VideoError::NoDatagrams)?;
+        self.packetiser.set_payload_len(payload);
+        self.take_probe(payload);
+        if let Some(probe) = self.armed {
+            self.pacer.set_rate(probe.rate);
+        }
+        self.finish_cluster(payload)
     }
 
     /// Sleeps out a datagram's turn, in slices short enough that a connection

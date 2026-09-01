@@ -21,6 +21,10 @@ tracing.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 serde.workspace = true
+# The shaped-path test drives the shipped controller against a userspace relay,
+# so the test binary needs both the estimator and a UDP socket of its own.
+tachyx-congestion.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
 
 [lints]
 workspace = true

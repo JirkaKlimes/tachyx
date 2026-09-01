@@ -2281,6 +2281,7 @@ dependencies = [
  "quinn",
  "serde",
  "tachyx-client",
+ "tachyx-congestion",
  "tachyx-proto",
  "tachyx-transport",
  "thiserror 2.0.20",

@@ -21,6 +21,7 @@ use tachyx_transport::endpoint::HostSession;
 use tachyx_transport::video::VideoControl;
 
 use crate::config::Config;
+use crate::cursor::{self, CursorFeed};
 use crate::idr::{Budget, Reason, Verdict};
 use crate::ladder::{Ladder, Produced, Settings, Size as RungSize};
 
@@ -470,6 +471,8 @@ async fn run(
     // liveness from a beat that did not arrive, so it has to expect the same
     // one the host keeps.
     let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut cursor = CursorFeed::new(capture_size);
+    let mut cursor_tick = tokio::time::interval(cursor::INTERVAL);
     let mut key_frame_tick = tokio::time::interval(KEY_FRAME_MAX_AGE / 4);
 
     let outcome = loop {
@@ -497,6 +500,17 @@ async fn run(
                 live.tick(&connection, &mut to_client, Instant::now()).await?;
             }
             _ = key_frame_tick.tick() => live.repair_if_stale(Instant::now()),
+            _ = cursor_tick.tick() => {
+                // The frame carries no pointer: capture is asked not to paint
+                // one, so that the client can draw it where its own finger says
+                // it is rather than a round trip behind.
+                if let Some(feed) = cursor.as_mut()
+                    && let Some(update) = feed.poll(&capture.cursor())
+                    && to_client.send(&HostMessage::Cursor(update)).await.is_err()
+                {
+                    break Ok(());
+                }
+            }
             _ = heartbeat_tick.tick() => {
                 live.watch(Instant::now());
                 let beat = live.beat(&capture, &connection);
