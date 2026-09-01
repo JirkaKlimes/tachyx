@@ -35,6 +35,25 @@ subprojects {
     }
 }
 
+// Do not build irondash_engine_context's Rust half for Android.
+//
+// The published 0.5.5 builds it through cargokit, whose Gradle script calls
+// `Project.exec`, removed in Gradle 9. The task therefore cannot run here at
+// all. It also has nothing to do: that crate exists to hand a Rust GStreamer
+// pipeline the engine's texture registry, which is the Linux present path.
+// Android presents through a surface producer and never reaches it, so the
+// library it would build is dead weight in the package.
+//
+// Remove this when the plugin moves to a release that builds through native
+// assets, as the unpublished 0.6.0 already does.
+subprojects {
+    if (name == "irondash_engine_context") {
+        tasks.matching { it.name.startsWith("cargokitCargoBuild") }.configureEach {
+            enabled = false
+        }
+    }
+}
+
 subprojects {
     project.evaluationDependsOn(":app")
 }
