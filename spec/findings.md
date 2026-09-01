@@ -1147,8 +1147,17 @@ layer retry does. Twenty seconds, 1200 slots:
 | **15 ms** | **94.6%** | 5 | 4 | 4 |
 | 25 ms | 94.9% | 4 | 4 | 4 |
 
-Nothing was lost on this link. Every one of those 384 dropped frames was thrown
-away while the datagram that would have completed it was in the air. That is the
+The receiver used for that sweep is the shipped `Reassembler` with its two
+constants lifted into parameters, and it was checked against the shipped one
+rather than assumed equal to it: over 3913 datagrams carrying 300 frames, with
+2% of datagrams dropped and 5% held back by up to 10 ms, the two agreed on every
+frame completion and on every one of the seven counters. That run is worth
+quoting on its own, because it is the shipped receiver on a link far gentler than
+the measured one: **0 frames of 300 delivered**, 164 dropped and 136 undecodable.
+
+Nothing was lost on the jitter-only link above. Every one of those 384 dropped
+frames was thrown away while the datagram that would have completed it was in the
+air. That is the
 40 late packets against 24 lost in the original measurement, and it is why the
 late count is larger than the loss count.
 
