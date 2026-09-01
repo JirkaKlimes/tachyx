@@ -1,4 +1,11 @@
 [toolchain]
 channel = "stable"
+# The default profile adds rust-docs, which is 706 MiB of closure nobody reads
+# from a terminal.
+profile = "minimal"
 components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
-targets = ["aarch64-linux-android", "x86_64-linux-android"]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-linux-android",
+  "x86_64-linux-android",
+]
