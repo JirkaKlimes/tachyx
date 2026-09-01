@@ -747,10 +747,6 @@ pub(crate) fn import_layouts() -> Result<HashMap<u32, Vec<u64>>, Error> {
     Ok(layouts)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the pipeline's parts, threaded into one thread body rather than bundled into a struct that exists only to be unpacked"
-)]
 fn pump(
     frames: &Frames,
     control: &Control,
