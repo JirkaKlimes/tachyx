@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -44,8 +44,9 @@ const NAL_FILLER: u8 = 12;
 /// What to encode, and at what rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeConfig {
-    /// Picture size to send. Anything other than the capture's own size makes
-    /// the scaler do work, so the ladder starts at the capture size.
+    /// Picture size to send. A lower rung costs the scaler work and saves the
+    /// encoder more: measured on a 3440x1440 capture, the whole chain takes
+    /// 7.56 ms at the capture's own size and 4.94 ms scaled to 2580x1080.
     pub size: EncodeSize,
     /// Bits per second and the frame rate they are divided by.
     pub rate: Rate,
@@ -421,24 +422,30 @@ impl Control {
         *self.settings.lock().expect("settings mutex")
     }
 
-    /// Restates the geometry only when it genuinely changes.
+    /// States the geometry the scaler must produce, and that it must stay on
+    /// the GPU.
     ///
-    /// A filter that repeats the input size is not free: it defeats the
-    /// scaler's pass-through and doubles its cost, from 9.2 to 18.6
-    /// milliseconds at full resolution.
+    /// The memory feature is load-bearing. Caps with no feature field mean
+    /// system memory, and the scaler and the encoder both honour that: the
+    /// negotiated caps become a bare `video/x-raw` and every picture makes a
+    /// round trip through main memory. It costs nothing measurable on this
+    /// integrated part, where the two memories are the same memory, but it
+    /// would on anything with its own.
+    ///
+    /// Restating a geometry the scaler is not changing costs nothing either.
+    /// Measured over three passes at 3440x1440, all at the refresh rate: 7.64,
+    /// 7.62 and 7.57 ms with the geometry stated against 7.64, 7.64 and 7.64 ms
+    /// with the filter left open. An earlier note in the findings claimed that
+    /// restating it defeated a pass-through and doubled the cost. It does not.
     fn apply_size(&self, size: EncodeSize) {
-        let caps = if size.visible() == self.capture {
-            gst::Caps::new_any()
-        } else {
-            gst::Caps::builder("video/x-raw")
-                .features(["memory:VAMemory"])
-                .field("width", i32::try_from(size.visible().width()).unwrap_or(0))
-                .field(
-                    "height",
-                    i32::try_from(size.visible().height()).unwrap_or(0),
-                )
-                .build()
-        };
+        let caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:VAMemory"])
+            .field("width", i32::try_from(size.visible().width()).unwrap_or(0))
+            .field(
+                "height",
+                i32::try_from(size.visible().height()).unwrap_or(0),
+            )
+            .build();
         self.filter.set_property("caps", caps);
     }
 
