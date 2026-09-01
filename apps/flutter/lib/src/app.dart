@@ -2,6 +2,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'dart:ui' show FlutterView;
 
@@ -31,6 +32,24 @@ class _TachyxAppState extends State<TachyxApp> {
   void initState() {
     super.initState();
     unawaited(_link.restore());
+    // Naming a host in the environment dials it as soon as there is a view to
+    // measure. Without this a session can only begin by hand, which makes an
+    // end-to-end run something nobody can repeat.
+    final String preset = Platform.environment['TACHYX_HOST'] ?? '';
+    if (preset.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _dialAddress(preset));
+    }
+  }
+
+  /// Dials `host:port`, or the default port when the address names none.
+  void _dialAddress(String address) {
+    final int colon = address.lastIndexOf(':');
+    if (colon < 0) {
+      _dial(address, HostLink.defaultPort);
+      return;
+    }
+    final int? port = int.tryParse(address.substring(colon + 1));
+    _dial(address.substring(0, colon), port ?? HostLink.defaultPort);
   }
 
   @override
