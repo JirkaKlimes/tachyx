@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use tachyx_hostd::config::Config;
 use tachyx_hostd::session;
 use tachyx_proto::control::CodedSize;
+use tachyx_transport::TransportError;
 use tachyx_transport::endpoint::{Host, Tuning};
 use tachyx_transport::identity::HostIdentity;
 
@@ -66,7 +67,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         loop {
-            let session = host.accept().await?;
+            // A connection that fails to establish is that client's problem, not
+            // the daemon's. Only losing the socket itself ends the loop.
+            let session = match host.accept().await {
+                Ok(session) => session,
+                Err(TransportError::Closed) => return Err(TransportError::Closed.into()),
+                Err(error) => {
+                    tracing::warn!(%error, "a client failed to connect");
+                    continue;
+                }
+            };
             let peer = session.connection.remote_address();
             tracing::info!(%peer, "client connected");
             match session::serve(&config, session, &mut injector).await {

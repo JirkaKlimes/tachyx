@@ -91,6 +91,7 @@ pub struct Ladder {
     rung: usize,
     fps: u16,
     bitrate: u32,
+    ceiling: u32,
     pressure: Pressure,
     last_resolution_change: Option<Instant>,
 }
@@ -148,6 +149,7 @@ impl Ladder {
             rung,
             fps,
             bitrate,
+            ceiling: bitrate,
             pressure: Pressure::Settled,
             last_resolution_change: None,
         }
@@ -171,7 +173,12 @@ impl Ladder {
     /// the dwell has elapsed.
     pub fn observe(&mut self, available_bits: u32, now: Instant) -> Option<Settings> {
         let before = self.settings();
-        self.bitrate = available_bits;
+        // Clamped, not followed. The transport reports what the path could carry,
+        // which on a fast local network is far more than anyone asked for: a
+        // Wi-Fi 6 link reported 216 Mbit/s, and encoding at that produces key
+        // frames too large for a client to reassemble before its deadline. The
+        // ceiling is what the user asked for and the estimate can only lower it.
+        self.bitrate = available_bits.min(self.ceiling);
 
         let ratio = bits_per_pixel_per_frame(self.bitrate, self.rungs[self.rung], self.fps);
         self.pressure = match (ratio, self.pressure) {
@@ -285,6 +292,27 @@ mod tests {
                 "{rung:?} would make the scaler stretch the picture"
             );
         }
+    }
+
+    #[test]
+    fn the_estimate_can_lower_the_bitrate_but_never_raise_it_past_the_ceiling() {
+        let mut ladder = ladder();
+        let ceiling = ladder.settings().bitrate;
+        let now = Instant::now();
+
+        ladder.observe(u32::MAX, now);
+        assert_eq!(
+            ladder.settings().bitrate,
+            ceiling,
+            "a fast link must not raise the encoder above what was asked for"
+        );
+
+        ladder.observe(ceiling / 4, now);
+        assert_eq!(
+            ladder.settings().bitrate,
+            ceiling / 4,
+            "a slow link must still lower it"
+        );
     }
 
     #[test]
