@@ -655,7 +655,23 @@ fn top_rung(
 
 /// The tallest picture this client can put to use.
 fn viewport(capabilities: tachyx_proto::control::Capabilities, capture: tachyx_media::Size) -> u32 {
-    u32::from(capabilities.viewport.height.get())
+    // The height the picture will actually occupy, not the height of the client's
+    // window. A wide desktop shown on a phone is letterboxed: the width runs out
+    // first, so the drawn height is the client's width scaled by the capture's
+    // own shape, and the bars above and below it are not picture.
+    //
+    // Taking the window height instead is how a 3440x1440 desktop was sent whole
+    // to a phone that draws it 979 pixels tall. Those pixels are not free: they
+    // are four times the encoding, four times the wire, and the loss that follows
+    // from asking a link for four times what it carries breaks the encoder's
+    // reference chain, which is what turns a busy link into a frozen picture.
+    let box_width = u32::from(capabilities.viewport.width.get());
+    let box_height = u32::from(capabilities.viewport.height.get());
+    let drawn =
+        u64::from(box_width) * u64::from(capture.height()) / u64::from(capture.width().max(1));
+    u32::try_from(drawn)
+        .unwrap_or(box_height)
+        .min(box_height)
         .min(u32::from(capabilities.max_decode.height.get()))
         .min(capture.height())
 }
