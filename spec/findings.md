@@ -758,3 +758,475 @@ focus instead of reaching the remote desktop.
 Text from the on-screen keyboard is taken as edit deltas rather than by watching a
 hidden text field change, so composition in a language that needs it arrives as
 one committed string rather than as a stream of half-formed guesses.
+
+## Pacing and loss on a real wireless link
+
+Everything above about the transport was measured on loopback, where the round
+trip is under a millisecond and nothing is ever dropped by a queue we do not
+own. A Galaxy S25 over Wi-Fi 6 is a different link, and the difference is not a
+matter of degree. In sixteen seconds of streaming to it: 859 packets in, 24
+lost, 40 late; 63 frames in, 8 missing, 12 undecodable; round trip 13.91 ms; the
+host gated 179 frames while sending 64.
+
+This section is why. The probe is a real quinn host and a real quinn client with
+the shipped transport configuration, joined by a userspace relay that gives the
+path a chosen one-way delay, a chosen bottleneck rate with a finite drop-tail
+queue, a chosen loss rate, and a chosen per-packet jitter. Nothing about quinn is
+modelled: its congestion controller, its pacer, its datagram queue and the
+shipped gate are all the real ones reacting to the shaped path. Frame sizes are
+the ones measured on this machine, 130,427 bytes for a 1080p key frame and
+16,673 for a P frame. The client asks for a key frame over the real control
+stream the moment reassembly says it cannot go on, and the host answers under the
+shipped 250 ms budget, because a run without that measures nothing but how long
+the first break lasts.
+
+### The air hop, measured
+
+1200 pings of 1400 bytes at 60 Hz from this laptop to its access point, one air
+hop of the two the phone is behind:
+
+| | |
+|---|---|
+| round trip | min 2.12, median 3.26, ninetieth 6.48, ninety-ninth 141, worst 243 ms |
+| delay above the fastest probe | median 1.14, ninetieth 4.36, ninety-fifth 7.00 ms |
+| probes more than 2 ms above the floor | **22.92%** |
+| probes more than 5 ms above the floor | 8.33% |
+| probes more than 10 ms above the floor | 3.42% |
+| probes more than 50 ms above the floor | 2.25% |
+
+Nothing was lost. The medium does not drop packets here, it delays them, and it
+delays roughly a quarter of them by more than two milliseconds. Hold that figure
+against the receiver's two millisecond reorder window; it comes back below.
+
+The 13.91 ms round trip to the phone is mostly not this. This hop is 3.26 ms at
+the median, so about ten milliseconds of the phone's round trip is the second
+air hop, which is the phone's own radio waking up. **Reasoned, not measured:**
+that is what Wi-Fi power save looks like, and it means the round trip to a phone
+is not a queueing delay we can shorten by sending less.
+
+### quinn paces, and its pacer does nothing for us
+
+Settled by reading `quinn-proto` 0.11.17 and then measured.
+
+The pacer is checked in `Connection::poll_transmit` before every new UDP
+datagram, whatever the frames inside it are, so it applies to application
+datagrams exactly as it applies to stream data. That much is right.
+
+What it applies is `Pacer`, a token bucket whose capacity is
+`window * 2 ms / smoothed_rtt`, clamped to between ten and 256 MTUs, refilling
+at `1.25 * window / smoothed_rtt`. Two things follow. The rate is derived from
+the congestion window, not from BBR's own pacing rate: `calculate_pacing_rate`
+computes one and `Pacer` never reads it. And with BBR's steady-state congestion
+window gain of 2.0, the effective pacing rate is about **2.5 times the
+bandwidth estimate**, with a two millisecond burst allowance on top.
+
+Measured, on a path with no bottleneck and a 13.91 ms round trip: the 92
+datagrams of a 1080p key frame arrive at the client spread over **0.08 ms** at
+the median. A twelve datagram P frame spreads over 0.02 ms. quinn puts 130 kB on
+the wire in eighty microseconds, which is about thirteen gigabits a second.
+
+So the pacer exists, it applies to datagrams, and at these rates it never
+engages. **A pacer of our own is needed, and quinn's is not a substitute.**
+
+### quinn's bandwidth estimate is not a bandwidth estimate
+
+This contradicts a claim made earlier in this document, and it is the most
+important thing in this section. That claim was:
+
+> The congestion controller applies to datagrams. [...] So the bandwidth estimate
+> comes free from the transport, and a delay-based estimator of our own is not
+> needed on a local network.
+
+**The first sentence is right and the second is wrong.** The estimate does not
+come free. On a link with headroom it does not come at all.
+
+`BandwidthEstimation::on_ack` updates its filter only when
+`!app_limited && self.max_filter.get() < bandwidth`, and `Connection::app_limited`
+is set at the end of every `poll_transmit` to `buf.is_empty() && !congestion_blocked`.
+It is therefore a statement about whether the *last* `poll_transmit` had anything
+to send, not about whether the connection was application limited when the packet
+being acknowledged went out. A 60 Hz video sender fills quinn's queue in a
+hundred microseconds and then has nothing for sixteen milliseconds, so by the
+time the acknowledgements come back a round trip later, `app_limited` is true and
+no bandwidth sample is ever taken. The guard `max_filter.get() < bandwidth` also
+means the filter is only ever raised, so once a sample is recorded it never
+decays.
+
+Measured, sampling `Connection::congestion_state().metrics().pacing_rate` every
+50 ms. A 9 Mbit/s stream on a 100 Mbit/s path, then the path drops to 6 Mbit/s at
+ten seconds:
+
+| t | reported pacing rate |
+|---|---|
+| 0 to 4 s, path 100 Mbit/s | **0.00 Mbit/s** |
+| 5 to 10 s, path 100 Mbit/s | 0.76 to 0.95 Mbit/s |
+| 11 to 30 s, path 6 Mbit/s | 7.31 Mbit/s, with excursions to 12.19 |
+
+On a healthy hundred megabit path the transport reports zero, or under one
+megabit. On a six megabit path it reports seven to twelve. The sign of the error
+is the dangerous one: it reads far too low exactly when there is headroom, and
+too high when there is none. In a separate twenty second run at 9.2 Mbit/s on a
+100 Mbit/s path with a deep queue, every one of four hundred samples was
+**0.0 Mbit/s**.
+
+`Ladder::observe` is fed `pacing_rate * 85 / 100` through `connection_target`. A
+target of zero drives the bits-per-pixel ratio to zero, which is below `STARVED`,
+which steps the ladder down every two seconds until it reaches its bottom rung.
+The one thing keeping this from being visible on the real link is that the real
+link congests, which is what makes the estimate exist at all.
+
+This does not change the conclusion that the congestion controller applies to
+datagrams. It changes the conclusion that we can read a rate off it. **An
+estimator of our own is needed, and the reason is not that quinn's is
+imprecise. It is that quinn's is absent whenever the link is fine.**
+
+### Why a burst fails, and it is the buffer and not the rate
+
+A burst does not fail because the link is too slow. It fails because the
+bottleneck's buffer is smaller than the frame.
+
+Measured, 100 Mbit/s path, 13.91 ms round trip, no loss and no jitter
+configured, twenty seconds at 60 Hz, key frame every two seconds, bursting as the
+transport does today. The only variable is how many bytes the bottleneck may hold
+before it drops the tail:
+
+| bottleneck buffer | frames delivered | packets dropped by the queue |
+|---|---|---|
+| 16 kB | 0.1% | 8067 |
+| 32 kB | 12.0% | 5549 |
+| 64 kB | 12.1% | 3628 |
+| 96 kB | 18.8% | 1458 |
+| **128 kB** | **97.4%** | 1 |
+| 192 kB | 97.9% | 0 |
+
+The step is at one key frame. 130,427 bytes of key frame offered in eighty
+microseconds either fits the buffer at the far end or does not, and at a hundred
+megabits that buffer drains 32 kB in 2.6 ms while we fill it in a tenth of a
+millisecond. The link's rate never enters into it.
+
+We do not choose that buffer, we cannot see it, and it is a per-station queue
+inside an access point. **So the transport must not depend on its depth.**
+
+The same thing from the other side, bursting into a 32 kB buffer with the key
+frame capped at various sizes:
+
+| key frame | frames delivered | peak backlog |
+|---|---|---|
+| 130,427 B, as measured | 0% to 68% depending on the seed | 32,739 B, full |
+| 65,000 B | 0% | 32,752 B, full |
+| 40,000 B | 6.2% | 32,734 B, full |
+| **25,000 B** | **100%**, worst latency 13.47 ms | 24,637 B |
+
+The spread on the first row is not noise to be averaged away. Bursting into a
+buffer that cannot hold the frame is bistable: either the stream limps along, or
+one destroyed key frame provokes a request for another one, which is another
+burst into the same full buffer, and the session never recovers. Three seeds of
+the same 32 kB configuration delivered 51.7%, 7.3% and 0.0% of frames.
+
+### Pacing works, and the rate to pace at is the path's
+
+Pacing over a fixed slice of the frame interval, which is the obvious design, is
+the wrong one. Measured on an unbottlenecked path: spreading every frame over
+0.9 of a frame interval delivers 100% of frames and moves the median latency from
+**9.21 ms to 23.64 ms**. A frame is worth nothing until its last datagram, so
+spreading it over fourteen milliseconds costs fourteen milliseconds, on a budget
+of ten to twenty.
+
+Pacing at a byte rate is right, and the rate is roughly the path's own.
+Measured, 50 Mbit/s path, 32 kB buffer, twenty seconds:
+
+| how the frame is offered | delivered | packets lost | median latency | worst |
+|---|---|---|---|---|
+| burst, as today | 1.3% | 5446 | 12.20 ms | 33.77 ms |
+| paced at 10 Mbit/s | 0% | 0 | key frames took 104 ms and timed out |
+| paced at 20 Mbit/s | 0% | 0 | key frames took 52 ms and timed out |
+| **paced at 40 Mbit/s** | **100%** | **0** | **13.44 ms** | 37.92 ms |
+| paced at 80 Mbit/s | 0% | 1713 | overran the buffer again |
+
+And on a 100 Mbit/s path with the same 32 kB buffer, three seeds each:
+
+| | delivered | packets lost | median | ninetieth | ninety-ninth | worst |
+|---|---|---|---|---|---|---|
+| burst | 51.7%, 7.3%, 0.0% | 2897, 5887, 6328 | 10.6 to 11.3 ms | 11.1 to 14.0 | 15.3 to 42.6 | 46 to 70 ms |
+| **paced at 80 Mbit/s** | **100%, 100%, 100%** | **0, 0, 0** | 11.6 to 11.8 ms | 12.4 to 12.7 | 13.4 to 14.3 | 24.6 to 25.0 ms |
+
+Pacing at eighty percent of the path rate costs about **one millisecond of median
+latency** and takes the stream from between zero and half of its frames to all of
+them. It also improves every percentile above the median, because a burst that
+overfills a queue delays everything behind it: the ninety-ninth percentile falls
+from as much as 42.6 ms to 14.3 ms and the worst case from 70 ms to 25 ms.
+
+The window is narrow on both sides, and that is the design problem. Too fast and
+the buffer overruns again. Too slow and a key frame takes longer than the
+receiver will wait for it. At 25 Mbit/s the same sweep put the sweet spot at 20
+to 25 Mbit/s, delivering 98.2% and 99.1%, so the rule "pace at about the path
+rate" holds across a factor of four in path rate. **Measured.**
+
+Pacing at quinn's own reported rate does not work, for the reason in the section
+above: measured, it collapsed the stream to 45.8% of frames on an unbottlenecked
+path, because the estimate falls, which makes the pacer slower, which makes the
+sender more application limited, which lowers the estimate further.
+
+### The key frame is the whole problem
+
+At 8 Mbit/s a 130 kB key frame is 130 ms of the stream's average budget delivered
+in one sixteen millisecond slot. Every failure above is a consequence of that
+one ratio. Pacing moves the queue from the access point to us, where we can see
+it, but it cannot make the bytes smaller: paced at 40 Mbit/s a key frame's
+datagrams still span 26.6 ms at the client, and at 25 Mbit/s they span 43.8 ms.
+
+Three ways out, in the order they should be taken:
+
+1. **Cap the key frame.** Measured above: at 25,000 bytes a key frame is
+   invisible even to a burst into a 32 kB buffer. The encoder has no direct
+   control for this, but the coded picture buffer does have a floor of half the
+   bitrate, and the bitrate itself is a per-frame budget divided by the declared
+   frame rate. This is the cheapest lever and it is not yet pulled.
+2. **Spread it over more than one frame interval.** Measured to work only if the
+   receiver's deadline is raised to match. Measured: on a 25 Mbit/s path, pacing
+   the key frame over 70 ms delivered 97.2% of frames against a 120 ms frame
+   deadline. Against the shipped 50 ms deadline the same shape fails outright: on
+   a 50 Mbit/s path a key frame paced over 52 ms delivered **0%**, because every
+   key frame timed out one or two milliseconds before its last datagram arrived.
+   The frames that fall inside the key frame's span are never encoded, so they
+   cost no frame identifier and no reference chain.
+3. **Intra-refresh**, which removes key frames entirely. Still not exposed by
+   GStreamer on either GPU here. VA-API's `VAEncMiscParameterTypeRIR` is the
+   parameter and `cros-libva` is the road to it. **Not measured. Nothing here
+   changes the earlier judgement that this is a large undertaking**, but every
+   measurement in this section raises what it is worth.
+
+**Reasoned:** the ordering matters because 1 and 2 are settings and 3 is a new
+encoder backend.
+
+### Loss resilience, re-derived for this link
+
+The earlier finding chose recovery on demand over parity, and its reasoning was:
+
+> On a local network the round trip is under a millisecond, so parity on every
+> frame would be paying continuously for something that costs one round trip and
+> one IDR when it happens.
+
+**That reasoning is sound and its premise is gone.** On this link the round trip
+is 13.91 ms and a frame period at 60 Hz is 16.67 ms.
+
+The number that decides everything is the survival probability of one frame.
+Closed form, independent loss at the measured 2.79%:
+
+| | delta, 12 datagrams | key, 92 datagrams |
+|---|---|---|
+| no parity | 0.712 | **0.074** |
+| 20% parity | 0.9994 | 1.0000 |
+
+An unprotected key frame arrives intact **seven times in a hundred**. Everything
+the client sees follows from that: the chain breaks, the client asks for another
+key frame, and that one has a seven percent chance too.
+
+Monte Carlo over a 60 fps stream, twelve runs of sixty seconds each, with the
+chain rule applied (one lost frame makes every later frame undecodable until a
+key frame lands) and the shipped 250 ms key frame budget. `hold` is how long the
+client keeps an incomplete frame open:
+
+At the measured 2.79% independent loss, hold of one frame period:
+
+| scheme | frames shown | freezes | median freeze | bandwidth |
+|---|---|---|---|---|
+| none, as today | 1.5% | 0.27/s | 2533 ms | 11.89 Mbit/s |
+| retransmit only | 5.2% | 0.37/s | 2017 ms | 12.00 Mbit/s |
+| 10% parity everywhere | 98.3% | 0.38/s | 33 ms | 10.37 Mbit/s |
+| **20% parity everywhere** | **99.9%** | 0.03/s | 33 ms | 10.73 Mbit/s |
+| 20% on delta, none on key | 88.4% | 0.04/s | 2300 ms | 11.07 Mbit/s |
+| 20% on delta, 5% on key | 99.8% | 0.03/s | 33 ms | 10.72 Mbit/s |
+
+The same, with the hold raised to two frame periods:
+
+| scheme | frames shown | median freeze | bandwidth |
+|---|---|---|---|
+| none, as today | 1.5% | 2533 ms | 11.89 Mbit/s |
+| **retransmit only** | **99.3%** | 850 ms | **8.81 Mbit/s** |
+| 20% parity everywhere | 99.9% | 33 ms | 10.73 Mbit/s |
+| 20% parity and retransmit | 100.0% | 0 ms | 10.69 Mbit/s |
+
+Four things come out of this.
+
+**Retransmission does fit, but only just, and only if the client waits two frame
+periods.** The repair takes the round trip plus however long it takes to notice.
+A gap is seen when the next datagram after the hole arrives, which inside a paced
+frame is a fraction of a millisecond, but a hole at the tail of a frame is proven
+only by the next frame's first datagram, a whole frame period later. So the
+repair lands between 14 and 31 ms after the loss. At a hold of one frame period
+it shows 5.2% of frames; at two it shows 99.3%. **The earlier decision was not
+wrong about retransmission being cheap. It was wrong about it being free of
+latency.**
+
+**Parity is the only scheme that needs no extra hold**, because the repair
+travels with the frame. Its freezes, when it has any, are one frame long rather
+than a second long.
+
+**Giving key frames no parity is wrong for us, and it is wrong for a reason
+specific to our frame sizes.** Sunshine can afford it; our key frame is 92
+datagrams against a delta frame's 12, so it is the frame most exposed to loss and
+not the least. Measured: 88.4% shown against 99.9%, with a median freeze of 2.3
+seconds. Five percent parity on a key frame is five datagrams and takes it to
+99.8%. **The rule is not "protect key frames more" or "less", it is that the
+parity must be sized against the frame's datagram count, which is what a
+percentage already does.**
+
+**Under bursty loss both schemes degrade and neither is sufficient alone.** Same
+long-run rate of 2.79% but arriving in runs of three: today's scheme shows 21.2%,
+retransmission alone 75.2%, 20% parity 81.9%, and the two together 97.2% at 11.38
+Mbit/s. This is the case that argues for having both.
+
+The bandwidth arithmetic is worth stating plainly, because "20% FEC" sounds
+expensive and is not. At 8.5 Mbit/s of picture, 20% parity is 1.7 Mbit/s. One
+recovery key frame is 130 kB, which is 1.04 Mbit. Today's scheme spends 3.4 key
+frames a second at this loss rate, which is 3.5 Mbit/s of key frames alone. **The
+scheme with no parity is the more expensive one.** Measured: 11.89 Mbit/s for
+today against 10.73 Mbit/s for 20% parity everywhere, and the second one shows
+99.9% of frames against 1.5%.
+
+### Slices buy nothing until the receiver changes
+
+`num-slices = 1` today, and the earlier measurement that rejected more slices
+measured latency on a local network: 7.30 ms mean at one slice against 8.81 ms
+mean and 23.74 ms worst at four. That measurement stands.
+
+What it did not consider is that **slices buy nothing at all with the receiver we
+have.** `Reassembler` delivers a frame only when every slice of it is complete:
+`Partial::complete` requires `slices.len() == last + 1` and every slice full. A
+frame missing one datagram of one slice is dropped whole, exactly as a
+single-slice frame is. Read from the source, and it is not a subtlety, it is the
+first condition in the function.
+
+So slicing is a change to three things at once: the encoder's `num-slices`, the
+receiver's willingness to hand a partial access unit to the decoder, and the
+decoder's concealment. Only the first is a setting.
+
+What the third would buy, if the first two were done. Measured over the frames
+actually damaged in the runs above, by asking of each damaged frame's arrival
+record how many bands would have survived had the frame been cut into that many:
+
+| the damaged frames of | intact at 2 slices | at 4 | at 8 | at 16 |
+|---|---|---|---|---|
+| a 100 Mbit/s path with a 128 kB buffer, 13 frames | 50% | 75% | 88% | 94% |
+| a 50 Mbit/s path with a 32 kB buffer, 24 frames | 15% | 44% | 51% | 63% |
+| a 25 Mbit/s path with a 32 kB buffer, 50 frames | 2% | 4% | 16% | 23% |
+
+The rows are ordered by how hard the bottleneck was pressed, and the trend is the
+point. When a frame loses the odd scattered datagram, slices do what the
+architecture expected: cutting into four leaves three quarters of the picture.
+When the loss comes from a buffer overrunning, it does not scatter. It takes the
+tail of the frame, contiguously, because that is what a drop-tail queue does, and
+two slices then save two percent of the picture rather than half of it. Slices
+are worth something against **independent** loss and nearly nothing against
+**queue** loss, and queue loss is what a burst produces.
+
+**Recommendation, firm: do not add slices.** They cost 1.5 ms of encoder latency,
+they require a partial-frame path through the receiver and the decoder, and
+against the loss this link actually produces they recover a fifth of a picture at
+best. Parity over the whole frame recovers all of it for less. `slice_id` 255 and
+the spare flag bits stay reserved, and the field stays in the header, because
+parity is what they were reserved for.
+
+### The two millisecond reorder window is the single worst constant
+
+`REORDER_WINDOW` is 2 ms, and its documentation says why: "a reordered packet on
+a link whose round trip is under a millisecond arrives immediately". That is
+true, and this is not that link. Measured above: **22.92% of packets on one air
+hop arrive more than 2 ms behind the fastest one.**
+
+Measured in the probe, on a path with no loss whatsoever, paced so that no queue
+ever overruns, with three percent of packets held back by up to 10 ms as a link
+layer retry does. Twenty seconds, 1200 slots:
+
+| reorder window | frames delivered | frames dropped | late packets | of those, ones that would have completed the frame |
+|---|---|---|---|---|
+| **2 ms, as shipped** | **1.8%** | 384 | 5177 | 384 |
+| 5 ms | 8.3% | 241 | 2906 | 241 |
+| 10 ms | 46.8% | 50 | 350 | 50 |
+| **15 ms** | **94.6%** | 5 | 4 | 4 |
+| 25 ms | 94.9% | 4 | 4 | 4 |
+
+Nothing was lost on this link. Every one of those 384 dropped frames was thrown
+away while the datagram that would have completed it was in the air. That is the
+40 late packets against 24 lost in the original measurement, and it is why the
+late count is larger than the loss count.
+
+The window costs nothing to widen. Median latency across the whole sweep is
+11.85 to 12.13 ms, flat. The ninetieth percentile **improves**, from 24.25 ms at
+2 ms to 18.80 ms at 15 ms, because a frame dropped at 2 ms is not a frame that
+arrived sooner, it is a frame replaced by a key frame request and a break in the
+chain.
+
+The reason widening is free is worth stating, because it is not obvious. The
+window only ever applies to a frame that is already known to be damaged. An
+undamaged frame is delivered the instant its last datagram arrives and never
+looks at the window at all. So the window trades nothing against the good case;
+it trades a damaged frame's delay against not having that frame.
+
+The ceiling on it is a frame period. A datagram that arrives after the next frame
+is complete cannot be used: the receiver has already moved its floor past it.
+
+**Reasoned, not measured:** the window should be derived rather than fixed,
+because 15 ms is right for 60 Hz and wrong for 120. One frame period is the
+principled figure, and the client knows the frame period from `StreamConfig`.
+
+A second, smaller thing in the same function. When a frame completes,
+`abandon_below` decides every frame under it on the spot, with no window at all,
+even a frame that is one datagram short and inside its reorder window. Measured
+as a variant that lets those frames keep their window: it helps, 1.8% to 4.2% at
+a 2 ms window, and it is dominated by simply widening the window, 94.6%. **Not
+worth the complexity on its own. Widen the window instead.**
+
+### The gate closes on the wrong question
+
+Not the subject of this research, but it fell out of it and it explains the
+"gated 179 while sending 64" line.
+
+The admission gate asks `can_send_bytes(key_frame_estimate())` before every
+frame, delta frames included. That is room for 130 kB in a 204 kB buffer, so the
+gate shuts as soon as 74 kB is queued, which is about five P frames of backlog.
+On a link that cannot drain a key frame in one frame interval, that is most of
+the time. The gate is right that a key frame must fit whole; it is asking that
+question about frames that are not key frames.
+
+**Reasoned:** the gate should ask for the frame it is about to encode, and ask
+for a key frame's room only when it is about to ask for a key frame.
+
+### Recommendations
+
+1. **Pace, in the transport, at a byte rate.** Spread a frame's datagrams evenly
+   over `bytes * 8 / rate`, where `rate` is a target the session owns. Do not
+   pace over a fixed slice of the frame interval; that costs the whole slice.
+   Measured cost at the right rate: about one millisecond of median latency.
+   Measured benefit on a 32 kB bottleneck: from between 0% and 52% of frames to
+   100%.
+2. **Do not take that rate from quinn.** `pacing_rate` is zero on a healthy link
+   and never falls on a bad one. Until an estimator exists, pace at a multiple of
+   the encoder's own configured bitrate, which is a number the session already
+   sets, with a floor that keeps a key frame inside the receiver's deadline.
+3. **Cap the key frame before anything else.** It is a setting, and at 25 kB the
+   whole problem disappears even without pacing.
+4. **Carry parity, sized as a percentage of the frame's datagrams, on every
+   frame including key frames.** 20% at the measured loss takes the stream from
+   1.5% to 99.9% of frames shown, and it does so for **less** total bandwidth
+   than today's key-frame-on-demand recovery, because a key frame costs eight
+   frames and parity costs a fifth of one. Keep recovery on demand as the
+   backstop for the case parity cannot cover.
+5. **Widen the reorder window to one frame period**, and derive it from the frame
+   rate in `StreamConfig`. This is a one line change and it is worth 384 frames
+   in 1200 on a link with no loss at all.
+6. **Do not add slices.**
+
+### What was not measured
+
+The phone was not attached during this work, so nothing here was taken against
+the real Android client. The link characterisation is the laptop's own air hop,
+which is one of the two the phone sits behind.
+
+An attempt to show a burst disturbing the real radio more than a paced load did
+not separate the two. The medium's own variance is far larger than the effect:
+ping to the access point under no load at all measured a worst case of 234 ms
+and a mean deviation of 22 ms, which swamps anything an 8.5 Mbit/s stream does to
+it. The claim that pacing helps rests on the shaped-link measurements and on the
+buffer-depth mechanism, not on a measurement of this access point.
