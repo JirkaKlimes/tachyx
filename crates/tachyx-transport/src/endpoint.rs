@@ -7,7 +7,6 @@ use std::time::Duration;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{AckFrequencyConfig, Connection, Endpoint, IdleTimeout, TransportConfig, VarInt};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::ServerName;
 use tachyx_proto::control::{ClientHello, HostHello};
 
 use crate::control::{ControlError, ControlReader, ControlWriter};
@@ -205,7 +204,6 @@ pub struct HostSession {
 #[derive(Debug)]
 pub struct Client {
     endpoint: Endpoint,
-    tuning: Tuning,
 }
 
 impl Client {
@@ -231,7 +229,7 @@ impl Client {
         let mut endpoint = Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
             .or_else(|_| Endpoint::client((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))?;
         endpoint.set_default_client_config(config);
-        Ok(Self { endpoint, tuning })
+        Ok(Self { endpoint })
     }
 
     /// The endpoint this client dials from, for its statistics, its address,
@@ -258,13 +256,18 @@ impl Client {
         host: &str,
         hello: &ClientHello,
     ) -> Result<ClientSession, TransportError> {
-        let name =
-            ServerName::try_from(host.to_owned()).map_err(|_| TransportError::UnusableHostName)?;
-        let server_name = match &name {
-            ServerName::DnsName(dns) => dns.as_ref().to_owned(),
-            other => format!("{other:?}"),
+        // The name goes to quinn as written. Turning it into a `ServerName`
+        // here and back into a string for quinn produced the debug form of an
+        // address for every host named by one, which quinn then refused: a
+        // client that dials an address it was told, which is every client on a
+        // local network, could not connect at all.
+        let connection = match self.endpoint.connect(address, host) {
+            Ok(connecting) => connecting.await?,
+            Err(quinn::ConnectError::InvalidServerName(_)) => {
+                return Err(TransportError::UnusableHostName);
+            }
+            Err(refused) => return Err(refused.into()),
         };
-        let connection = self.endpoint.connect(address, &server_name)?.await?;
         let (send, recv) = connection.open_bi().await?;
         let mut to_host = ControlWriter::new(send);
         // The stream reaches the host only when something is written on it, so

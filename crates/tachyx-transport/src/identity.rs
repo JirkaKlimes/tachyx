@@ -313,12 +313,13 @@ impl ServerCertVerifier for PinnedServer {
 
 /// The name a pin is filed under.
 ///
-/// A domain name is taken as written. Anything else is taken by its debug form,
-/// which is stable for the addresses rustls can carry and is never confused
-/// with a name, because a name cannot contain the brackets it prints.
+/// A domain name and an address are both taken as written, which is what the
+/// user typed and what the file is worth reading for. The two can never be
+/// confused: a name that parses as an address is an address.
 fn pin_key(server_name: &ServerName<'_>) -> String {
     match server_name {
         ServerName::DnsName(name) => name.as_ref().to_owned(),
+        ServerName::IpAddress(address) => std::net::IpAddr::from(*address).to_string(),
         other => format!("{other:?}"),
     }
 }

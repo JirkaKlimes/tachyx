@@ -12,8 +12,8 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::time::{Duration, Instant};
 
 use tachyx_proto::control::{
-    Capabilities, ClientHello, ClientMessage, Heartbeat, HostMessage, Size, StreamConfig,
-    HEARTBEAT_INTERVAL,
+    Capabilities, ClientHello, ClientMessage, HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size,
+    StreamConfig,
 };
 use tachyx_proto::input::InputEvent;
 use tachyx_proto::media::{FrameId, MalformedPacket, Timestamp};

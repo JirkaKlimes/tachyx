@@ -1,0 +1,26 @@
+[package]
+name = "tachyx-driver"
+description = "The client's I/O driver: owns the QUIC connection, runs the session, and feeds the decoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tachyx-client.workspace = true
+tachyx-proto.workspace = true
+tachyx-transport.workspace = true
+quinn.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# The loopback test plays the host, which means writing datagrams and a hello
+# that no `HostSession` would write.
+[dev-dependencies]
+bytes.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
