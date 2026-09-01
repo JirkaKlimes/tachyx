@@ -310,9 +310,20 @@ async fn run(
 }
 
 /// The bandwidth the link will carry, in bits per second.
-fn connection_target(connection: &quinn::Connection) -> Option<u32> {
-    let rate = connection.congestion_state().metrics().pacing_rate?;
-    u32::try_from(rate * 85 / 100).ok()
+/// What the link will carry, if anything here can say.
+///
+/// Nothing here can, yet. The transport's own bandwidth estimate was measured
+/// reporting zero on a healthy hundred-megabit path, for every sample of a
+/// twenty-second run: its sampler discards any measurement taken while the
+/// sender is limited by its own supply, and a sender producing sixty frames a
+/// second is in that state whenever an acknowledgement arrives. Feeding that
+/// zero to the ladder drove the encoder to its smallest picture on a link with
+/// room to spare, which is worse than not adapting at all.
+///
+/// So this reports nothing until the receiver's own report exists, and the
+/// ladder holds what the session was configured for. See `spec/congestion.md`.
+const fn connection_target(_connection: &quinn::Connection) -> Option<u32> {
+    None
 }
 
 /// Applies a rung, spending the key frame it costs from the shared budget.

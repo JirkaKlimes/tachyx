@@ -212,7 +212,7 @@ pub struct Frame {
 /// signal keeps the frame that reordering would otherwise have cost, and is
 /// still a small fraction of the eight to sixteen milliseconds a frame period
 /// gives.
-pub const REORDER_WINDOW: Duration = Duration::from_millis(2);
+pub const REORDER_WINDOW: Duration = Duration::from_millis(15);
 
 /// What a reassembler has seen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
