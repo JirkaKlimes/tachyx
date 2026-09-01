@@ -279,11 +279,111 @@ comes free from the transport, and a delay-based estimator of our own is not
 needed on a local network.
 
 A successful call to send a datagram does not mean the datagram was sent. Under
-pressure quinn discards queued datagrams to make room, and it discards arbitrary
-ones, which corrupts frames rather than skipping them. In the burst test 2166 of
-5000 vanished with no error reported. The send buffer is therefore sized to about
-two frames and the available space is checked before a frame is queued, so that a
-frame is dropped whole, by us, rather than shredded by the transport.
+pressure quinn discards queued datagrams to make room. In the burst test 2166 of
+5000 vanished with no error reported. The send buffer is therefore sized so that
+a whole key frame fits it, and the space is checked before a frame is queued, so
+that a frame is dropped whole, by us, rather than shredded by the transport.
+
+### Two things this document said about that are wrong
+
+An earlier revision said quinn "discards arbitrary ones". It discards the
+**oldest first**, in order, which is worse rather than better for us: the oldest
+queued datagrams are the head of the frame currently going out, so the frame that
+loses its pieces is the one the client is about to try to decode.
+
+It also said the send buffer is "sized to about two frames". Two frames of what
+decides whether the stream starts at all. The two frame sizes measured here are
+130,427 bytes in 92 datagrams for a 1080p key frame and 16,673 bytes in 12
+datagrams for a P frame at 8 Mbit/s and 60 Hz. Read as two P frames it is 33 KiB,
+into which no key frame ever fits, so every key frame is refused, the client never
+gets one to synchronise on, and no picture is ever shown. The figure is one key
+frame scaled by pixel count, charged the per-datagram accounting below, and given
+half a key frame of headroom: 203,785 bytes at 1920x1088.
+
+### Reaching quinn's eviction path is fatal, not lossy
+
+Measured, in both profiles, against quinn-proto 0.11.17.
+
+The eviction loop in `Datagrams::send` subtracts a dropped datagram's length from
+`payload_bytes` twice: once inside `DatagramBuffer::pop_front`, which the loop
+calls, and once again in the loop body. The count then no longer describes the
+queue.
+
+- Debug, or any build with overflow checks: the next drain of the queue subtracts
+  a real length from the understated count and panics with `attempt to subtract
+  with overflow` at `connection/datagrams.rs:203`. The panic poisons the
+  connection's mutex, so every later use of that connection panics too, and
+  dropping it panics during cleanup, which aborts the process.
+- Release: `payload_bytes` wraps instead. The connection then reports zero free
+  space for ever, so the gate refuses every frame and the video stops with no
+  error at all. The next datagram offered reaches quinn's own
+  `expect("datagrams.outgoing.payload_bytes desynchronized")` and panics there.
+
+So the gate is not a refinement of quinn's behaviour under pressure. It is what
+keeps the connection alive. This was found by running the transport at
+saturation, where it killed the connection, and reproduced deterministically:
+fill the queue past the eviction threshold, then let it drain.
+
+### The free-space report understates, and by how much
+
+`Connection::datagram_send_buffer_space()` reports the buffer less the payload
+bytes queued less one entry's worth of accounting. The eviction loop it is meant
+to predict charges one entry's worth **per queued datagram**, so the two disagree
+by 32 bytes for every datagram already in the queue.
+
+Measured with a 1080p key frame queued: 92 datagrams held, 71,854 bytes reported
+free, of which the report says another 49 datagrams fit and the queue really
+takes 47. Trusting the report evicts, and evicting is fatal.
+
+The gate closes the gap without guessing. This transport is the only producer on
+that queue and quinn takes from the front, so the datagrams still in it are the
+tail of the ones pushed, and the tail whose sizes add up to the payload bytes
+reported is the only tail it can be. That gives the entry count the report leaves
+out. When the sizes cannot be made to add up, something removed a datagram from
+the middle, and the gate refuses everything until the queue drains and the record
+squares itself again.
+
+### The receive buffer evicts the same way, and its default is not the trap
+
+`DatagramState::received` discards the oldest queued incoming datagram to make
+room, silently, exactly as the send side does. Its accounting is correct, so
+nothing panics; the datagrams simply vanish.
+
+Measured: a client whose datagram receive buffer is 29,991 bytes receives 20 of
+the 92 datagrams of a key frame sent to it. The frame is destroyed on the client,
+after a healthy network delivered every packet, with no error anywhere.
+
+quinn's default is 1,250,000 bytes, which is fine. Any configuration that lowers
+it below a key frame plus the application's drain lag is not. Send and receive are
+therefore set to the same figure. With both at 203,785 bytes, a key frame that
+sits unread for 100 ms while the application is busy arrives complete: 92 of 92
+datagrams, nothing discarded.
+
+### Loopback, measured
+
+180 frames at 60 Hz, one key frame every 60, real sockets, real handshake,
+1418-byte payloads.
+
+| | |
+|---|---|
+| Delivered | 180 of 180, 2400 datagrams, none evicted, none lost |
+| Carried | 26.74 Mbit in 2.985 s, 8.96 Mbit/s |
+| Capture to delivery | 1.42 ms median, 2.56 ms at the 99th percentile, 2.80 ms worst |
+| Round trip | 193 µs, quinn's own path estimate |
+| BBR pacing rate | 670 Mbit/s |
+| Congestion events | 0 |
+
+The same link driven as hard as the gate allows for 1.5 seconds: 34,850 frames
+offered, 30,357 queued, 4493 refused whole by the gate, 2.99 Gbit/s carried,
+33 µs round trip, BBR pacing rate 3.39 Gbit/s. Of 397,373 datagrams received,
+4911 were lost, which is the kernel dropping UDP at three gigabits and not the
+transport evicting: eviction would have killed the connection outright.
+
+Capture to delivery is measured from when the frame was due to be sent, so it
+includes the sender's own scheduling and the encoder is not in it. The pacing
+rate is only ever `Some` under BBR. Cubic and NewReno report `None`, so choosing
+BBR is the precondition for having a bandwidth estimate at all rather than a
+preference between controllers.
 
 Datagram frames are written into a packet before stream frames, so control traffic
 cannot starve video within a packet, though the two still share the window.
@@ -293,15 +393,42 @@ initial round trip estimate defaults to 333 ms, which seeds loss detection, so a
 lost packet is not suspected for a third of a second on a link where the real
 figure is under one millisecond.
 
-quinn defaults to one cryptographic provider and rustls to another, so accepting
-both defaults compiles both. The provider is selected explicitly.
+Read from quinn 0.11.11 and quinn-proto 0.11.17 rather than run, for the record:
+`max_idle_timeout` 30 s, `initial_rtt` 333 ms, `initial_mtu` and `min_mtu` 1200,
+no keep-alive, no acknowledgement frequency configuration, `datagram_send_buffer_size`
+1 MiB, which is about eight 1080p key frames of queued latency, and Cubic as the
+congestion controller. `AckFrequencyConfig::max_ack_delay` is clamped by quinn to
+at least the peer's minimum and at most the greater of the path round trip and
+25 ms, so the 2 ms asked for here is honoured on a local link and not elsewhere.
 
-Recovery is by retransmission rather than forward error correction. Sunshine and
-Moonlight carry a fifth of their bandwidth as parity because a wide-area round trip
-exceeds a frame period, making retransmission useless. On a local network a
-retransmission costs about a millisecond, so parity on every frame would be paying
-continuously for a problem that can be fixed on demand. The header reserves room
-for parity for when this leaves the local network.
+There is no public API that fails fast instead of shredding.
+`Connection::send_datagram` always passes `drop = true`, so its `Blocked` result
+is unreachable. The path that does not drop is reachable only through
+`send_datagram_wait`, which waits rather than failing, and waiting prioritises old
+datagrams over new ones, which for live video is exactly backwards. The gate is
+the only defence.
+
+quinn defaults to one cryptographic provider and rustls to another, so accepting
+both defaults compiles both. The provider is selected explicitly, and with quinn
+on `rustls-ring` and rustls on `ring` the resolved lockfile contains no
+`aws-lc-rs` at all.
+
+Recovery is on demand rather than by forward error correction. Video datagrams are
+never retransmitted, and neither intra-refresh nor long-term reference frames are
+reachable on this hardware, so what recovery means here is exactly one thing: the
+client asks for a key frame and the host sends an IDR. Sunshine and Moonlight carry
+a fifth of their bandwidth as parity because a wide-area round trip exceeds a frame
+period. On a local network the round trip is under a millisecond, so parity on every
+frame would be paying continuously for something that costs one round trip and one
+IDR when it happens. The header reserves room for parity for when this leaves the
+local network.
+
+That makes detecting loss the whole of the recovery mechanism, and one kind of loss
+leaves no evidence to detect: a frame that loses every packet. Nothing in the
+sequence numbers separates it from the frame boundary around it. The frame
+identifiers are what say it happened, which is why the host must number every
+picture it encodes and skip none. That rule and its consequences are in
+[`protocol.md`](protocol.md).
 
 ## Discovery
 

@@ -188,9 +188,11 @@ impl Hello for ClientHello {
 /// drive. What this message exists for is the version, which the client
 /// otherwise has no way to check.
 ///
-/// The host sends it before it has read the client's hello, so a client of the
-/// wrong version is told which version the host speaks rather than being left
-/// with a connection that closed.
+/// The host sends it before it has read the client's hello, so the order the
+/// two arrive in never matters. It is not what a refused client usually reads,
+/// though: closing a connection discards stream data the peer has not
+/// acknowledged, so the reason for a refusal reaches the client as the
+/// connection's close reason, which is measured, not assumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostHello {
     /// Read before anything after it, and private for the same reason as

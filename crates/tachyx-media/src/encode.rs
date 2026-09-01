@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -81,6 +81,24 @@ pub struct AccessUnit {
     pub bytes: Vec<u8>,
 }
 
+impl AccessUnit {
+    /// The picture's independently decodable pieces, in decode order, ready to
+    /// hand to [`tachyx_proto::packet::AccessUnit::new`] without copying.
+    ///
+    /// There is exactly one, and the array type says so rather than implying a
+    /// choice that is not there. The encoder runs with `num-slices` at one
+    /// because more slices measured slower, so an access unit is one piece and
+    /// losing any datagram of it costs the whole picture. The protocol's slice
+    /// field is carrying nothing while that holds.
+    ///
+    /// Bind the result before lending it, because the array is a temporary:
+    /// `let slices = unit.slices();` then `AccessUnit::new(.., &slices)`.
+    #[must_use]
+    pub fn slices(&self) -> [&[u8]; 1] {
+        [&self.bytes]
+    }
+}
+
 /// The encoder's output.
 #[derive(Debug)]
 pub struct AccessUnits(Receiver<AccessUnit>);
@@ -116,6 +134,12 @@ pub struct EncodeStats {
     pub bytes: u64,
     /// Bytes of filler the encoder emitted and this crate discarded.
     pub filler_bytes: u64,
+    /// Frames the admission gate refused, which were therefore never encoded.
+    ///
+    /// Counted apart from the frames capture dropped at the slot, because the
+    /// two name different bottlenecks: this one is the wire, that one is the
+    /// encoder.
+    pub refused: u64,
     /// Time from handing a frame to the pipeline to holding its access unit.
     pub latency: Percentiles,
 }
@@ -146,6 +170,7 @@ impl EncodeStats {
 pub struct Encoder {
     control: Arc<Control>,
     counters: Arc<Counters>,
+    admission: Arc<AtomicBool>,
     source: Arc<Slot<crate::Frame>>,
     thread: Option<JoinHandle<Result<(), Error>>>,
 }
@@ -160,26 +185,46 @@ impl Encoder {
         gst::init()?;
         let control = Arc::new(Control::build(frames.format(), config)?);
         let counters = Arc::new(Counters::default());
+        let admission = Arc::new(AtomicBool::new(true));
         let (sender, receiver) = sync_channel(2);
         let source = frames.slot();
 
         let thread = {
             let control = Arc::clone(&control);
             let counters = Arc::clone(&counters);
+            let admission = Arc::clone(&admission);
             std::thread::Builder::new()
                 .name("tachyx-encode".to_owned())
-                .spawn(move || pump(&frames, &control, &counters, &sender))?
+                .spawn(move || pump(&frames, &control, &counters, &admission, &sender))?
         };
 
         Ok((
             Self {
                 control,
                 counters,
+                admission,
                 source,
                 thread: Some(thread),
             },
             AccessUnits(receiver),
         ))
+    }
+
+    /// The gate that decides whether the next frame is encoded at all.
+    ///
+    /// Clear it while the transport has no room for another frame. A frame
+    /// refused here never reaches the encoder, so the reference chain is
+    /// unbroken and every picture that does go out stays decodable. Encoding a
+    /// frame and then dropping it on the wire would instead corrupt the picture
+    /// until the next key frame, which with one reference frame and a key
+    /// interval of 1024 is many seconds away.
+    ///
+    /// It starts set, so an encoder nobody gates encodes everything. Refusals
+    /// are counted in [`EncodeStats::refused`], apart from the frames capture
+    /// dropped at the slot.
+    #[must_use]
+    pub fn admission(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.admission)
     }
 
     /// The geometry the current settings produce.
@@ -541,12 +586,20 @@ fn pump(
     frames: &Frames,
     control: &Control,
     counters: &Counters,
+    admission: &AtomicBool,
     output: &SyncSender<AccessUnit>,
 ) -> Result<(), Error> {
     let allocator = DmaBufAllocator::new();
     let mut next = 0u32;
     let mut scratch = Vec::new();
     while let Some(frame) = frames.next() {
+        if !admission.load(Ordering::Relaxed) {
+            counters.refused.fetch_add(1, Ordering::Relaxed);
+            // Dropping the frame is what returns its buffer to the ring, so a
+            // refusal costs capture nothing.
+            drop(frame);
+            continue;
+        }
         let captured = frame.captured();
         let (fd, lease) = frame.into_parts();
         let buffer = control.wrap(&allocator, fd, captured)?;
@@ -668,6 +721,7 @@ struct Counters {
     encoded: AtomicU64,
     bytes: AtomicU64,
     filler: AtomicU64,
+    refused: AtomicU64,
     latency: Mutex<Samples>,
 }
 

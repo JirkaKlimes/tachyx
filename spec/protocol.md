@@ -53,11 +53,13 @@ Both directions, because a check in one direction only leaves the other end
 decoding a message a later version reshaped, and those bytes do not fail to
 parse. They parse into something else.
 
-The host writes its hello before it reads the client's. Its version does not
-depend on the client's, and sending it first means a client of the wrong version
-is told which version the host speaks. A refusal then closes the connection with
-the reason attached, so neither end is left with a connection that ended for no
-stated reason.
+The host writes its hello before it reads the client's, so the order the two
+arrive in never matters. A refusal closes the connection with the reason
+attached, and that is what a refused client actually reads: closing a QUIC
+connection discards stream data the peer has not acknowledged, so the hello
+loses the race to the close. Measured on loopback, a client claiming version 7
+sees `closed by peer: peer speaks protocol version 7, this build speaks 0 (code
+1)`, which is a named answer rather than a reset.
 
 The video path does not use this encoding, or serde at all. See below.
 
