@@ -7,10 +7,19 @@
 //! wherever the queue happens to hold them, so what they destroy is not a frame
 //! but pieces of several frames.
 //!
-//! The whole of this module exists to make that impossible. A frame is offered
-//! only when the queue provably has room for all of it, and is otherwise
-//! refused whole, by us, before it is sent.
+//! Worse than that, and measured here rather than read: the discard path in
+//! quinn-proto 0.11.17 subtracts a dropped datagram's length from its own
+//! accounting twice, once in `DatagramBuffer::pop_front` and again in the loop
+//! that called it. The second subtraction underflows, so reaching that path is
+//! not a lossy degradation. It panics the connection task where overflow checks
+//! are on, and wraps the byte count to something near `usize::MAX` where they
+//! are not, which makes every later report of free space zero.
+//!
+//! The whole of this module exists to make that path unreachable. A frame is
+//! offered only when the queue provably has room for all of it, and is
+//! otherwise refused whole, by us, before it is sent.
 
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
@@ -91,19 +100,29 @@ pub struct VideoSender {
     connection: Connection,
     packetiser: Packetiser,
     datagrams: Vec<Vec<u8>>,
+    /// The size quinn was configured to give the outgoing datagram queue.
+    /// Nothing on the connection reports it back, and the gate cannot be
+    /// exact without it.
+    buffer: usize,
+    /// Sizes of the datagrams pushed onto that queue, oldest first, less the
+    /// ones quinn is known to have taken.
+    outstanding: VecDeque<usize>,
     key_frame_bytes: usize,
     frames_sent: u64,
     frames_refused: u64,
 }
 
 impl VideoSender {
-    /// Starts sending on `connection`.
+    /// Starts sending on `connection`, whose outgoing datagram queue holds
+    /// `buffer` bytes.
     #[must_use]
-    pub fn new(connection: Connection) -> Self {
+    pub fn new(connection: Connection, buffer: usize) -> Self {
         Self {
             connection,
             packetiser: Packetiser::new(NOMINAL_PAYLOAD),
             datagrams: Vec::new(),
+            buffer,
+            outstanding: VecDeque::new(),
             key_frame_bytes: MEASURED_KEY_FRAME_BYTES,
             frames_sent: 0,
             frames_refused: 0,
@@ -137,12 +156,59 @@ impl VideoSender {
     /// key frame.
     ///
     /// The header and the queue's own accounting are charged per datagram
-    /// rather than once, which is the term
-    /// [`quinn::Connection::datagram_send_buffer_space`] omits.
+    /// rather than once, for the frame being offered and for every datagram
+    /// already queued. Both are terms
+    /// [`quinn::Connection::datagram_send_buffer_space`] omits: it subtracts a
+    /// single entry's accounting from the buffer, while the eviction loop it is
+    /// meant to predict charges one per entry. Trusting the report costs a
+    /// frame as soon as two datagrams are queued ahead of it.
     #[must_use]
     pub fn can_send_frame(&self, datagrams: usize, payload_per_datagram: usize) -> bool {
+        let space = self.connection.datagram_send_buffer_space();
+        let Some(queued) = self.queued(space) else {
+            return false;
+        };
         let required = datagrams.saturating_mul(payload_per_datagram + HEADER_LEN + QUEUE_OVERHEAD);
-        self.connection.datagram_send_buffer_space() >= required
+        // `space` is the buffer less the payload bytes queued less one entry's
+        // accounting, so adding that entry back gives the bytes the queue has
+        // free, from which every entry in it charges its own.
+        required <= (space + QUEUE_OVERHEAD).saturating_sub(queued * QUEUE_OVERHEAD)
+    }
+
+    /// Datagrams quinn's outgoing queue still holds, or `None` when the record
+    /// of them cannot be squared with what quinn reports.
+    ///
+    /// quinn reports the payload bytes in that queue but never the number of
+    /// entries holding them, and its eviction charges one
+    /// [`QUEUE_OVERHEAD`] per entry. This transport is the only producer on the
+    /// queue and quinn takes from the front, so what is left is the tail of
+    /// what was pushed, and the tail whose sizes add up to the bytes reported
+    /// is the only one it can be.
+    ///
+    /// When they do not add up, something removed a datagram from the middle:
+    /// a path that shrinks makes quinn drop the queued datagrams too large for
+    /// it. The count is then unknown, the gate refuses everything, and the
+    /// record squares itself again the moment the queue drains.
+    fn queued(&self, space: usize) -> Option<usize> {
+        let held = self.buffer.saturating_sub(space + QUEUE_OVERHEAD);
+        let mut bytes = 0;
+        let mut entries = 0;
+        for size in self.outstanding.iter().rev() {
+            if bytes >= held {
+                break;
+            }
+            bytes += size;
+            entries += 1;
+        }
+        (bytes == held).then_some(entries)
+    }
+
+    /// Forgets the datagrams quinn has taken off the queue.
+    fn forget_sent(&mut self) {
+        let space = self.connection.datagram_send_buffer_space();
+        if let Some(queued) = self.queued(space) {
+            self.outstanding.drain(..self.outstanding.len() - queued);
+        }
     }
 
     /// Whether the queue has room for a single-slice picture of `bytes`.
@@ -216,6 +282,7 @@ impl VideoSender {
     pub fn send(&mut self, unit: &AccessUnit<'_>) -> Result<Sent, VideoError> {
         let payload = self.payload_len().ok_or(VideoError::NoDatagrams)?;
         self.packetiser.set_payload_len(payload);
+        self.forget_sent();
         let datagrams = unit.datagrams(payload);
         if !self.can_send_frame(datagrams, payload.get()) {
             self.frames_refused += 1;
@@ -229,7 +296,9 @@ impl VideoSender {
         self.datagrams.clear();
         self.packetiser.packetise(unit, &mut self.datagrams);
         for datagram in self.datagrams.drain(..) {
+            let queued = datagram.len();
             self.connection.send_datagram(Bytes::from(datagram))?;
+            self.outstanding.push_back(queued);
         }
         self.frames_sent += 1;
         Ok(Sent::Queued { datagrams })

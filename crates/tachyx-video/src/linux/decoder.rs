@@ -105,10 +105,10 @@ impl Decoder {
     /// which is why nothing here tracks frames by identity.
     pub(super) fn push(
         &self,
-        access_unit: &[u8],
+        access_unit: Vec<u8>,
         arrived: gstreamer::ClockTime,
     ) -> Result<(), Error> {
-        let mut buffer = gstreamer::Buffer::from_mut_slice(access_unit.to_vec());
+        let mut buffer = gstreamer::Buffer::from_mut_slice(access_unit);
         buffer
             .get_mut()
             .expect("a freshly built buffer is unshared")

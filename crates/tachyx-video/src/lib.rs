@@ -19,10 +19,16 @@
 //! - `format=RGBA`. The embedder states `GL_RGBA8` for every texture it is given
 //!   and never asks what the texture really is.
 //!
-//! Everything here is Linux. On other targets the crate is empty.
+//! Everything here is Linux. Android reaches the compositor through a surface
+//! producer instead, which is a different mechanism and not this crate; on that
+//! target [`VideoTexture::new`] says so rather than failing to link.
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(not(target_os = "linux"))]
+mod unsupported;
 
 #[cfg(target_os = "linux")]
 pub use linux::{Error, Latency, Stats, VideoTexture};
+#[cfg(not(target_os = "linux"))]
+pub use unsupported::{Error, Latency, Stats, VideoTexture};

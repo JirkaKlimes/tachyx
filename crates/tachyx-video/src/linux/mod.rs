@@ -126,20 +126,21 @@ impl VideoTexture {
     ///
     /// # Errors
     /// If the decoder rejects the access unit.
-    pub fn push(&self, access_unit: &[u8]) -> Result<(), Error> {
+    pub fn push(&self, access_unit: Vec<u8>) -> Result<(), Error> {
         let arrived = gstreamer::ClockTime::from_nseconds(
             u64::try_from(self.shared.start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
-        let started = {
+        let queued = {
             let mut state = self.shared.locked();
             state.pushed += 1;
-            let started = self.shared.context.get().is_some();
-            if !started {
-                state.waiting.push_back((access_unit.to_vec(), arrived));
+            if self.shared.context.get().is_some() {
+                Some(access_unit)
+            } else {
+                state.waiting.push_back((access_unit, arrived));
+                None
             }
-            started
         };
-        if started {
+        if let Some(access_unit) = queued {
             self.shared.pipeline.push(access_unit, arrived)?;
         }
         self.texture.mark_frame_available();
@@ -242,7 +243,7 @@ impl Shared {
             }
             let waiting = std::mem::take(&mut self.locked().waiting);
             for (access_unit, arrived) in waiting {
-                if let Err(error) = self.pipeline.push(&access_unit, arrived) {
+                if let Err(error) = self.pipeline.push(access_unit, arrived) {
                     tracing::error!(%error, "the decoder rejected a buffered access unit");
                 }
             }

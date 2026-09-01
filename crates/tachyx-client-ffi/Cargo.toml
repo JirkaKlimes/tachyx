@@ -15,6 +15,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 tachyx-client.workspace = true
 tachyx-proto.workspace = true
+tachyx-video.workspace = true
 anyhow.workspace = true
 flutter_rust_bridge = "=2.13.0"
 

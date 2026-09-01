@@ -2157,6 +2157,7 @@ dependencies = [
  "flutter_rust_bridge",
  "tachyx-client",
  "tachyx-proto",
+ "tachyx-video",
 ]
 
 [[package]]

@@ -161,7 +161,7 @@ impl Host {
             }
         };
         Ok(HostSession {
-            video: VideoSender::new(connection.clone()),
+            video: VideoSender::new(connection.clone(), self.tuning.video_buffer),
             to_client,
             from_client,
             hello,

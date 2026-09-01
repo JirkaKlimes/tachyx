@@ -233,6 +233,9 @@ class SoftKeyboard implements DeltaTextInputClient {
   void showAutocorrectionPromptRect(int start, int end) {}
 
   @override
+  bool onFocusReceived() => isOpen;
+
+  @override
   void connectionClosed() {
     _connection = null;
     _value = TextEditingValue.empty;

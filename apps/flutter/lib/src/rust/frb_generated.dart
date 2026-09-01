@@ -5,6 +5,7 @@
 
 import 'api/input.dart';
 import 'api/session.dart';
+import 'api/video.dart';
 
 import 'dart:async';
 import 'dart:convert';
@@ -70,7 +71,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 1879786432;
+  int get rustContentHash => 1992860221;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -92,6 +93,17 @@ abstract class RustLibApi extends BaseApi {
 
   VideoStats crateApiSessionSessionVideoStats({required Session that});
 
+  void crateApiVideoVideoTextureFinish({required VideoTexture that});
+
+  PlatformInt64 crateApiVideoVideoTextureId({required VideoTexture that});
+
+  void crateApiVideoVideoTexturePush({
+    required VideoTexture that,
+    required List<int> accessUnit,
+  });
+
+  PresentStats crateApiVideoVideoTextureStats({required VideoTexture that});
+
   Future<Session> crateApiSessionConnect({
     required String address,
     required int viewportWidth,
@@ -100,6 +112,10 @@ abstract class RustLibApi extends BaseApi {
 
   Future<void> crateApiSessionInit();
 
+  VideoTexture crateApiVideoOpenVideoTexture({
+    required PlatformInt64 engineHandle,
+  });
+
   int crateApiSessionProtocolVersion();
 
   RustArcIncrementStrongCountFnType get rust_arc_increment_strong_count_Session;
@@ -107,6 +123,14 @@ abstract class RustLibApi extends BaseApi {
   RustArcDecrementStrongCountFnType get rust_arc_decrement_strong_count_Session;
 
   CrossPlatformFinalizerArg get rust_arc_decrement_strong_count_SessionPtr;
+
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_VideoTexture;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_VideoTexture;
+
+  CrossPlatformFinalizerArg get rust_arc_decrement_strong_count_VideoTexturePtr;
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -215,6 +239,117 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "Session_video_stats", argNames: ["that"]);
 
   @override
+  void crateApiVideoVideoTextureFinish({required VideoTexture that}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+            that,
+            serializer,
+          );
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 4)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiVideoVideoTextureFinishConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiVideoVideoTextureFinishConstMeta =>
+      const TaskConstMeta(debugName: "VideoTexture_finish", argNames: ["that"]);
+
+  @override
+  PlatformInt64 crateApiVideoVideoTextureId({required VideoTexture that}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+            that,
+            serializer,
+          );
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 5)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_i_64,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiVideoVideoTextureIdConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiVideoVideoTextureIdConstMeta =>
+      const TaskConstMeta(debugName: "VideoTexture_id", argNames: ["that"]);
+
+  @override
+  void crateApiVideoVideoTexturePush({
+    required VideoTexture that,
+    required List<int> accessUnit,
+  }) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+            that,
+            serializer,
+          );
+          sse_encode_list_prim_u_8_loose(accessUnit, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 6)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiVideoVideoTexturePushConstMeta,
+        argValues: [that, accessUnit],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiVideoVideoTexturePushConstMeta =>
+      const TaskConstMeta(
+        debugName: "VideoTexture_push",
+        argNames: ["that", "accessUnit"],
+      );
+
+  @override
+  PresentStats crateApiVideoVideoTextureStats({required VideoTexture that}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+            that,
+            serializer,
+          );
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 7)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_present_stats,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiVideoVideoTextureStatsConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiVideoVideoTextureStatsConstMeta =>
+      const TaskConstMeta(debugName: "VideoTexture_stats", argNames: ["that"]);
+
+  @override
   Future<Session> crateApiSessionConnect({
     required String address,
     required int viewportWidth,
@@ -230,7 +365,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 8,
             port: port_,
           );
         },
@@ -260,7 +395,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 5,
+            funcId: 9,
             port: port_,
           );
         },
@@ -279,12 +414,41 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "init", argNames: []);
 
   @override
+  VideoTexture crateApiVideoOpenVideoTexture({
+    required PlatformInt64 engineHandle,
+  }) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_i_64(engineHandle, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 10)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData:
+              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiVideoOpenVideoTextureConstMeta,
+        argValues: [engineHandle],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiVideoOpenVideoTextureConstMeta =>
+      const TaskConstMeta(
+        debugName: "open_video_texture",
+        argNames: ["engineHandle"],
+      );
+
+  @override
   int crateApiSessionProtocolVersion() {
     return handler.executeSync(
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 6)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 11)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_u_16,
@@ -308,6 +472,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   get rust_arc_decrement_strong_count_Session => wire
       .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession;
 
+  RustArcIncrementStrongCountFnType
+  get rust_arc_increment_strong_count_VideoTexture => wire
+      .rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture;
+
+  RustArcDecrementStrongCountFnType
+  get rust_arc_decrement_strong_count_VideoTexture => wire
+      .rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture;
+
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -321,6 +493,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SessionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  VideoTexture
+  dco_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return VideoTextureImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
@@ -342,12 +523,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoTexture
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return VideoTextureImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
   Session
   dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     dynamic raw,
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return SessionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  VideoTexture
+  dco_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return VideoTextureImpl.frbInternalDcoDecode(raw as List<dynamic>);
   }
 
   @protected
@@ -387,6 +586,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   int dco_decode_i_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
+  }
+
+  @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dcoDecodeI64(raw);
   }
 
   @protected
@@ -433,6 +638,26 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  Latency dco_decode_latency(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return Latency(
+      minUs: dco_decode_u_32(arr[0]),
+      medianUs: dco_decode_u_32(arr[1]),
+      p95Us: dco_decode_u_32(arr[2]),
+      maxUs: dco_decode_u_32(arr[3]),
+    );
+  }
+
+  @protected
+  List<int> dco_decode_list_prim_u_8_loose(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as List<int>;
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
@@ -445,6 +670,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PresentStats dco_decode_present_stats(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return PresentStats(
+      pushed: dco_decode_u_64(arr[0]),
+      decoded: dco_decode_u_64(arr[1]),
+      presented: dco_decode_u_64(arr[2]),
+      superseded: dco_decode_u_64(arr[3]),
+      decode: dco_decode_latency(arr[4]),
+      present: dco_decode_latency(arr[5]),
+    );
+  }
+
+  @protected
   Press dco_decode_press(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return Press.values[raw as int];
@@ -452,6 +693,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   int dco_decode_u_16(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
+  int dco_decode_u_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
   }
@@ -516,6 +763,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoTexture
+  sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return VideoTextureImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   Session
   sse_decode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     SseDeserializer deserializer,
@@ -540,12 +799,36 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoTexture
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return VideoTextureImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
   Session
   sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     SseDeserializer deserializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return SessionImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  VideoTexture
+  sse_decode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return VideoTextureImpl.frbInternalSseDecode(
       sse_decode_usize(deserializer),
       sse_decode_i_32(deserializer),
     );
@@ -591,6 +874,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getPlatformInt64();
+  }
+
+  @protected
   InputEvent sse_decode_input_event(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -631,6 +920,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  Latency sse_decode_latency(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_minUs = sse_decode_u_32(deserializer);
+    var var_medianUs = sse_decode_u_32(deserializer);
+    var var_p95Us = sse_decode_u_32(deserializer);
+    var var_maxUs = sse_decode_u_32(deserializer);
+    return Latency(
+      minUs: var_minUs,
+      medianUs: var_medianUs,
+      p95Us: var_p95Us,
+      maxUs: var_maxUs,
+    );
+  }
+
+  @protected
+  List<int> sse_decode_list_prim_u_8_loose(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var len_ = sse_decode_i_32(deserializer);
+    return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
@@ -645,6 +956,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PresentStats sse_decode_present_stats(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_pushed = sse_decode_u_64(deserializer);
+    var var_decoded = sse_decode_u_64(deserializer);
+    var var_presented = sse_decode_u_64(deserializer);
+    var var_superseded = sse_decode_u_64(deserializer);
+    var var_decode = sse_decode_latency(deserializer);
+    var var_present = sse_decode_latency(deserializer);
+    return PresentStats(
+      pushed: var_pushed,
+      decoded: var_decoded,
+      presented: var_presented,
+      superseded: var_superseded,
+      decode: var_decode,
+      present: var_present,
+    );
+  }
+
+  @protected
   Press sse_decode_press(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_i_32(deserializer);
@@ -655,6 +985,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   int sse_decode_u_16(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint16();
+  }
+
+  @protected
+  int sse_decode_u_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getUint32();
   }
 
   @protected
@@ -729,6 +1065,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
+  sse_encode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    VideoTexture self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as VideoTextureImpl).frbInternalSseEncode(move: true),
+      serializer,
+    );
+  }
+
+  @protected
+  void
   sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     Session self,
     SseSerializer serializer,
@@ -755,6 +1104,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @protected
   void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    VideoTexture self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as VideoTextureImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
+  }
+
+  @protected
+  void
   sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     Session self,
     SseSerializer serializer,
@@ -762,6 +1124,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_usize(
       (self as SessionImpl).frbInternalSseEncode(move: null),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerVideoTexture(
+    VideoTexture self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as VideoTextureImpl).frbInternalSseEncode(move: null),
       serializer,
     );
   }
@@ -810,6 +1185,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putPlatformInt64(self);
+  }
+
+  @protected
   void sse_encode_input_event(InputEvent self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     switch (self) {
@@ -846,6 +1227,27 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_latency(Latency self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.minUs, serializer);
+    sse_encode_u_32(self.medianUs, serializer);
+    sse_encode_u_32(self.p95Us, serializer);
+    sse_encode_u_32(self.maxUs, serializer);
+  }
+
+  @protected
+  void sse_encode_list_prim_u_8_loose(
+    List<int> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    serializer.buffer.putUint8List(
+      self is Uint8List ? self : Uint8List.fromList(self),
+    );
+  }
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
     Uint8List self,
     SseSerializer serializer,
@@ -862,6 +1264,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_present_stats(PresentStats self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self.pushed, serializer);
+    sse_encode_u_64(self.decoded, serializer);
+    sse_encode_u_64(self.presented, serializer);
+    sse_encode_u_64(self.superseded, serializer);
+    sse_encode_latency(self.decode, serializer);
+    sse_encode_latency(self.present, serializer);
+  }
+
+  @protected
   void sse_encode_press(Press self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.index, serializer);
@@ -871,6 +1284,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_u_16(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint16(self);
+  }
+
+  @protected
+  void sse_encode_u_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putUint32(self);
   }
 
   @protected
@@ -962,4 +1381,46 @@ class SessionImpl extends RustOpaque implements Session {
   /// counters are worth.
   VideoStats videoStats() =>
       RustLib.instance.api.crateApiSessionSessionVideoStats(that: this);
+}
+
+@sealed
+class VideoTextureImpl extends RustOpaque implements VideoTexture {
+  // Not to be used by end users
+  VideoTextureImpl.frbInternalDcoDecode(List<dynamic> wire)
+    : super.frbInternalDcoDecode(wire, _kStaticData);
+
+  // Not to be used by end users
+  VideoTextureImpl.frbInternalSseDecode(BigInt ptr, int externalSizeOnNative)
+    : super.frbInternalSseDecode(ptr, externalSizeOnNative, _kStaticData);
+
+  static final _kStaticData = RustArcStaticData(
+    rustArcIncrementStrongCount:
+        RustLib.instance.api.rust_arc_increment_strong_count_VideoTexture,
+    rustArcDecrementStrongCount:
+        RustLib.instance.api.rust_arc_decrement_strong_count_VideoTexture,
+    rustArcDecrementStrongCountPtr:
+        RustLib.instance.api.rust_arc_decrement_strong_count_VideoTexturePtr,
+  );
+
+  /// Tells the decoder the stream has ended.
+  void finish() =>
+      RustLib.instance.api.crateApiVideoVideoTextureFinish(that: this);
+
+  /// The identifier to give a `Texture` widget.
+  PlatformInt64 id() =>
+      RustLib.instance.api.crateApiVideoVideoTextureId(that: this);
+
+  /// Hands one encoded access unit to the decoder.
+  ///
+  /// Synchronous, because a round trip through the isolate for every frame
+  /// would put the thing being measured inside the measurement.
+  ///
+  /// # Errors
+  /// If the decoder rejects the access unit.
+  void push({required List<int> accessUnit}) => RustLib.instance.api
+      .crateApiVideoVideoTexturePush(that: this, accessUnit: accessUnit);
+
+  /// What the path has counted so far.
+  PresentStats stats() =>
+      RustLib.instance.api.crateApiVideoVideoTextureStats(that: this);
 }

@@ -1,6 +1,8 @@
 /// The application, and the one decision it makes: connect screen or session.
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'package:tachyx/src/rust/api/session.dart' as rust;
