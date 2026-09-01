@@ -10,6 +10,8 @@ class _Recorder {
   final List<InputEvent> events = <InputEvent>[];
   int keyboardToggles = 0;
   int dragLocks = 0;
+  int controlsShown = 0;
+  int controlsHidden = 0;
 
   void emit(Duration at, InputEvent event) => events.add(event);
 
@@ -45,6 +47,8 @@ Future<(Touchpad, _Recorder)> _surface(
   final Touchpad pad = Touchpad(
     emit: log.emit,
     toggleKeyboard: () => log.keyboardToggles++,
+    showControls: () => log.controlsShown++,
+    hideControls: () => log.controlsHidden++,
     onDragLock: () => log.dragLocks++,
     scale: scale,
   );
@@ -55,6 +59,20 @@ Future<(Touchpad, _Recorder)> _surface(
     ),
   );
   return (pad, log);
+}
+
+/// Three fingers on the glass, all down before any of them moves.
+Future<List<TestGesture>> _threeFingers(WidgetTester tester) async =>
+    <TestGesture>[
+      await tester.startGesture(const Offset(100, 200), pointer: 4),
+      await tester.startGesture(const Offset(160, 200), pointer: 5),
+      await tester.startGesture(const Offset(220, 200), pointer: 6),
+    ];
+
+Future<void> _lift(List<TestGesture> fingers) async {
+  for (final TestGesture finger in fingers) {
+    await finger.up();
+  }
 }
 
 void main() {
@@ -277,6 +295,158 @@ void main() {
 
       expect(log.events, isEmpty);
       expect(log.keyboardToggles, 0);
+    });
+  });
+
+  group("the client's own controls", () {
+    testWidgets('a three-finger swipe down asks for them', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester);
+      final List<TestGesture> fingers = await _threeFingers(tester);
+      for (final TestGesture finger in fingers) {
+        await finger.moveBy(const Offset(0, 40));
+      }
+
+      // Asserted before the fingers lift: the swipe is read from how far they
+      // have got, so nothing is waiting on the end of the gesture.
+      expect(log.controlsShown, 1);
+      expect(log.controlsHidden, 0);
+
+      await _lift(fingers);
+      expect(log.events, isEmpty, reason: 'a swipe is not a click');
+      expect(
+        log.keyboardToggles,
+        0,
+        reason: 'a swipe left the slop, so it was never a tap',
+      );
+    });
+
+    testWidgets('a three-finger swipe up puts them away', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester);
+      final List<TestGesture> fingers = await _threeFingers(tester);
+      for (final TestGesture finger in fingers) {
+        await finger.moveBy(const Offset(0, -40));
+      }
+      await _lift(fingers);
+
+      expect(log.controlsHidden, 1);
+      expect(log.controlsShown, 0);
+      expect(log.events, isEmpty);
+    });
+
+    testWidgets('one swipe asks once, however far the fingers travel', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester);
+      final List<TestGesture> fingers = await _threeFingers(tester);
+      for (int i = 0; i < 6; i++) {
+        for (final TestGesture finger in fingers) {
+          await finger.moveBy(const Offset(0, 30));
+        }
+      }
+      await _lift(fingers);
+
+      expect(log.controlsShown, 1);
+    });
+
+    testWidgets('three fingers travelling sideways say nothing', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester);
+      final List<TestGesture> fingers = await _threeFingers(tester);
+      for (final TestGesture finger in fingers) {
+        await finger.moveBy(const Offset(120, 0));
+      }
+      await _lift(fingers);
+
+      expect(log.controlsShown, 0);
+      expect(log.controlsHidden, 0);
+      expect(log.events, isEmpty);
+      expect(log.keyboardToggles, 0);
+    });
+
+    testWidgets('no row of the table above asks for them', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester);
+
+      final TestGesture tap = await tester.startGesture(const Offset(100, 100));
+      await tap.up();
+      expect(log.buttons, <InputEvent>[
+        _press(PointerButton.left),
+        _release(PointerButton.left),
+      ], reason: 'one-finger tap is still a left click');
+
+      final TestGesture second = await tester.startGesture(
+        const Offset(100, 100),
+        pointer: 2,
+      );
+      final TestGesture third = await tester.startGesture(
+        const Offset(160, 100),
+        pointer: 3,
+      );
+      await second.up();
+      await third.up();
+      expect(log.buttons.last, _release(PointerButton.right),
+          reason: 'two-finger tap is still a right click');
+
+      final List<TestGesture> resting = await _threeFingers(tester);
+      await _lift(resting);
+      expect(
+        log.keyboardToggles,
+        1,
+        reason: 'three fingers that stay put still toggle the keyboard',
+      );
+
+      final TestGesture drag = await tester.startGesture(
+        const Offset(100, 100),
+        pointer: 7,
+      );
+      await drag.moveBy(const Offset(0, 40));
+      await drag.up();
+      expect(
+        log.travelled,
+        const Offset(0, 40),
+        reason: 'one finger still moves the pointer, downwards included',
+      );
+
+      final TestGesture pairLeft = await tester.startGesture(
+        const Offset(100, 300),
+        pointer: 8,
+      );
+      final TestGesture pairRight = await tester.startGesture(
+        const Offset(160, 300),
+        pointer: 9,
+      );
+      await pairLeft.moveBy(const Offset(0, 40));
+      await pairRight.moveBy(const Offset(0, 40));
+      await pairLeft.up();
+      await pairRight.up();
+      expect(
+        log.scrolled,
+        const Offset(0, 40),
+        reason: 'two fingers still scroll, downwards included',
+      );
+
+      final TestGesture held = await tester.startGesture(
+        const Offset(400, 300),
+        pointer: 10,
+      );
+      await held.moveBy(
+        const Offset(0, 40),
+        timeStamp: const Duration(milliseconds: 600),
+      );
+      await held.up();
+      expect(log.dragLocks, 1, reason: 'a long press still locks the drag');
+
+      expect(
+        <int>[log.controlsShown, log.controlsHidden],
+        <int>[0, 0],
+        reason: 'not one row of the table reached the controls',
+      );
     });
   });
 

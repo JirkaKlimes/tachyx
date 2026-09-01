@@ -22,6 +22,13 @@ import 'package:tachyx/src/ui/video_texture_view.dart';
 
 /// The remote desktop, and the touch surface that drives it.
 ///
+/// The picture is the whole window, under the system bars and all. Everything
+/// the client draws of its own is an overlay that arrives when it is asked for:
+/// a bar that says where the session is and offers a way out of it, and the
+/// statistics panel. A three-finger swipe down brings both back, a three-finger
+/// swipe up puts both away, and the bar retires by itself. See [Touchpad] for
+/// why that gesture and not an edge swipe.
+///
 /// There is no [Scaffold] here on purpose. The Android template asks for
 /// `adjustResize`, and a scaffold would take the on-screen keyboard's inset out
 /// of the surface, shrinking the picture every time the user typed. The
@@ -62,13 +69,21 @@ class _SessionScreenState extends State<SessionScreen>
   /// The shape a picture is drawn at before the host has said what it is.
   static const double _unknownAspect = 16 / 9;
 
+  /// How long the bar stays before it retires on its own. Long enough to read
+  /// the address and reach a button, short enough that nobody has to dismiss
+  /// it. The statistics panel is not on this clock: it is read for as long as
+  /// the reader wants it, and there is a gesture that puts it away.
+  static const Duration _barLingers = Duration(seconds: 5);
+
   final InputPipe _pipe = InputPipe();
   late final CursorFeed _cursor;
   late final Touchpad _pad;
   late final HardwareKeys _keys;
   late final SoftKeyboard _soft;
   Timer? _sampler;
+  Timer? _linger;
   bool _showStats = true;
+  bool _showBar = true;
   SessionStats? _stats;
   Presentation? _presentation;
   bool _presenting = false;
@@ -87,11 +102,17 @@ class _SessionScreenState extends State<SessionScreen>
     _pad = Touchpad(
       emit: _pipe.send,
       toggleKeyboard: _toggleKeyboard,
+      showControls: _reveal,
+      hideControls: _dismiss,
       onDragLock: _buzz,
     );
     _keys = HardwareKeys(_pipe.send)..attach();
     WidgetsBinding.instance.addObserver(this);
     _sampler = Timer.periodic(_sampleEvery, (_) => _sample());
+    // A session opens with its own chrome showing. It says which host was
+    // reached, it puts the gesture that brings it back in front of the user
+    // once, and then it gets out of the way without being asked.
+    _linger = Timer(_barLingers, _retire);
   }
 
   @override
@@ -136,6 +157,7 @@ class _SessionScreenState extends State<SessionScreen>
   @override
   void dispose() {
     _sampler?.cancel();
+    _linger?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _keys.detach();
     _soft.hide();
@@ -223,6 +245,39 @@ class _SessionScreenState extends State<SessionScreen>
     setState(() {});
   }
 
+  /// Brings the client's own chrome back, statistics and all.
+  void _reveal() {
+    _linger?.cancel();
+    _linger = Timer(_barLingers, _retire);
+    setState(() {
+      _showBar = true;
+      _showStats = true;
+    });
+  }
+
+  /// Takes everything the client draws off the picture.
+  void _dismiss() {
+    _linger?.cancel();
+    _linger = null;
+    setState(() {
+      _showBar = false;
+      _showStats = false;
+    });
+  }
+
+  /// The bar's own countdown, which leaves the panel where it is.
+  void _retire() {
+    if (!mounted) return;
+    setState(() => _showBar = false);
+  }
+
+  /// Drops or restores the panel without losing the bar that asked for it.
+  void _toggleStats() {
+    _linger?.cancel();
+    _linger = Timer(_barLingers, _retire);
+    setState(() => _showStats = !_showStats);
+  }
+
   void _buzz() =>
       unawaited(HapticFeedback.selectionClick().catchError((Object _) {}));
 
@@ -249,95 +304,149 @@ class _SessionScreenState extends State<SessionScreen>
 
   @override
   Widget build(BuildContext context) {
-    final bool keyboardUp = MediaQuery.viewInsetsOf(context).bottom > 0;
+    final MediaQueryData media = MediaQuery.of(context);
+    final bool keyboardUp = media.viewInsets.bottom > 0;
     return Material(
       color: Shade.ground,
-      child: SafeArea(
-        bottom: false,
-        child: Column(
-          children: <Widget>[
-            _TopBar(
-              address: widget.address,
-              showingStats: _showStats,
-              onToggleStats: () => setState(() => _showStats = !_showStats),
-              onLeave: widget.onLeave,
-            ),
-            Expanded(
-              child: Stack(
-                children: <Widget>[
-                  Positioned.fill(
-                    child: TouchSurface(pad: _pad, child: _picture()),
-                  ),
-                  if (_showStats)
-                    Positioned(
-                      left: 12,
-                      top: 12,
-                      child: IgnorePointer(
-                        child: StatsOverlay(
-                          host: widget.address,
-                          protocolVersion: widget.protocolVersion,
-                          eventsSent: _pipe.sent,
-                          lastEvent: _pipe.last,
-                          keyboardUp: keyboardUp,
-                          stats: _stats,
-                        ),
-                      ),
+      child: Stack(
+        children: <Widget>[
+          // The picture takes the window whole. Nothing above it is laid out
+          // against it, so the viewport the hello named is still the area the
+          // video occupies, and the host keeps encoding for the screen that is
+          // really there.
+          Positioned.fill(child: TouchSurface(pad: _pad, child: _picture())),
+          // The panel keeps the top left corner and the bar takes the bottom
+          // right, so that the two never cover each other on a screen as short
+          // as a phone held sideways.
+          if (_showStats)
+            Positioned(
+              left: 0,
+              top: 0,
+              child: SafeArea(
+                bottom: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+                  child: IgnorePointer(
+                    child: StatsOverlay(
+                      host: widget.address,
+                      protocolVersion: widget.protocolVersion,
+                      eventsSent: _pipe.sent,
+                      lastEvent: _pipe.last,
+                      keyboardUp: keyboardUp,
+                      stats: _stats,
                     ),
-                ],
+                  ),
+                ),
               ),
             ),
-          ],
-        ),
+          Positioned(
+            left: 0,
+            right: 0,
+            // Above the on-screen keyboard rather than behind it, so that the
+            // way out of the session is reachable while the user is typing.
+            bottom: media.viewInsets.bottom,
+            child: SafeArea(
+              top: false,
+              child: _ControlBar(
+                showing: _showBar,
+                address: widget.address,
+                showingStats: _showStats,
+                onToggleStats: _toggleStats,
+                onLeave: widget.onLeave,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
-class _TopBar extends StatelessWidget {
-  const _TopBar({
+/// The controls, which are on the glass only while they are wanted.
+///
+/// Built whether or not it is [showing], so that it can slide off the bottom
+/// edge rather than blink out, and made deaf to touch while it is away so that
+/// none of the surface under it stops being a trackpad.
+class _ControlBar extends StatelessWidget {
+  const _ControlBar({
+    required this.showing,
     required this.address,
     required this.showingStats,
     required this.onToggleStats,
     required this.onLeave,
   });
 
+  /// Long enough to read as a movement, short enough not to be waited on.
+  static const Duration _slide = Duration(milliseconds: 160);
+
+  final bool showing;
   final String? address;
   final bool showingStats;
   final VoidCallback onToggleStats;
   final VoidCallback onLeave;
 
   @override
-  Widget build(BuildContext context) => DecoratedBox(
-    decoration: const BoxDecoration(
-      border: Border(bottom: BorderSide(color: Shade.edge)),
-    ),
-    child: SizedBox(
-      height: 44,
-      child: Row(
-        children: <Widget>[
-          IconButton(
-            onPressed: onLeave,
-            icon: const Icon(Icons.arrow_back, size: 18),
-            color: Shade.faint,
-            tooltip: 'leave',
-          ),
-          Expanded(
-            child: Text(
-              address ?? 'no host — input monitor',
-              style: readout.copyWith(
-                color: address == null ? Shade.faint : Shade.text,
+  Widget build(BuildContext context) => IgnorePointer(
+    ignoring: !showing,
+    child: AnimatedSlide(
+      offset: showing ? Offset.zero : const Offset(0, 1),
+      duration: _slide,
+      curve: Curves.easeOut,
+      child: AnimatedOpacity(
+        opacity: showing ? 1 : 0,
+        duration: _slide,
+        child: Align(
+          alignment: Alignment.bottomRight,
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Shade.panel,
+                border: Border.all(color: Shade.edge),
+                borderRadius: BorderRadius.circular(6),
               ),
-              overflow: TextOverflow.ellipsis,
+              child: SizedBox(height: 44, child: _row()),
             ),
           ),
-          IconButton(
-            onPressed: onToggleStats,
-            icon: const Icon(Icons.data_usage, size: 18),
-            color: showingStats ? Shade.good : Shade.faint,
-            tooltip: 'statistics',
-          ),
-        ],
+        ),
       ),
     ),
+  );
+
+  Widget _row() => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: <Widget>[
+      IconButton(
+        onPressed: onLeave,
+        icon: const Icon(Icons.arrow_back, size: 18),
+        color: Shade.faint,
+        tooltip: 'leave',
+      ),
+      Flexible(
+        child: Text(
+          address ?? 'no host — input monitor',
+          style: readout.copyWith(
+            color: address == null ? Shade.faint : Shade.text,
+          ),
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
+      // The only place the gesture is written down. The bar shows itself once
+      // when a session opens, which is the one moment it can say how to ask
+      // for it again.
+      const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 10),
+        child: Text(
+          'three fingers ↕',
+          style: TextStyle(color: Shade.faint, fontSize: 11),
+        ),
+      ),
+      IconButton(
+        onPressed: onToggleStats,
+        icon: const Icon(Icons.data_usage, size: 18),
+        color: showingStats ? Shade.good : Shade.faint,
+        tooltip: 'statistics',
+      ),
+    ],
   );
 }

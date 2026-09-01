@@ -96,6 +96,8 @@ const List<(int, PointerButton)> _mouseButtons = <(int, PointerButton)>[
 /// | One-finger drag | Move the pointer |
 /// | Two-finger drag | Scroll |
 /// | Long press, then drag | Move the pointer with the left button held |
+/// | Three-finger swipe down | Show the client's own controls |
+/// | Three-finger swipe up | Hide them |
 ///
 /// There are no timers. The largest number of fingers that were down at once is
 /// latched on the way down, and the gesture is decided when the last one
@@ -109,6 +111,8 @@ class Touchpad {
   Touchpad({
     required this.emit,
     required this.toggleKeyboard,
+    this.showControls,
+    this.hideControls,
     this.onDragLock,
     this.scale = ImageScale.identity,
     this.slop = kTouchSlop,
@@ -123,6 +127,12 @@ class Touchpad {
 
   /// Asked for by a three-finger tap.
   final VoidCallback toggleKeyboard;
+
+  /// Asked for by a three-finger swipe down.
+  final VoidCallback? showControls;
+
+  /// Asked for by a three-finger swipe up.
+  final VoidCallback? hideControls;
 
   /// Called when a long press turns into a held button, for haptic feedback.
   final VoidCallback? onDragLock;
@@ -147,6 +157,10 @@ class Touchpad {
 
   bool _dragLocked = false;
   bool _scrolled = false;
+
+  /// Whether this gesture has already been read as a three-finger swipe, so
+  /// that a swipe asks once rather than on every move that follows it.
+  bool _swiped = false;
 
   /// Mouse buttons currently held, as a [PointerEvent.buttons] mask.
   int _held = 0;
@@ -200,8 +214,10 @@ class Touchpad {
         // Each finger contributes its share of the movement of the pair, so two
         // fingers moving together scroll by what one of them travelled.
         _scroll(event.timeStamp, event.delta / _fingers.length.toDouble());
+      case 3:
+        _swipe(event.position - finger.origin);
       default:
-        // Three fingers or more say nothing until they lift.
+        // Four fingers or more say nothing until they lift.
         break;
     }
   }
@@ -278,6 +294,26 @@ class Touchpad {
     _reach = 0;
     _dragLocked = false;
     _scrolled = false;
+    _swiped = false;
+  }
+
+  /// Reads three fingers that are travelling as a request for the controls.
+  ///
+  /// Three fingers that move are the one thing on this surface that meant
+  /// nothing, so the client's own chrome can be hung on them without making a
+  /// single row of the table above ambiguous, and without costing the remote
+  /// desktop a pixel of the glass. It needs no timer either: [from] is where
+  /// the finger has got to since it landed, so the swipe is decided by distance
+  /// exactly as every other gesture here is.
+  ///
+  /// A three-finger tap still toggles the keyboard, because a tap is a gesture
+  /// that stayed inside [slop] and this one has left it.
+  void _swipe(Offset from) {
+    if (_swiped || from.dy.abs() <= slop || from.dy.abs() <= from.dx.abs()) {
+      return;
+    }
+    _swiped = true;
+    (from.dy > 0 ? showControls : hideControls)?.call();
   }
 
   void _motion(Duration at, Offset delta) {

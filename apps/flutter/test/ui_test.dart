@@ -3,12 +3,14 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException;
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:tachyx/src/input/touchpad.dart';
 import 'package:tachyx/src/rust/api/input.dart';
 import 'package:tachyx/src/rust/api/session.dart'
     show Encoding, HostReport, Liveness, SessionStats, VideoStats;
 import 'package:tachyx/src/rust/api/video.dart' show Latency, PresentStats;
 import 'package:tachyx/src/session/link.dart';
 import 'package:tachyx/src/ui/connect_screen.dart';
+import 'package:tachyx/src/ui/session_screen.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 
 Widget _wrap(Widget child) => MaterialApp(home: child);
@@ -307,6 +309,108 @@ void main() {
       await tester.pump();
 
       expect(dials, 0);
+    });
+  });
+
+  group('the session screen', () {
+    // Pointer identifiers are never reused, because a run may leave one down
+    // in the framework's own bookkeeping and the next gesture would then be
+    // read as a continuation of it.
+    int pointer = 0;
+
+    /// A session with no host, which is the one shape a widget test can build:
+    /// anything else needs the client core on the other end.
+    Future<void> pumpSession(WidgetTester tester, {VoidCallback? onLeave}) =>
+        tester.pumpWidget(
+          _wrap(SessionScreen(protocolVersion: 1, onLeave: onLeave ?? () {})),
+        );
+
+    /// Three fingers travelling [by] on the pad, and the frames that follow.
+    Future<void> swipe(WidgetTester tester, Offset by) async {
+      final List<TestGesture> fingers = <TestGesture>[
+        for (final double x in <double>[300, 360, 420])
+          await tester.startGesture(Offset(x, 300), pointer: ++pointer),
+      ];
+      for (final TestGesture finger in fingers) {
+        await finger.moveBy(by);
+      }
+      for (final TestGesture finger in fingers) {
+        await finger.up();
+      }
+      await tester.pump();
+      // Not pumpAndSettle: the counters are sampled on a periodic timer, so
+      // there is always another frame coming and settling never arrives.
+      await tester.pump(const Duration(milliseconds: 250));
+    }
+
+    /// Where the bar has been told to sit, in multiples of its own height.
+    Offset barOffset(WidgetTester tester) =>
+        tester.widget<AnimatedSlide>(find.byType(AnimatedSlide)).offset;
+
+    testWidgets('the picture is the whole window', (WidgetTester tester) async {
+      await pumpSession(tester);
+
+      expect(
+        tester.getSize(find.byType(TouchSurface)),
+        tester.view.physicalSize / tester.view.devicePixelRatio,
+        reason: 'the host encodes for the viewport the client named, so the '
+            'video has to be the whole of it',
+      );
+
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('a three-finger swipe puts the chrome away and brings it back', (
+      WidgetTester tester,
+    ) async {
+      await pumpSession(tester);
+      expect(find.byType(StatsOverlay), findsOneWidget);
+
+      await swipe(tester, const Offset(0, -60));
+
+      expect(find.byType(StatsOverlay), findsNothing);
+      expect(barOffset(tester), const Offset(0, 1), reason: 'off the bottom');
+
+      await swipe(tester, const Offset(0, 60));
+
+      expect(find.byType(StatsOverlay), findsOneWidget);
+      expect(barOffset(tester), Offset.zero);
+
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('the bar retires on its own and leaves the panel', (
+      WidgetTester tester,
+    ) async {
+      await pumpSession(tester);
+      expect(barOffset(tester), Offset.zero);
+
+      await tester.pump(const Duration(seconds: 6));
+      await tester.pump(const Duration(milliseconds: 250));
+
+      expect(barOffset(tester), const Offset(0, 1));
+      expect(
+        find.byType(StatsOverlay),
+        findsOneWidget,
+        reason: 'the panel is read for as long as its reader wants it',
+      );
+
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('a bar that is away takes no touch from the pad', (
+      WidgetTester tester,
+    ) async {
+      int left = 0;
+      await pumpSession(tester, onLeave: () => left++);
+      await swipe(tester, const Offset(0, -60));
+
+      await tester.tap(find.byTooltip('leave'), warnIfMissed: false);
+      await tester.pump();
+
+      expect(left, 0);
+
+      await tester.pumpWidget(const SizedBox());
     });
   });
 
