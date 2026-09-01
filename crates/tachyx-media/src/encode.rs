@@ -208,6 +208,15 @@ pub struct EncodeStats {
     pub paced: u64,
     /// Time from handing a frame to the pipeline to holding its access unit.
     pub latency: Percentiles,
+    /// Bytes of the most recent key frame, filler removed. Zero until one has
+    /// been encoded.
+    ///
+    /// What the key frame budget in `tachyx-hostd` prices its refusals from. It
+    /// opens on a 1080p estimate of 130 kB, and a 720p key frame at a narrow
+    /// target is a fraction of that: left unmeasured, the budget refuses a
+    /// client whose picture is broken for seconds longer than the link
+    /// requires.
+    pub key_frame_bytes: u64,
 }
 
 impl EncodeStats {
@@ -870,6 +879,9 @@ fn pump(
         };
         bucket.charge(unit.bytes.len());
         if matches!(unit.kind, FrameKind::Key) {
+            counters
+                .key_frame_bytes
+                .store(unit.bytes.len() as u64, Ordering::Relaxed);
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a frame size is far below the exact integer range of a double"
@@ -971,6 +983,7 @@ struct Counters {
     refused: AtomicU64,
     gated: AtomicU64,
     paced: AtomicU64,
+    key_frame_bytes: AtomicU64,
     latency: Mutex<Samples>,
 }
 
@@ -990,6 +1003,7 @@ impl Counters {
             refused: self.refused.load(Ordering::Relaxed),
             gated: self.gated.load(Ordering::Relaxed),
             paced: self.paced.load(Ordering::Relaxed),
+            key_frame_bytes: self.key_frame_bytes.load(Ordering::Relaxed),
             latency: self
                 .latency
                 .lock()

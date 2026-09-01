@@ -272,7 +272,7 @@ impl Live {
         } else {
             Reason::Resolution
         };
-        if self.budget.request(reason, now) == Verdict::Refuse {
+        if self.spend_key_frame(reason, now) == Verdict::Refuse {
             return Ok(());
         }
         if want.size != held.size {
@@ -294,9 +294,26 @@ impl Live {
         Ok(())
     }
 
+    /// Asks the budget for a key frame, telling it first what one now costs.
+    ///
+    /// The budget opens on a 1080p estimate of 130 kB, and its refusal
+    /// interval is that size over a fixed share of the target bitrate. Left
+    /// unmeasured, a 720p session at the 2 Mbit/s opening target refuses every
+    /// repair for 3.5 seconds, which was measured as 413 of 848 frames thrown
+    /// away undecodable: each break in the reference chain froze the picture
+    /// for the whole refusal interval, at twenty frames a second.
+    fn spend_key_frame(&mut self, reason: Reason, now: Instant) -> Verdict {
+        answer(
+            &mut self.budget,
+            self.encoder.stats().key_frame_bytes,
+            reason,
+            now,
+        )
+    }
+
     /// The client lost a frame and cannot continue from what it holds.
     fn keyframe_request(&mut self, now: Instant) {
-        if self.budget.request(Reason::ClientRequest, now) == Verdict::Allow {
+        if self.spend_key_frame(Reason::ClientRequest, now) == Verdict::Allow {
             self.encoder.force_keyframe();
             self.last_key = now;
         }
@@ -328,7 +345,7 @@ impl Live {
     /// frame a client needs to be able to decode.
     fn repair_if_stale(&mut self, now: Instant) {
         if now.duration_since(self.last_key) >= KEY_FRAME_MAX_AGE
-            && self.budget.request(Reason::Periodic, now) == Verdict::Allow
+            && self.spend_key_frame(Reason::Periodic, now) == Verdict::Allow
         {
             self.encoder.force_keyframe();
             self.last_key = now;
@@ -346,7 +363,7 @@ impl Live {
         };
         match owed {
             Reason::ClientRequest | Reason::Periodic | Reason::Startup => {
-                if self.budget.request(owed, now) == Verdict::Allow {
+                if self.spend_key_frame(owed, now) == Verdict::Allow {
                     self.encoder.force_keyframe();
                     self.last_key = now;
                 }
@@ -593,6 +610,20 @@ fn release(
     })
 }
 
+/// The verdict for one cause of a key frame, priced at what the last key frame
+/// really cost.
+///
+/// The measurement goes in on the same call that spends, rather than on a tick
+/// of its own, so the budget can never refuse on a price the encoder has
+/// already disproved. `measured` is zero until a key frame has been encoded,
+/// and the budget's opening estimate stands until then.
+fn answer(budget: &mut Budget, measured: u64, reason: Reason, now: Instant) -> Verdict {
+    if let Some(bytes) = u32::try_from(measured).ok().filter(|bytes| *bytes > 0) {
+        budget.observe(bytes);
+    }
+    budget.request(reason, now)
+}
+
 /// What the encoder has done, as the ladder reads it.
 fn produced(encoder: &Encoder) -> Produced {
     let stats = encoder.stats();
@@ -778,7 +809,41 @@ fn narrow(value: u32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::halving_for;
+    use std::time::{Duration, Instant};
+
+    use super::{Budget, Reason, Verdict, answer, halving_for};
+
+    /// The session measured on the phone: 1720x720 at the 2 Mbit/s opening
+    /// target, a break in the reference chain, and a client repeating its
+    /// request every 250 ms. Priced at the budget's 1080p opening estimate the
+    /// refusal lasts 3.5 seconds, and the client showed 413 of 848 frames
+    /// thrown away undecodable, ten frames of freeze per break. Priced at what
+    /// the 720p key frame really cost, the repair is answered on the next
+    /// request.
+    #[test]
+    fn a_repair_at_a_narrow_target_is_priced_at_the_measured_key_frame() {
+        let start = Instant::now();
+        let mut budget = Budget::new(2_000_000);
+        budget.request(Reason::Startup, start);
+
+        // The opening key frame the startup request bought: 26 kB measured at
+        // 1720x720 and 2 Mbit/s, an eighth of the 130 kB opening estimate.
+        let measured = 26_000;
+
+        // The chain breaks one second in, and the client asks four times a
+        // second until the picture is repaired.
+        let broken = start + Duration::from_secs(1);
+        let answered = (0..8u32)
+            .map(|ask| broken + Duration::from_millis(250) * ask)
+            .find(|now| {
+                answer(&mut budget, measured, Reason::ClientRequest, *now) == Verdict::Allow
+            })
+            .map(|now| now.duration_since(broken));
+        assert!(
+            answered.is_some_and(|waited| waited <= Duration::from_secs(1)),
+            "a repair the link can afford within a second was refused: {answered:?}"
+        );
+    }
 
     #[test]
     fn a_viewport_no_halving_covers_is_not_answered_with_the_whole_picture() {
