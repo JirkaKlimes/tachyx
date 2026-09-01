@@ -1,0 +1,10 @@
+# Names that are spelled this way and are not code, so `doc_markdown` must not
+# ask for backticks around them. `..` keeps clippy's own list.
+doc-valid-idents = [
+  "..",
+  "GStreamer",
+  "GBM",
+  "DMA-BUF",
+  "VA-API",
+  "Wayland",
+]

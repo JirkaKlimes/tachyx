@@ -1,0 +1,30 @@
+[package]
+name = "tachyx-media"
+description = "Wayland screen capture and VA-API H.264 encode for the tachyx host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tachyx-dmabuf.workspace = true
+tachyx-proto.workspace = true
+
+gbm.workspace = true
+gstreamer.workspace = true
+gstreamer-allocators.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+
+[dev-dependencies]
+clap.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

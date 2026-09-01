@@ -1,0 +1,784 @@
+//! The `vah264enc` pipeline: `appsrc ! vapostproc ! capsfilter ! vah264enc ! appsink`.
+//!
+//! The source pushes the capture's own size and keeps that size for the life of
+//! the pipeline, because a fixed-size capture cannot renegotiate. The resolution
+//! ladder is a caps filter between the scaler and the encoder, which applies in
+//! 0.03 ms and takes effect on the very next frame.
+
+use std::collections::HashMap;
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_allocators::DmaBufAllocator;
+use gstreamer_app::{AppSink, AppSrc};
+use gstreamer_video as gst_video;
+use tachyx_proto::media::{FrameId, FrameKind, Timestamp};
+
+use crate::capture::{CaptureFormat, Frames};
+use crate::slot::Slot;
+use crate::{EncodeSize, Error, Rate, Size};
+
+/// How long to wait for the encoder to answer for a frame that was pushed.
+///
+/// The chain is synchronous, so this is a bound on a stall rather than a normal
+/// wait: an encoder that has stopped answering must be reported, not waited on.
+const OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Floor on how often a key frame may be forced.
+///
+/// The property's own default is no limit at all. A client that has lost
+/// synchronisation cannot use anything before the next key frame, so the floor
+/// only has to be short enough not to be felt, while still stopping a burst of
+/// recovery requests from turning the whole stream into key frames.
+const MIN_KEYFRAME_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The NAL unit type that carries padding and nothing else.
+const NAL_FILLER: u8 = 12;
+
+/// What to encode, and at what rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeConfig {
+    /// Picture size to send. Anything other than the capture's own size makes
+    /// the scaler do work, so the ladder starts at the capture size.
+    pub size: EncodeSize,
+    /// Bits per second and the frame rate they are divided by.
+    pub rate: Rate,
+}
+
+/// The geometry a decoder needs, which the bitstream does not fully carry.
+///
+/// H.264 expresses a size the macroblock grid cannot hold by coding a larger
+/// picture and attaching a crop, and the scaler's aspect correction never
+/// reaches the sequence parameter set at all, so all three travel in the stream
+/// configuration message instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamGeometry {
+    /// The size the bitstream codes.
+    pub coded: Size,
+    /// The size a decoder must show.
+    pub visible: Size,
+    /// Width to height of the visible picture, in lowest terms.
+    pub display_aspect: (u32, u32),
+}
+
+/// One encoded picture, ready for the packetiser.
+#[derive(Debug, Clone)]
+pub struct AccessUnit {
+    /// Position in the encoded sequence, and the reassembly key on the wire.
+    pub frame: FrameId,
+    /// When the picture was captured.
+    pub captured: Timestamp,
+    /// Whether the picture stands alone.
+    pub kind: FrameKind,
+    /// The access unit in Annex B form, parameter sets included before every
+    /// key frame, filler removed.
+    pub bytes: Vec<u8>,
+}
+
+/// The encoder's output.
+#[derive(Debug)]
+pub struct AccessUnits(Receiver<AccessUnit>);
+
+impl AccessUnits {
+    /// Waits for the next access unit, or returns `None` once encoding has
+    /// ended.
+    #[must_use]
+    pub fn recv(&self) -> Option<AccessUnit> {
+        self.0.recv().ok()
+    }
+}
+
+/// Percentiles of a timing sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Percentiles {
+    /// Median.
+    pub p50: Duration,
+    /// Ninetieth percentile.
+    pub p90: Duration,
+    /// Ninety-ninth percentile.
+    pub p99: Duration,
+    /// Worst sample held.
+    pub max: Duration,
+}
+
+/// What the encoder has done so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EncodeStats {
+    /// Access units emitted.
+    pub encoded: u64,
+    /// Bytes emitted, after filler was removed.
+    pub bytes: u64,
+    /// Bytes of filler the encoder emitted and this crate discarded.
+    pub filler_bytes: u64,
+    /// Time from handing a frame to the pipeline to holding its access unit.
+    pub latency: Percentiles,
+}
+
+impl EncodeStats {
+    /// Share of the encoder's output that was padding.
+    #[must_use]
+    pub fn filler_fraction(&self) -> f64 {
+        let total = self.bytes + self.filler_bytes;
+        if total == 0 {
+            return 0.0;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a ratio does not need the last bit of a byte count"
+        )]
+        {
+            self.filler_bytes as f64 / total as f64
+        }
+    }
+}
+
+/// A running encode of one capture.
+///
+/// Dropping this stops the encode thread. The capture that feeds it is stopped
+/// separately, and in either order.
+#[derive(Debug)]
+pub struct Encoder {
+    control: Arc<Control>,
+    counters: Arc<Counters>,
+    source: Arc<Slot<crate::Frame>>,
+    thread: Option<JoinHandle<Result<(), Error>>>,
+}
+
+impl Encoder {
+    /// Builds the pipeline and starts a thread that drains `frames` into it.
+    ///
+    /// # Errors
+    /// If GStreamer lacks an element, the pipeline will not start, or the
+    /// capture's buffer layout cannot be described to it.
+    pub fn start(frames: Frames, config: EncodeConfig) -> Result<(Self, AccessUnits), Error> {
+        gst::init()?;
+        let control = Arc::new(Control::build(frames.format(), config)?);
+        let counters = Arc::new(Counters::default());
+        let (sender, receiver) = sync_channel(2);
+        let source = frames.slot();
+
+        let thread = {
+            let control = Arc::clone(&control);
+            let counters = Arc::clone(&counters);
+            std::thread::Builder::new()
+                .name("tachyx-encode".to_owned())
+                .spawn(move || pump(&frames, &control, &counters, &sender))?
+        };
+
+        Ok((
+            Self {
+                control,
+                counters,
+                source,
+                thread: Some(thread),
+            },
+            AccessUnits(receiver),
+        ))
+    }
+
+    /// The geometry the current settings produce.
+    #[must_use]
+    pub fn geometry(&self) -> StreamGeometry {
+        let size = self.control.settings().size;
+        StreamGeometry {
+            coded: size.coded(),
+            visible: size.visible(),
+            display_aspect: size.display_aspect(),
+        }
+    }
+
+    /// The rate the encoder is spending to.
+    #[must_use]
+    pub fn rate(&self) -> Rate {
+        self.control.settings().rate
+    }
+
+    /// Sets the bitrate and the frame rate it is divided by.
+    ///
+    /// Both move together because the encoder spends `bitrate / framerate` on
+    /// every picture and ignores presentation timestamps, so changing one alone
+    /// scales the real rate by the ratio between them. This forces a key frame:
+    /// the property setter marks the encoder for reconfiguration, and
+    /// reconfiguration resets its state.
+    ///
+    /// # Errors
+    /// If the source caps cannot be rebuilt.
+    pub fn set_rate(&self, rate: Rate) -> Result<(), Error> {
+        {
+            let mut settings = self.control.settings.lock().expect("settings mutex");
+            settings.rate = rate;
+        }
+        self.control.apply_rate(rate)
+    }
+
+    /// Moves to another rung of the resolution ladder.
+    ///
+    /// Takes effect on the very next frame and drops nothing.
+    ///
+    /// # Errors
+    /// If the filter caps cannot be built.
+    pub fn set_resolution(&self, size: EncodeSize) -> Result<(), Error> {
+        {
+            let mut settings = self.control.settings.lock().expect("settings mutex");
+            settings.size = size;
+        }
+        self.control.apply_size(size);
+        Ok(())
+    }
+
+    /// Asks for a key frame on the next picture, parameter sets included.
+    pub fn force_keyframe(&self) {
+        let event = gst_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        if let Some(pad) = self.control.encoder.static_pad("src") {
+            pad.send_event(event);
+        }
+    }
+
+    /// Counters since the pipeline started.
+    #[must_use]
+    pub fn stats(&self) -> EncodeStats {
+        self.counters.snapshot()
+    }
+
+    /// Stops encoding and reports how the thread ended.
+    ///
+    /// # Errors
+    /// Whatever ended the encode thread, unless it was this call.
+    pub fn stop(mut self) -> Result<(), Error> {
+        let thread = self.thread.take();
+        self.source.close();
+        match thread.map(JoinHandle::join) {
+            Some(Ok(result)) => result,
+            Some(Err(_)) => Err(Error::Gst("the encode thread panicked".to_owned())),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.source.close();
+        if let Ok(Err(error)) = thread.join() {
+            tracing::warn!(%error, "encoding ended in an error");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Settings {
+    size: EncodeSize,
+    rate: Rate,
+}
+
+/// The pipeline and everything needed to change its mind about it.
+#[derive(Debug)]
+struct Control {
+    pipeline: gst::Pipeline,
+    source: AppSrc,
+    filter: gst::Element,
+    encoder: gst::Element,
+    sink: AppSink,
+    settings: Mutex<Settings>,
+    capture: Size,
+    fourcc: u32,
+    modifier: u64,
+    length: usize,
+    offsets: Vec<usize>,
+    strides: Vec<i32>,
+}
+
+impl Control {
+    fn build(format: &CaptureFormat, config: EncodeConfig) -> Result<Self, Error> {
+        let source = AppSrc::builder()
+            .format(gst::Format::Time)
+            .is_live(true)
+            .do_timestamp(false)
+            .block(true)
+            .build();
+        source.set_max_buffers(1);
+        let scaler = make("vapostproc")?;
+        // The scaler drops frames to meet a deadline nobody set here, and
+        // letterboxes rather than stretching, because the pixel aspect ratio it
+        // would otherwise record never reaches the bitstream.
+        scaler.set_property("qos", false);
+        scaler.set_property("add-borders", true);
+        let filter = make("capsfilter")?;
+        let encoder = make("vah264enc")?;
+        configure_encoder(&encoder)?;
+        let sink = AppSink::builder()
+            .sync(false)
+            .max_buffers(1u32)
+            .drop(false)
+            .build();
+
+        let pipeline = gst::Pipeline::new();
+        let elements = [
+            source.upcast_ref::<gst::Element>(),
+            &scaler,
+            &filter,
+            &encoder,
+            sink.upcast_ref::<gst::Element>(),
+        ];
+        pipeline.add_many(elements)?;
+        gst::Element::link_many(elements)?;
+
+        let control = Self {
+            pipeline,
+            source,
+            filter,
+            encoder,
+            sink,
+            settings: Mutex::new(Settings {
+                size: config.size,
+                rate: config.rate,
+            }),
+            capture: format.size,
+            fourcc: format.fourcc,
+            modifier: format.modifier,
+            length: format.length,
+            offsets: format
+                .planes
+                .iter()
+                .map(|plane| plane.offset as usize)
+                .collect(),
+            strides: format
+                .planes
+                .iter()
+                .map(|plane| i32::try_from(plane.stride).unwrap_or(i32::MAX))
+                .collect(),
+        };
+        control.apply_size(config.size);
+        control.apply_rate(config.rate)?;
+        control.pipeline.set_state(gst::State::Playing)?;
+        Ok(control)
+    }
+
+    fn settings(&self) -> Settings {
+        *self.settings.lock().expect("settings mutex")
+    }
+
+    /// Restates the geometry only when it genuinely changes.
+    ///
+    /// A filter that repeats the input size is not free: it defeats the
+    /// scaler's pass-through and doubles its cost, from 9.2 to 18.6
+    /// milliseconds at full resolution.
+    fn apply_size(&self, size: EncodeSize) {
+        let caps = if size.visible() == self.capture {
+            gst::Caps::new_any()
+        } else {
+            gst::Caps::builder("video/x-raw")
+                .features(["memory:VAMemory"])
+                .field("width", i32::try_from(size.visible().width()).unwrap_or(0))
+                .field(
+                    "height",
+                    i32::try_from(size.visible().height()).unwrap_or(0),
+                )
+                .build()
+        };
+        self.filter.set_property("caps", caps);
+    }
+
+    /// The frame rate reaches the encoder through the source caps because the
+    /// scaler does not convert frame rate: a filter asking it for another rate
+    /// fails to link.
+    fn apply_rate(&self, rate: Rate) -> Result<(), Error> {
+        self.source.set_caps(Some(&self.source_caps(rate)?));
+        self.encoder.set_property("bitrate", rate.bitrate.kbps());
+        // Half the bitrate is the floor. A smaller value is silently replaced
+        // by twice the bitrate, which is also the default.
+        self.encoder
+            .set_property("cpb-size", rate.bitrate.kbps() / 2);
+        Ok(())
+    }
+
+    fn source_caps(&self, rate: Rate) -> Result<gst::Caps, Error> {
+        let format = gst_video::dma_drm_fourcc_to_format(self.fourcc)?;
+        let info =
+            gst_video::VideoInfo::builder(format, self.capture.width(), self.capture.height())
+                .fps(rate.framerate.as_fraction())
+                .build()?;
+        Ok(gst_video::VideoInfoDmaDrm::from_video_info(&info, self.modifier)?.to_caps()?)
+    }
+
+    /// Wraps one shared buffer as a GStreamer buffer.
+    ///
+    /// Every plane of a buffer object shares one descriptor, so this is a
+    /// single memory covering the object and a video meta saying where inside
+    /// it each plane begins.
+    fn wrap(
+        &self,
+        allocator: &DmaBufAllocator,
+        fd: OwnedFd,
+        captured: Timestamp,
+    ) -> Result<gst::Buffer, Error> {
+        let memory = tachyx_dmabuf::wrap_plane(allocator, fd, self.length)?;
+        let mut buffer = gst::Buffer::new();
+        let raw = buffer
+            .get_mut()
+            .expect("a buffer that was just made has one reference");
+        raw.append_memory(memory);
+        raw.set_pts(gst::ClockTime::from_useconds(
+            captured.micros_since(Timestamp::from_session_micros(0)),
+        ));
+        gst_video::VideoMeta::add_full(
+            raw,
+            gst_video::VideoFrameFlags::empty(),
+            gst_video::VideoFormat::DmaDrm,
+            self.capture.width(),
+            self.capture.height(),
+            &self.offsets,
+            &self.strides,
+        )?;
+        Ok(buffer)
+    }
+
+    /// The most recent error the pipeline posted, if it posted one.
+    fn failure(&self) -> Option<String> {
+        let bus = self.pipeline.bus()?;
+        let message = bus.pop_filtered(&[gst::MessageType::Error])?;
+        let gst::MessageView::Error(error) = message.view() else {
+            return None;
+        };
+        Some(format!("{}: {:?}", error.error(), error.debug()))
+    }
+}
+
+impl Drop for Control {
+    fn drop(&mut self) {
+        if let Err(error) = self.pipeline.set_state(gst::State::Null) {
+            tracing::warn!(?error, "the pipeline would not shut down");
+        }
+    }
+}
+
+fn make(element: &'static str) -> Result<gst::Element, Error> {
+    gst::ElementFactory::make(element)
+        .build()
+        .map_err(|_| Error::MissingElement(element))
+}
+
+fn configure_encoder(encoder: &gst::Element) -> Result<(), Error> {
+    // Variable bitrate rather than constant: constant pads every picture to the
+    // target with filler, which was 87% of a static desktop's bitstream, and a
+    // stream that is mostly padding makes the transport's bandwidth estimator
+    // measure our own padding.
+    encoder.set_property_from_str("rate-control", "vbr");
+    encoder.set_property("target-percentage", 66u32);
+    encoder.set_property("key-int-max", 1024u32);
+    encoder.set_property("b-frames", 0u32);
+    encoder.set_property("ref-frames", 1u32);
+    encoder.set_property("aud", true);
+    // One slice: the hardware encodes the whole picture either way, and four
+    // slices measured worse, 8.81 ms mean against 7.30.
+    encoder.set_property("num-slices", 1u32);
+    encoder.set_property_from_str("mbbrc", "disabled");
+    encoder.set_property(
+        "min-force-key-unit-interval",
+        u64::try_from(MIN_KEYFRAME_INTERVAL.as_nanos()).unwrap_or(u64::MAX),
+    );
+    Ok(())
+}
+
+/// What the scaler will import, as modifiers per DRM format.
+///
+/// It advertises one layout per format, the compressed one this GPU prefers,
+/// and refuses a plain linear buffer, so capture has to allocate from this list
+/// rather than from the compositor's.
+pub(crate) fn import_layouts() -> Result<HashMap<u32, Vec<u64>>, Error> {
+    gst::init()?;
+    let factory =
+        gst::ElementFactory::find("vapostproc").ok_or(Error::MissingElement("vapostproc"))?;
+    let mut layouts: HashMap<u32, Vec<u64>> = HashMap::new();
+    for template in factory.static_pad_templates() {
+        if template.direction() != gst::PadDirection::Sink {
+            continue;
+        }
+        for (structure, features) in template.caps().iter_with_features() {
+            if !features.contains("memory:DMABuf") {
+                continue;
+            }
+            let Ok(value) = structure.value("drm-format") else {
+                continue;
+            };
+            let listed = value
+                .get::<gst::List>()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|item| item.get::<String>().ok())
+                        .collect()
+                })
+                .or_else(|_| value.get::<String>().map(|one| vec![one]))
+                .unwrap_or_default();
+            for description in listed {
+                if let Ok((fourcc, modifier)) = gst_video::dma_drm_fourcc_from_str(&description) {
+                    layouts.entry(fourcc).or_default().push(modifier);
+                }
+            }
+        }
+    }
+    Ok(layouts)
+}
+
+fn pump(
+    frames: &Frames,
+    control: &Control,
+    counters: &Counters,
+    output: &SyncSender<AccessUnit>,
+) -> Result<(), Error> {
+    let allocator = DmaBufAllocator::new();
+    let mut next = 0u32;
+    let mut scratch = Vec::new();
+    while let Some(frame) = frames.next() {
+        let captured = frame.captured();
+        let (fd, lease) = frame.into_parts();
+        let buffer = control.wrap(&allocator, fd, captured)?;
+
+        let started = Instant::now();
+        if control.source.push_buffer(buffer).is_err() {
+            return Err(Error::Gst(
+                control
+                    .failure()
+                    .unwrap_or_else(|| "the source refused a buffer".to_owned()),
+            ));
+        }
+        // Pulling here is what makes the chain synchronous: the sample only
+        // exists once the scaler has finished reading the shared buffer, so the
+        // return of this call is the signal that returns it to the ring.
+        let sample = control
+            .sink
+            .try_pull_sample(gst::ClockTime::from_nseconds(
+                u64::try_from(OUTPUT_TIMEOUT.as_nanos()).unwrap_or(u64::MAX),
+            ))
+            .ok_or_else(|| {
+                control
+                    .failure()
+                    .map_or(Error::EncodeTimeout(OUTPUT_TIMEOUT), Error::Gst)
+            })?;
+        let elapsed = started.elapsed();
+        drop(lease);
+
+        let Some(unit) = describe(&sample, next, &mut scratch, counters) else {
+            continue;
+        };
+        counters.record(elapsed);
+        next = next.wrapping_add(1);
+        if output.send(unit).is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Turns one encoded sample into an access unit, dropping filler.
+fn describe(
+    sample: &gst::Sample,
+    id: u32,
+    scratch: &mut Vec<u8>,
+    counters: &Counters,
+) -> Option<AccessUnit> {
+    let buffer = sample.buffer()?;
+    let map = buffer.map_readable().ok()?;
+    scratch.clear();
+    scratch.reserve(map.size());
+    let filler = without_filler(&map, scratch);
+    counters.filler.fetch_add(filler as u64, Ordering::Relaxed);
+    counters
+        .bytes
+        .fetch_add(scratch.len() as u64, Ordering::Relaxed);
+    counters.encoded.fetch_add(1, Ordering::Relaxed);
+    Some(AccessUnit {
+        frame: FrameId(id),
+        captured: Timestamp::from_session_micros(buffer.pts().unwrap_or_default().useconds()),
+        kind: if buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+            FrameKind::Delta
+        } else {
+            FrameKind::Key
+        },
+        bytes: std::mem::take(scratch),
+    })
+}
+
+/// Copies an Annex B access unit without its filler, returning the bytes left
+/// behind.
+///
+/// Filler is discardable by definition, so carrying it would spend the link on
+/// padding and, worse, make the transport's bandwidth estimate a measurement of
+/// that padding rather than of the path.
+fn without_filler(unit: &[u8], out: &mut Vec<u8>) -> usize {
+    let mut discarded = 0;
+    let mut cursor = 0;
+    while cursor < unit.len() {
+        let body = cursor + prefix_len(&unit[cursor..]);
+        let end = next_prefix(&unit[body..]).map_or(unit.len(), |offset| body + offset);
+        if unit.get(body).is_some_and(|byte| byte & 0x1f == NAL_FILLER) {
+            discarded += end - cursor;
+        } else {
+            out.extend_from_slice(&unit[cursor..end]);
+        }
+        cursor = end;
+    }
+    discarded
+}
+
+/// Length of the start code the slice begins with, or zero if it begins with
+/// something else.
+fn prefix_len(unit: &[u8]) -> usize {
+    match unit {
+        [0, 0, 0, 1, ..] => 4,
+        [0, 0, 1, ..] => 3,
+        _ => 0,
+    }
+}
+
+/// Where the next start code begins, counting a leading zero as part of it.
+fn next_prefix(unit: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    while at + 2 < unit.len() {
+        match unit[at + 2] {
+            0 => at += 1,
+            1 if unit[at] == 0 && unit[at + 1] == 0 => {
+                return Some(at - usize::from(at > 0 && unit[at - 1] == 0));
+            }
+            _ => at += 3,
+        }
+    }
+    None
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    encoded: AtomicU64,
+    bytes: AtomicU64,
+    filler: AtomicU64,
+    latency: Mutex<Samples>,
+}
+
+impl Counters {
+    fn record(&self, elapsed: Duration) {
+        self.latency
+            .lock()
+            .expect("the latency mutex is never held across a panic")
+            .push(u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX));
+    }
+
+    fn snapshot(&self) -> EncodeStats {
+        EncodeStats {
+            encoded: self.encoded.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            filler_bytes: self.filler.load(Ordering::Relaxed),
+            latency: self
+                .latency
+                .lock()
+                .expect("the latency mutex is never held across a panic")
+                .percentiles(),
+        }
+    }
+}
+
+/// A ring of the most recent timings, in microseconds.
+#[derive(Debug, Default)]
+struct Samples {
+    held: Vec<u32>,
+    next: usize,
+}
+
+impl Samples {
+    const CAPACITY: usize = 4096;
+
+    fn push(&mut self, micros: u32) {
+        if self.held.len() < Self::CAPACITY {
+            self.held.push(micros);
+        } else {
+            self.held[self.next] = micros;
+            self.next = (self.next + 1) % Self::CAPACITY;
+        }
+    }
+
+    fn percentiles(&self) -> Percentiles {
+        if self.held.is_empty() {
+            return Percentiles::default();
+        }
+        let mut sorted = self.held.clone();
+        sorted.sort_unstable();
+        let at = |share: usize| {
+            Duration::from_micros(u64::from(
+                sorted[(sorted.len() * share / 100).min(sorted.len() - 1)],
+            ))
+        };
+        Percentiles {
+            p50: at(50),
+            p90: at(90),
+            p99: at(99),
+            max: Duration::from_micros(u64::from(sorted[sorted.len() - 1])),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nal(kind: u8, len: usize) -> Vec<u8> {
+        let mut unit = vec![0, 0, 0, 1, kind & 0x1f];
+        unit.extend(std::iter::repeat_n(0xff, len));
+        unit
+    }
+
+    #[test]
+    fn filler_is_removed_and_everything_else_survives() {
+        let mut stream = nal(7, 8);
+        stream.extend(nal(8, 4));
+        let filler = nal(NAL_FILLER, 100);
+        stream.extend(filler.clone());
+        stream.extend(nal(5, 32));
+        let mut out = Vec::new();
+        let discarded = without_filler(&stream, &mut out);
+        assert_eq!(discarded, filler.len());
+        assert_eq!(out.len(), stream.len() - filler.len());
+        let mut expected = nal(7, 8);
+        expected.extend(nal(8, 4));
+        expected.extend(nal(5, 32));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn a_unit_with_no_filler_is_copied_unchanged() {
+        let mut stream = nal(9, 1);
+        stream.extend(nal(1, 64));
+        let mut out = Vec::new();
+        assert_eq!(without_filler(&stream, &mut out), 0);
+        assert_eq!(out, stream);
+    }
+
+    #[test]
+    fn three_byte_start_codes_are_understood() {
+        let mut stream = vec![0, 0, 1, 9, 0x10];
+        stream.extend([0, 0, 1, NAL_FILLER, 0xff, 0xff]);
+        stream.extend([0, 0, 1, 1, 0x42]);
+        let mut out = Vec::new();
+        assert_eq!(without_filler(&stream, &mut out), 6);
+        assert_eq!(out, [0, 0, 1, 9, 0x10, 0, 0, 1, 1, 0x42]);
+    }
+
+    #[test]
+    fn percentiles_hold_the_most_recent_samples() {
+        let mut samples = Samples::default();
+        for micros in 1..=100 {
+            samples.push(micros);
+        }
+        let stats = samples.percentiles();
+        assert_eq!(stats.p50, Duration::from_micros(51));
+        assert_eq!(stats.max, Duration::from_micros(100));
+    }
+}
