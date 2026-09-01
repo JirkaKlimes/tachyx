@@ -1,0 +1,17 @@
+[package]
+name = "tachyx-client"
+description = "The client core: session state, control stream framing and input batching, with no I/O of its own"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tachyx-proto.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
