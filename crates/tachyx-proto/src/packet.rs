@@ -4,13 +4,13 @@
 //! functions over the sixteen-byte header of [`crate::media`], and because the
 //! client reassembles video without wanting a QUIC server linked in to do it.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use crate::media::{
-    Fragment, FrameId, FrameKind, HEADER_LEN, MalformedPacket, PacketHeader, Seq, Timestamp,
+    Fragment, FrameId, FrameKind, MalformedPacket, PacketHeader, Seq, Timestamp, HEADER_LEN,
 };
 
 /// Slices one access unit may hold.
@@ -227,6 +227,12 @@ pub struct ReassemblyStats {
     pub frames_delivered: u64,
     /// Frames abandoned with fragments missing.
     pub frames_dropped: u64,
+    /// Frames the sender numbered and of which nothing arrived at all.
+    ///
+    /// Counted separately from [`ReassemblyStats::frames_dropped`] because
+    /// nothing in the frame itself reveals it: the hole in the identifiers is
+    /// the only evidence that the frame existed.
+    pub frames_missing: u64,
     /// Frames that arrived whole and were thrown away anyway, because the
     /// frames they refer back to did not.
     pub frames_undecodable: u64,
@@ -234,6 +240,11 @@ pub struct ReassemblyStats {
 
 /// Rebuilds access units from datagrams, giving up on a frame rather than
 /// stalling behind it.
+///
+/// A frame every packet of which was lost leaves no evidence but the hole it
+/// makes in the identifiers, so the identifiers are what this reads. That is
+/// only sound because the sender numbers every picture it encodes and skips
+/// none: see [`FrameId`].
 ///
 /// Frame identifiers are compared directly rather than circularly. The four
 /// bytes they occupy last four hundred days at a hundred and twenty frames a
@@ -427,7 +438,9 @@ impl Reassembler {
         }
 
         let partial = open.remove();
-        self.discard_below(header.frame.0);
+        if self.abandon_below(header.frame.0) > 0 {
+            self.needs_key = true;
+        }
         self.floor = header.frame.0 + 1;
         if matches!(header.kind, FrameKind::Key) {
             self.needs_key = false;
@@ -444,21 +457,20 @@ impl Reassembler {
     /// Only needed on a connection where no datagram is arriving to run it, so
     /// on a timer beside the receive loop rather than in it.
     pub fn expire(&mut self, now: Instant) {
-        let mut dropped = 0;
-        let mut highest = None;
-        self.open.retain(|&id, partial| {
-            if partial.deadline > now {
-                return true;
-            }
-            dropped += 1;
-            highest = Some(highest.map_or(id, |seen: u32| seen.max(id)));
-            false
-        });
-        if let Some(highest) = highest {
-            self.floor = self.floor.max(highest + 1);
-            self.stats.frames_dropped += dropped;
-            self.needs_key = true;
-        }
+        let Some(highest) = self
+            .open
+            .iter()
+            .filter(|(_, partial)| partial.deadline <= now)
+            .map(|(&id, _)| id)
+            .max()
+        else {
+            return;
+        };
+        // Everything at or below the frame that gave up is decided with it: a
+        // frame below the floor can no longer be completed, because its
+        // remaining packets arrive as late ones.
+        self.abandon_below(highest + 1);
+        self.needs_key = true;
     }
 
     /// Accounts for the sequence number, reporting whether the gap it reveals
@@ -490,17 +502,26 @@ impl Reassembler {
         previous.frame == header.frame
     }
 
-    /// Abandons every open frame older than `id`, which a delivery has passed.
-    fn discard_below(&mut self, id: u32) {
-        let older: Vec<u32> = self.open.range(..id).map(|(&id, _)| id).collect();
-        if older.is_empty() {
-            return;
+    /// Decides every frame below `id`, which nothing can complete any more, and
+    /// reports how many frames that cost.
+    ///
+    /// The frames still open are the damaged ones. The rest of the span is
+    /// frames of which not one packet arrived, which nothing but the gap in the
+    /// identifiers reveals.
+    fn abandon_below(&mut self, id: u32) -> u64 {
+        let span = u64::from(id.saturating_sub(self.floor));
+        if span == 0 {
+            return 0;
         }
-        for id in &older {
-            self.open.remove(id);
+        let damaged: Vec<u32> = self.open.range(..id).map(|(&open, _)| open).collect();
+        for open in &damaged {
+            self.open.remove(open);
         }
-        self.stats.frames_dropped += older.len() as u64;
-        self.needs_key = true;
+        let damaged = damaged.len() as u64;
+        self.stats.frames_dropped += damaged;
+        self.stats.frames_missing += span - damaged;
+        self.floor = id;
+        span
     }
 }
 
@@ -676,22 +697,58 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_frame_identifier_is_not_treated_as_loss() {
+    fn a_frame_that_arrives_not_at_all_is_still_loss() {
         let mut packetiser = Packetiser::new(PAYLOAD);
         let start = Instant::now();
         let mut reassembler = Reassembler::new(Duration::from_millis(50));
-        for id in [0, 5, 11] {
+
+        let mut wire = Vec::new();
+        for (id, kind) in [
+            (0, FrameKind::Key),
+            (1, FrameKind::Delta),
+            (2, FrameKind::Delta),
+        ] {
+            let picture = picture(200, u8::try_from(id).unwrap());
+            let mut out = Vec::new();
+            packetiser.packetise(&unit(id, kind, &[&picture]), &mut out);
+            wire.push(out);
+        }
+
+        assert_eq!(deliver(&mut reassembler, &wire[0], start).len(), 1);
+        assert!(!reassembler.needs_keyframe());
+        // Frame one is not merely damaged: every packet of it is gone, so
+        // nothing inside the frame and nothing about frame two's own packets
+        // says anything is missing. Only the hole in the identifiers does.
+        assert!(
+            deliver(&mut reassembler, &wire[2], start).is_empty(),
+            "frame two refers back to a frame the decoder never received"
+        );
+        assert_eq!(reassembler.stats().frames_missing, 1);
+        assert_eq!(reassembler.stats().frames_undecodable, 1);
+        assert!(reassembler.needs_keyframe());
+    }
+
+    #[test]
+    fn a_frame_lost_whole_between_two_key_frames_costs_nothing() {
+        let mut packetiser = Packetiser::new(PAYLOAD);
+        let start = Instant::now();
+        let mut reassembler = Reassembler::new(Duration::from_millis(50));
+
+        let mut wire = Vec::new();
+        for id in 0..3u32 {
             let picture = picture(200, u8::try_from(id).unwrap());
             let mut out = Vec::new();
             packetiser.packetise(&unit(id, FrameKind::Key, &[&picture]), &mut out);
-            assert_eq!(deliver(&mut reassembler, &out, start).len(), 1);
+            wire.push(out);
         }
+
+        assert_eq!(deliver(&mut reassembler, &wire[0], start).len(), 1);
         assert_eq!(
-            reassembler.stats().frames_dropped,
-            0,
-            "a host that declines to encode a frame never advances the encoder's \
-             reference chain, so the identifiers it skips are not loss"
+            deliver(&mut reassembler, &wire[2], start).len(),
+            1,
+            "a key frame stands alone, so the hole before it is counted and forgiven"
         );
+        assert_eq!(reassembler.stats().frames_missing, 1);
         assert!(!reassembler.needs_keyframe());
     }
 

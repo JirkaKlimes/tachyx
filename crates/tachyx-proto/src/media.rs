@@ -153,6 +153,31 @@ impl Seq {
 }
 
 /// A frame number, counted over the session.
+///
+/// It counts pictures the encoder produced, and it skips none of them. That
+/// rule is what makes a gap in the identifiers mean exactly one thing, and the
+/// receiver depends on it: a frame every packet of which was lost leaves no
+/// other evidence that it ever existed, and the delta frames that refer back to
+/// it would otherwise be decoded against a picture the client does not have.
+///
+/// Both ways a host declines a frame keep the rule, and they keep it for the
+/// same reason: the identifier follows the encoder's chain of reference frames
+/// rather than the capture clock.
+///
+/// - Declined **before** encoding, which is what the send gate asks for: the
+///   encoder never sees the picture, so its reference chain is unbroken and no
+///   identifier is spent. Nothing is missing and nothing is signalled.
+/// - Declined **after** encoding, by the send gate's second check or by a host
+///   that throws an encoded picture away: the reference chain has already
+///   advanced, so every later frame refers to a picture the client will never
+///   receive. The identifier is spent, the gap appears, and the client asks for
+///   a key frame. That is not a wasted request; it is the only thing that
+///   restores the picture.
+///
+/// A host that numbered frames by capture instead would make the two cases
+/// indistinguishable, and the client would decode against missing references
+/// for as long as a key frame interval: seventeen seconds at 1024 frames and
+/// sixty hertz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FrameId(pub u32);
 
