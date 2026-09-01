@@ -6,12 +6,13 @@
 //! that field before it reads anything a later version might have reshaped.
 
 use std::num::{NonZeroU16, NonZeroU32};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::VERSION;
 use crate::input::InputEvent;
 use crate::media::{FrameId, Timestamp};
+use crate::VERSION;
 
 /// A picture size in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +307,18 @@ pub struct Heartbeat {
     /// Median capture to wire latency over the last interval, in microseconds.
     pub pipeline_micros: u32,
 }
+
+/// How often the host sends a [`Heartbeat`].
+///
+/// It is a constant rather than a field of the message because both ends need
+/// it and only one of them would carry it: a client reads liveness from the
+/// *absence* of a heartbeat, so it has to know the interval before it has
+/// received one.
+///
+/// Twice the transport's keep-alive, which is what makes the connection itself
+/// hold open, and short enough that three missed beats are noticed inside the
+/// five-second idle timeout that would otherwise be the only signal.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Anything a client sends after its hello.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
