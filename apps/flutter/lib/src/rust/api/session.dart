@@ -8,7 +8,7 @@ import 'input.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `fmt`
 
 /// The protocol version this build speaks.
 ///
@@ -52,4 +52,68 @@ abstract class Session implements RustOpaqueInterface {
   /// `PointerEvent.timeStamp` rather than from the moment this was called, so
   /// that batching does not hide inside the latency measurement.
   Future<void> input({required BigInt atMicros, required InputEvent event});
+
+  /// What the video path has seen so far.
+  ///
+  /// Synchronous, because the overlay reads it once a frame and a round trip
+  /// through the isolate to fetch six counters would cost more than the
+  /// counters are worth.
+  VideoStats videoStats();
+}
+
+/// What the client's own video path has seen.
+///
+/// Every field is something this client counted. Nothing here is a figure the
+/// host reported about itself, and nothing is an estimate: a statistics overlay
+/// built to measure latency is worth less than nothing if it shows a number
+/// that was made up.
+class VideoStats {
+  /// Datagrams parsed.
+  final BigInt packetsReceived;
+
+  /// Datagrams the sequence number says never arrived.
+  final BigInt packetsLost;
+
+  /// Datagrams for a frame that had already been decided.
+  final BigInt packetsLate;
+
+  /// Frames handed to the decoder.
+  final BigInt framesDelivered;
+
+  /// Frames abandoned with fragments missing.
+  final BigInt framesDropped;
+
+  /// Frames that arrived whole and were thrown away anyway, because the
+  /// frames they refer back to did not.
+  final BigInt framesUndecodable;
+
+  const VideoStats({
+    required this.packetsReceived,
+    required this.packetsLost,
+    required this.packetsLate,
+    required this.framesDelivered,
+    required this.framesDropped,
+    required this.framesUndecodable,
+  });
+
+  @override
+  int get hashCode =>
+      packetsReceived.hashCode ^
+      packetsLost.hashCode ^
+      packetsLate.hashCode ^
+      framesDelivered.hashCode ^
+      framesDropped.hashCode ^
+      framesUndecodable.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VideoStats &&
+          runtimeType == other.runtimeType &&
+          packetsReceived == other.packetsReceived &&
+          packetsLost == other.packetsLost &&
+          packetsLate == other.packetsLate &&
+          framesDelivered == other.framesDelivered &&
+          framesDropped == other.framesDropped &&
+          framesUndecodable == other.framesUndecodable;
 }

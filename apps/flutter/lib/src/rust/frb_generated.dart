@@ -70,7 +70,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 1086106806;
+  int get rustContentHash => 1879786432;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -89,6 +89,8 @@ abstract class RustLibApi extends BaseApi {
     required BigInt atMicros,
     required InputEvent event,
   });
+
+  VideoStats crateApiSessionSessionVideoStats({required Session that});
 
   Future<Session> crateApiSessionConnect({
     required String address,
@@ -187,6 +189,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  VideoStats crateApiSessionSessionVideoStats({required Session that}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
+            that,
+            serializer,
+          );
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 3)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_video_stats,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiSessionSessionVideoStatsConstMeta,
+        argValues: [that],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSessionSessionVideoStatsConstMeta =>
+      const TaskConstMeta(debugName: "Session_video_stats", argNames: ["that"]);
+
+  @override
   Future<Session> crateApiSessionConnect({
     required String address,
     required int viewportWidth,
@@ -202,7 +230,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 4,
             port: port_,
           );
         },
@@ -232,7 +260,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 4,
+            funcId: 5,
             port: port_,
           );
         },
@@ -256,7 +284,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 5)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 6)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_u_16,
@@ -298,6 +326,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   Session
   dco_decode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
+    dynamic raw,
+  ) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return SessionImpl.frbInternalDcoDecode(raw as List<dynamic>);
+  }
+
+  @protected
+  Session
+  dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     dynamic raw,
   ) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -444,6 +481,22 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoStats dco_decode_video_stats(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return VideoStats(
+      packetsReceived: dco_decode_u_64(arr[0]),
+      packetsLost: dco_decode_u_64(arr[1]),
+      packetsLate: dco_decode_u_64(arr[2]),
+      framesDelivered: dco_decode_u_64(arr[3]),
+      framesDropped: dco_decode_u_64(arr[4]),
+      framesUndecodable: dco_decode_u_64(arr[5]),
+    );
+  }
+
+  @protected
   AnyhowException sse_decode_AnyhowException(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_String(deserializer);
@@ -465,6 +518,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   Session
   sse_decode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return SessionImpl.frbInternalSseDecode(
+      sse_decode_usize(deserializer),
+      sse_decode_i_32(deserializer),
+    );
+  }
+
+  @protected
+  Session
+  sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     SseDeserializer deserializer,
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -616,6 +681,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  VideoStats sse_decode_video_stats(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_packetsReceived = sse_decode_u_64(deserializer);
+    var var_packetsLost = sse_decode_u_64(deserializer);
+    var var_packetsLate = sse_decode_u_64(deserializer);
+    var var_framesDelivered = sse_decode_u_64(deserializer);
+    var var_framesDropped = sse_decode_u_64(deserializer);
+    var var_framesUndecodable = sse_decode_u_64(deserializer);
+    return VideoStats(
+      packetsReceived: var_packetsReceived,
+      packetsLost: var_packetsLost,
+      packetsLate: var_packetsLate,
+      framesDelivered: var_framesDelivered,
+      framesDropped: var_framesDropped,
+      framesUndecodable: var_framesUndecodable,
+    );
+  }
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint8() != 0;
@@ -646,6 +730,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void
   sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
+    Session self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_usize(
+      (self as SessionImpl).frbInternalSseEncode(move: false),
+      serializer,
+    );
+  }
+
+  @protected
+  void
+  sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     Session self,
     SseSerializer serializer,
   ) {
@@ -800,6 +897,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_video_stats(VideoStats self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_64(self.packetsReceived, serializer);
+    sse_encode_u_64(self.packetsLost, serializer);
+    sse_encode_u_64(self.packetsLate, serializer);
+    sse_encode_u_64(self.framesDelivered, serializer);
+    sse_encode_u_64(self.framesDropped, serializer);
+    sse_encode_u_64(self.framesUndecodable, serializer);
+  }
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint8(self ? 1 : 0);
@@ -846,4 +954,12 @@ class SessionImpl extends RustOpaque implements Session {
         atMicros: atMicros,
         event: event,
       );
+
+  /// What the video path has seen so far.
+  ///
+  /// Synchronous, because the overlay reads it once a frame and a round trip
+  /// through the isolate to fetch six counters would cost more than the
+  /// counters are worth.
+  VideoStats videoStats() =>
+      RustLib.instance.api.crateApiSessionSessionVideoStats(that: this);
 }

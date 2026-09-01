@@ -1,0 +1,21 @@
+[package]
+name = "tachyx-video"
+description = "The Linux client's decode and present path: H.264 to a Flutter texture without a CPU copy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tachyx-glctx.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+gstreamer-gl.workspace = true
+gstreamer-video.workspace = true
+irondash_texture.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

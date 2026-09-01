@@ -14,9 +14,13 @@ use std::path::Path;
 /// `tachyx-client-ffi` holds the code `flutter_rust_bridge` generates, where
 /// every call across the Dart boundary reads a pointer Dart wrote.
 ///
-/// Both keep the rest of the workspace lint set, which the first test below
-/// checks, and neither holds any decision of its own.
-const UNSAFE_EXCEPTIONS: [&str; 2] = ["tachyx-dmabuf", "tachyx-client-ffi"];
+/// `tachyx-glctx` reads the OpenGL context Flutter's Linux embedder has made
+/// current and describes it to GStreamer: no type can prove a raw EGL handle
+/// names a live display or context.
+///
+/// All three keep the rest of the workspace lint set, which the first test below
+/// checks, and none holds any decision of its own.
+const UNSAFE_EXCEPTIONS: [&str; 3] = ["tachyx-dmabuf", "tachyx-client-ffi", "tachyx-glctx"];
 
 #[test]
 fn every_crate_opts_in_to_the_workspace_lints() {

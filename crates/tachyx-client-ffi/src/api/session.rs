@@ -23,6 +23,29 @@ pub fn protocol_version() -> u16 {
     tachyx_proto::VERSION
 }
 
+/// What the client's own video path has seen.
+///
+/// Every field is something this client counted. Nothing here is a figure the
+/// host reported about itself, and nothing is an estimate: a statistics overlay
+/// built to measure latency is worth less than nothing if it shows a number
+/// that was made up.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoStats {
+    /// Datagrams parsed.
+    pub packets_received: u64,
+    /// Datagrams the sequence number says never arrived.
+    pub packets_lost: u64,
+    /// Datagrams for a frame that had already been decided.
+    pub packets_late: u64,
+    /// Frames handed to the decoder.
+    pub frames_delivered: u64,
+    /// Frames abandoned with fragments missing.
+    pub frames_dropped: u64,
+    /// Frames that arrived whole and were thrown away anyway, because the
+    /// frames they refer back to did not.
+    pub frames_undecodable: u64,
+}
+
 /// A live session with a host.
 ///
 /// It holds [`tachyx_client::Session`] and adds nothing: the decisions live in
@@ -34,6 +57,25 @@ pub struct Session {
 }
 
 impl Session {
+    /// What the video path has seen so far.
+    ///
+    /// Synchronous, because the overlay reads it once a frame and a round trip
+    /// through the isolate to fetch six counters would cost more than the
+    /// counters are worth.
+    #[frb(sync)]
+    #[must_use]
+    pub fn video_stats(&self) -> VideoStats {
+        let stats = self.core.video_stats();
+        VideoStats {
+            packets_received: stats.packets_received,
+            packets_lost: stats.packets_lost,
+            packets_late: stats.packets_late,
+            frames_delivered: stats.frames_delivered,
+            frames_dropped: stats.frames_dropped,
+            frames_undecodable: stats.frames_undecodable,
+        }
+    }
+
     /// Records what the user did.
     ///
     /// `at_micros` is when the client saw the event, taken from

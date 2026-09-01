@@ -14,11 +14,13 @@ repository = "https://github.com/JirkaKlimes/tachyx"
 [workspace.dependencies]
 tachyx-client = { path = "crates/tachyx-client" }
 tachyx-dmabuf = { path = "crates/tachyx-dmabuf" }
+tachyx-glctx = { path = "crates/tachyx-glctx" }
 tachyx-hostd = { path = "crates/tachyx-hostd" }
 tachyx-input = { path = "crates/tachyx-input" }
 tachyx-media = { path = "crates/tachyx-media" }
 tachyx-proto = { path = "crates/tachyx-proto" }
 tachyx-transport = { path = "crates/tachyx-transport" }
+tachyx-video = { path = "crates/tachyx-video" }
 
 anyhow = "1.0"
 bytes = "1.10"
@@ -51,7 +53,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gstreamer = { version = "0.25", features = ["v1_26"] }
 gstreamer-allocators = { version = "0.25", features = ["v1_26"] }
 gstreamer-app = { version = "0.25", features = ["v1_26"] }
+gstreamer-gl = { version = "0.25", features = ["v1_26"] }
+gstreamer-gl-egl = { version = "0.25", features = ["v1_26"] }
 gstreamer-video = { version = "0.25", features = ["v1_26"] }
+
+# The Flutter texture registry, reached from Rust. Its Linux payload registers a
+# subclass of the embedder's `FlTextureGL`, which is the only interface the Linux
+# embedder offers for a texture the application draws itself.
+irondash_engine_context = "0.5"
+irondash_texture = "0.5"
 
 drm-fourcc = "2.2"
 gbm = { version = "0.18", default-features = false }

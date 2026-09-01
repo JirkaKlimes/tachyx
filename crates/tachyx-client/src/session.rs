@@ -225,7 +225,7 @@ impl Session {
 mod tests {
     use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
-    use tachyx_proto::control::{Aspect, Codec, CodedSize, Size};
+    use tachyx_proto::control::{Aspect, Codec, CodedSize, Hello, Size};
     use tachyx_proto::input::{PointerButton, Press};
     use tachyx_proto::media::FrameKind;
     use tachyx_proto::packet::{AccessUnit, Packetiser};

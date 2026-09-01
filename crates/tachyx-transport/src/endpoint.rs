@@ -19,7 +19,7 @@ use crate::video::{VideoReceiver, VideoSender};
 /// The protocol version is not folded into this. A version mismatch belongs in
 /// the hello, where it is reported by name, rather than in the handshake, where
 /// it would surface as an opaque TLS alert.
-pub const ALPN: &[u8] = b"tachyx";
+const ALPN: &[u8] = b"tachyx";
 
 /// The close code for a peer whose hello this build will not accept.
 const REFUSED: VarInt = VarInt::from_u32(1);
@@ -228,6 +228,15 @@ impl Client {
             .or_else(|_| Endpoint::client((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))?;
         endpoint.set_default_client_config(config);
         Ok(Self { endpoint, tuning })
+    }
+
+    /// The endpoint this client dials from, for its statistics, its address,
+    /// and for a connection that is not a session: a peer that wants to say
+    /// something no [`ClientSession`] would say, which is what proves the host
+    /// refuses it.
+    #[must_use]
+    pub const fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 
     /// Connects to the host at `address`, which is pinned under `host`.
