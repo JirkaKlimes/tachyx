@@ -67,7 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let elapsed = started.elapsed();
     let motion = capture.stats();
-
     println!("\n-- motion --");
     println!("frames      {}", waits.len());
     println!("elapsed     {:.3} s", elapsed.as_secs_f64());
@@ -91,6 +90,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(idle_for);
     let cpu = processor_time()?.saturating_sub(cpu);
     let idle = capture.stats();
+    let pointer = capture.cursor();
+
+    println!("\n-- cursor --");
+    match &pointer.pointer {
+        Some(shown) => {
+            println!("at          {:?}", shown.at);
+            println!("hotspot     {:?}", shown.hotspot);
+            match &shown.image {
+                Some(image) => println!("image       {}x{}", image.width, image.height),
+                None => println!("image       (none yet)"),
+            }
+        }
+        None => println!("at          (this compositor reports no pointer)"),
+    }
+    println!(
+        "serial      {} image {}",
+        pointer.serial, pointer.image_serial
+    );
+
     capture.stop()?;
     let seen = drain.join().map_err(|_| "the drain thread panicked")?;
 

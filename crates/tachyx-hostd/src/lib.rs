@@ -5,6 +5,7 @@
 //! that decides what the encoder is asked for.
 
 pub mod config;
+pub mod cursor;
 pub mod idle;
 pub mod idr;
 pub mod ladder;

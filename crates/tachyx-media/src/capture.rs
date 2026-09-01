@@ -196,22 +196,43 @@ struct Counters {
     starved: AtomicU64,
 }
 
-/// Where the pointer is and what it looks like.
+/// What the compositor says about the pointer.
 ///
 /// The frame itself is captured without the cursor painted into it, so the
 /// client draws it locally and pointer movement is not gated on a round trip.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cursor {
-    /// Whether the pointer is over the captured output.
-    pub visible: bool,
-    /// Position of the cursor's hotspot, in output pixels.
-    pub position: (i32, i32),
-    /// Where the hotspot sits inside the image.
+    /// What the compositor reports, or `None` when it offers no cursor session
+    /// at all. A client told that draws a pointer of its own instead.
+    pub pointer: Option<Pointer>,
+    /// Bumped whenever anything here changes.
+    pub serial: u64,
+    /// Bumped whenever [`Pointer::image`] changes, and by nothing else.
+    ///
+    /// The picture is thousands of times the size of a position and it changes
+    /// thousands of times less often, so whatever carries the cursor onward
+    /// reads this to decide whether to carry the picture with it.
+    pub image_serial: u64,
+}
+
+/// Where the pointer is and what it looks like.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pointer {
+    /// The hotspot's place on the captured output, in that output's pixels, or
+    /// `None` while the pointer is not over it.
+    ///
+    /// The compositor may report a position outside the picture: a cursor
+    /// overlapping the edge has entered the captured area while its hotspot has
+    /// not.
+    pub at: Option<(i32, i32)>,
+    /// Where the hotspot sits inside the image, from its top left corner.
     pub hotspot: (i32, i32),
     /// The pointer's picture, once one has been captured.
-    pub image: Option<CursorImage>,
-    /// Bumped whenever anything above changes.
-    pub serial: u64,
+    ///
+    /// Shared rather than owned so that reading the cursor costs a pointer copy
+    /// rather than the tens of kilobytes behind it. Whatever forwards the
+    /// cursor reads it many times a second and the picture changes rarely.
+    pub image: Option<Arc<CursorImage>>,
 }
 
 /// A pointer image, as premultiplied ARGB rows.
@@ -364,13 +385,28 @@ enum Target {
     Cursor,
 }
 
-#[derive(Debug, Default)]
-struct SessionState {
+/// What one round of buffer constraints said.
+///
+/// A compositor may re-send constraints at any time, and a round is only
+/// complete at its `done` event. Rounds are therefore accumulated into
+/// [`SessionState::next`] and published to [`SessionState::current`] whole, so
+/// that a reader never sees half of one: a cursor session that grows its buffer
+/// would otherwise be read as one that lost its pixel format.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Constraints {
     size: Option<(u32, u32)>,
     device: Option<u64>,
     formats: Vec<(u32, Vec<u64>)>,
     shm_formats: Vec<wl_shm::Format>,
-    done: bool,
+}
+
+#[derive(Debug, Default)]
+struct SessionState {
+    next: Constraints,
+    current: Option<Constraints>,
+    /// Counts completed constraint rounds, so a reader can tell a re-send from
+    /// the round it already acted on.
+    generation: u64,
     stopped: bool,
     ready: bool,
     failed: Option<String>,
@@ -384,6 +420,10 @@ impl SessionState {
             self.failed.take(),
             self.presented.take(),
         )
+    }
+
+    fn size(&self) -> Option<(u32, u32)> {
+        self.current.as_ref().and_then(|round| round.size)
     }
 }
 
@@ -399,7 +439,12 @@ struct State {
     dmabuf: Option<ZwpLinuxDmabufV1>,
     screen: SessionState,
     cursor: SessionState,
-    pointer: Cursor,
+    /// Whether the cursor overlaps the captured output. `enter` precedes the
+    /// first position, so where the pointer is and whether it is anywhere are
+    /// two facts and are kept as two.
+    inside: bool,
+    position: (i32, i32),
+    hotspot: (i32, i32),
     pointer_changed: bool,
 }
 
@@ -485,8 +530,8 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, Target> for State {
             Target::Cursor => &mut state.cursor,
         };
         match event {
-            E::BufferSize { width, height } => session.size = Some((width, height)),
-            E::DmabufDevice { device } => session.device = read_u64(&device),
+            E::BufferSize { width, height } => session.next.size = Some((width, height)),
+            E::DmabufDevice { device } => session.next.device = read_u64(&device),
             E::DmabufFormat { format, modifiers } => {
                 let modifiers = modifiers
                     .as_chunks::<8>()
@@ -494,12 +539,15 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, Target> for State {
                     .iter()
                     .map(|bytes| u64::from_ne_bytes(*bytes))
                     .collect();
-                session.formats.push((format, modifiers));
+                session.next.formats.push((format, modifiers));
             }
             E::ShmFormat {
                 format: WEnum::Value(format),
-            } => session.shm_formats.push(format),
-            E::Done => session.done = true,
+            } => session.next.shm_formats.push(format),
+            E::Done => {
+                session.current = Some(std::mem::take(&mut session.next));
+                session.generation += 1;
+            }
             E::Stopped => session.stopped = true,
             _ => {}
         }
@@ -547,10 +595,10 @@ impl Dispatch<ExtImageCopyCaptureCursorSessionV1, ()> for State {
     ) {
         use ext_image_copy_capture_cursor_session_v1::Event as E;
         match event {
-            E::Enter => state.pointer.visible = true,
-            E::Leave => state.pointer.visible = false,
-            E::Position { x, y } => state.pointer.position = (x, y),
-            E::Hotspot { x, y } => state.pointer.hotspot = (x, y),
+            E::Enter => state.inside = true,
+            E::Leave => state.inside = false,
+            E::Position { x, y } => state.position = (x, y),
+            E::Hotspot { x, y } => state.hotspot = (x, y),
             _ => return,
         }
         state.pointer_changed = true;
@@ -619,6 +667,9 @@ struct Pump {
     counters: Arc<Counters>,
     cursor: Arc<Mutex<Cursor>>,
     pointer: Option<PointerCapture>,
+    /// The last picture read out of the cursor buffer, kept here so that
+    /// deciding whether a new one differs costs no lock.
+    image: Option<Arc<CursorImage>>,
     size: Size,
     epoch: u64,
     next_id: u64,
@@ -630,13 +681,31 @@ struct Slab {
     buffer: wl_buffer::WlBuffer,
 }
 
-/// The cursor session and the shared memory its picture is copied into.
+/// The cursor session, and the shared memory its picture is copied into once
+/// the compositor has said how big that has to be.
+///
+/// The buffer is not part of starting up. Buffer constraints arrive when the
+/// compositor chooses to send them and may be re-sent at any time, so waiting a
+/// fixed number of round trips for the first round and giving up otherwise
+/// makes the pointer depend on a race, and a cursor that grows as it crosses a
+/// widget stops being copied at all. Both are answered the same way: the
+/// buffer is (re)built from whatever round of constraints is current, whenever
+/// that round changes.
 struct PointerCapture {
+    cursor: ExtImageCopyCaptureCursorSessionV1,
     session: ExtImageCopyCaptureSessionV1,
+    shm: wl_shm::WlShm,
+    /// The constraint round `buffer` was built for. Zero until one has been.
+    generation: u64,
+    buffer: Option<CursorBuffer>,
+    armed: Option<ExtImageCopyCaptureFrameV1>,
+}
+
+/// One shared-memory buffer sized for the cursor the compositor described.
+struct CursorBuffer {
     buffer: wl_buffer::WlBuffer,
     storage: std::fs::File,
     size: (u32, u32),
-    armed: Option<ExtImageCopyCaptureFrameV1>,
 }
 
 fn run(
@@ -711,18 +780,26 @@ impl Pump {
             &handle,
             Target::Screen,
         );
-        while !state.screen.done && !state.screen.stopped {
+        // The cursor session is opened here rather than after the ring, so that
+        // its own constraints arrive alongside the screen's and the first frame
+        // of the session already has a pointer to go with it.
+        let pointer = PointerCapture::open(state, &copies, &sources, &chosen, &handle);
+        // A pointer nobody has moved produces no events, so the first report is
+        // owed whether or not anything happened.
+        state.pointer_changed = pointer.is_some();
+        while state.screen.current.is_none() && !state.screen.stopped {
             queue.blocking_dispatch(state)?;
         }
         if state.screen.stopped {
             return Err(Error::SessionStopped);
         }
 
-        let (width, height) = state.screen.size.ok_or(Error::SessionStopped)?;
+        let screen = state.screen.current.clone().ok_or(Error::SessionStopped)?;
+        let (width, height) = screen.size.ok_or(Error::SessionStopped)?;
         let size = Size::new(width, height).ok_or(Error::SessionStopped)?;
-        let device = state.screen.device.ok_or(Error::NoSharedFormat)?;
+        let device = screen.device.ok_or(Error::NoSharedFormat)?;
         let node = render_node(device)?;
-        let (fourcc, modifier) = choose_layout(&state.screen.formats)?;
+        let (fourcc, modifier) = choose_layout(&screen.formats)?;
 
         let gbm = gbm::Device::new(
             std::fs::OpenOptions::new()
@@ -750,7 +827,6 @@ impl Pump {
             length,
         };
 
-        let pointer = PointerCapture::setup(state, &copies, &sources, &chosen, &mut queue, &handle);
         let mut pump = Self {
             connection,
             queue,
@@ -765,12 +841,13 @@ impl Pump {
             counters: Arc::clone(counters),
             cursor: Arc::clone(cursor),
             pointer,
+            image: None,
             size,
             epoch: monotonic_nanos(),
             next_id: 0,
         };
         pump.arm(0);
-        pump.arm_pointer();
+        pump.service_pointer(state);
         Ok((pump, format))
     }
 
@@ -801,7 +878,7 @@ impl Pump {
         if state.screen.stopped {
             return Err(Error::SessionStopped);
         }
-        if state.screen.size != Some((self.size.width(), self.size.height())) {
+        if state.screen.size() != Some((self.size.width(), self.size.height())) {
             return Err(Error::ConstraintsChanged);
         }
         let (ready, failed, presented) = state.screen.take_frame();
@@ -891,41 +968,95 @@ impl Pump {
         self.armed = Some((index, frame));
     }
 
+    /// Keeps the cursor session turning, and publishes what it has said.
+    ///
+    /// Everything the cursor path can do wrong is answered here rather than at
+    /// startup: constraints that have not arrived yet, constraints that changed,
+    /// a session the compositor stopped, and a frame it refused to fill.
     fn service_pointer(&mut self, state: &mut State) {
-        let mut image = None;
-        if let Some(pointer) = &mut self.pointer {
-            let (ready, failed, _) = state.cursor.take_frame();
-            if let Some(reason) = &failed {
-                tracing::debug!(%reason, "the compositor refused to fill the cursor buffer");
-            }
-            if (ready || failed.is_some())
-                && let Some(frame) = pointer.armed.take()
-            {
-                frame.destroy();
-            }
-            if ready {
-                match pointer.read() {
-                    Ok(picture) => image = Some(picture),
-                    Err(error) => tracing::warn!(%error, "cannot read the captured cursor"),
-                }
-            }
+        if self.pointer.is_none() {
+            return;
         }
-        if image.is_some() {
-            state.pointer_changed = true;
+        if state.cursor.stopped {
+            tracing::info!("the compositor stopped the cursor session");
+            self.give_up_on_the_pointer();
+            return;
         }
-        if std::mem::take(&mut state.pointer_changed) {
-            let mut cursor = self
-                .cursor
-                .lock()
-                .expect("the cursor mutex is never held across a panic");
-            let serial = cursor.serial + 1;
-            *cursor = Cursor {
-                image: image.or_else(|| cursor.image.clone()),
-                serial,
-                ..state.pointer.clone()
-            };
+
+        let (ready, failed, _) = state.cursor.take_frame();
+        if let Some(reason) = &failed {
+            tracing::debug!(%reason, "the compositor refused to fill the cursor buffer");
+        }
+        let pointer = self.pointer.as_mut().expect("checked above");
+        if (ready || failed.is_some())
+            && let Some(frame) = pointer.armed.take()
+        {
+            frame.destroy();
+        }
+        let captured = ready.then(|| pointer.read()).flatten();
+        if let Err(reason) = pointer.rebuild(state, &self.handle) {
+            tracing::warn!(
+                %reason,
+                "the compositor describes a cursor this cannot copy; the client draws its own"
+            );
+            self.give_up_on_the_pointer();
+            return;
+        }
+
+        let mut changed = std::mem::take(&mut state.pointer_changed);
+        if let Some(picture) = captured
+            && self.image.as_deref() != Some(&picture)
+        {
+            self.image = Some(Arc::new(picture));
+            changed = true;
+        }
+        if changed {
+            self.publish_pointer(Some(Pointer {
+                at: state.inside.then_some(state.position),
+                hotspot: state.hotspot,
+                image: self.image.clone(),
+            }));
         }
         self.arm_pointer();
+    }
+
+    /// Reports that this compositor will not say where the pointer is, and
+    /// stops asking.
+    fn give_up_on_the_pointer(&mut self) {
+        if let Some(pointer) = self.pointer.take() {
+            pointer.destroy();
+        }
+        self.image = None;
+        self.publish_pointer(None);
+    }
+
+    /// Writes the pointer through, bumping the serials that changed.
+    ///
+    /// The picture is compared by identity rather than by content: it is
+    /// replaced only when a captured one differs, so two handles to one
+    /// allocation are the same picture, and comparing tens of kilobytes on
+    /// every step of the pointer would not be.
+    fn publish_pointer(&self, pointer: Option<Pointer>) {
+        let mut cursor = self
+            .cursor
+            .lock()
+            .expect("the cursor mutex is never held across a panic");
+        let same_place = cursor.pointer.as_ref().map(|had| (had.at, had.hotspot))
+            == pointer.as_ref().map(|next| (next.at, next.hotspot));
+        let same_image = match (
+            cursor.pointer.as_ref().and_then(|had| had.image.as_ref()),
+            pointer.as_ref().and_then(|next| next.image.as_ref()),
+        ) {
+            (None, None) => true,
+            (Some(had), Some(next)) => Arc::ptr_eq(had, next),
+            _ => false,
+        };
+        if same_place && same_image {
+            return;
+        }
+        cursor.serial += 1;
+        cursor.image_serial += u64::from(!same_image);
+        cursor.pointer = pointer;
     }
 
     fn arm_pointer(&mut self) {
@@ -935,13 +1066,16 @@ impl Pump {
         if pointer.armed.is_some() {
             return;
         }
+        let Some(buffer) = &pointer.buffer else {
+            return;
+        };
         let frame = pointer.session.create_frame(&self.handle, Target::Cursor);
-        frame.attach_buffer(&pointer.buffer);
+        frame.attach_buffer(&buffer.buffer);
         #[expect(
             clippy::cast_possible_wrap,
             reason = "a cursor is a few tens of pixels across"
         )]
-        frame.damage_buffer(0, 0, pointer.size.0 as i32, pointer.size.1 as i32);
+        frame.damage_buffer(0, 0, buffer.size.0 as i32, buffer.size.1 as i32);
         frame.capture();
         pointer.armed = Some(frame);
     }
@@ -1094,81 +1228,169 @@ impl Slab {
 }
 
 impl PointerCapture {
-    /// Sets up the separate cursor session, or gives up quietly.
+    /// Asks for the cursor session. Nothing is waited for and nothing is
+    /// decided: see [`PointerCapture::rebuild`].
     ///
-    /// A pointer that is not over this output, or a compositor that declines
-    /// the session, costs the caller the cursor picture and nothing else, so
-    /// this reports the reason rather than failing the whole capture.
-    fn setup(
-        state: &mut State,
+    /// `None` only when the compositor offers no seat or no shared memory, so
+    /// there is nothing to ask with.
+    fn open(
+        state: &State,
         copies: &ExtImageCopyCaptureManagerV1,
         sources: &ExtOutputImageCaptureSourceManagerV1,
         output: &wl_output::WlOutput,
-        queue: &mut EventQueue<State>,
         handle: &QueueHandle<State>,
     ) -> Option<Self> {
-        let seat = state.seat.clone()?;
-        let shm = state.shm.clone()?;
+        let missing = match (state.seat.clone(), state.shm.clone()) {
+            (Some(seat), Some(shm)) => {
+                return Some(Self::ask(&seat, shm, copies, sources, output, handle));
+            }
+            (None, _) => "wl_seat",
+            (_, None) => "wl_shm",
+        };
+        tracing::warn!(
+            %missing,
+            "the compositor offers no pointer to capture; the client draws its own"
+        );
+        None
+    }
+
+    fn ask(
+        seat: &wl_seat::WlSeat,
+        shm: wl_shm::WlShm,
+        copies: &ExtImageCopyCaptureManagerV1,
+        sources: &ExtOutputImageCaptureSourceManagerV1,
+        output: &wl_output::WlOutput,
+        handle: &QueueHandle<State>,
+    ) -> Self {
         let source = sources.create_source(output, handle, ());
         let pointer = seat.get_pointer(handle, ());
         let cursor = copies.create_pointer_cursor_session(&source, &pointer, handle, ());
         let session = cursor.get_capture_session(handle, Target::Cursor);
-        for _ in 0..2 {
-            if queue.roundtrip(state).is_err() {
-                return None;
+        Self {
+            cursor,
+            session,
+            shm,
+            generation: 0,
+            buffer: None,
+            armed: None,
+        }
+    }
+
+    /// Builds the shared buffer for the current round of constraints, if that
+    /// round is new.
+    ///
+    /// # Errors
+    /// If the compositor described a cursor this cannot allocate a buffer for.
+    /// That ends the cursor path for the session: the same constraints would
+    /// fail the same way every time they were re-sent.
+    fn rebuild(&mut self, state: &State, handle: &QueueHandle<State>) -> Result<(), String> {
+        if state.cursor.generation == self.generation {
+            return Ok(());
+        }
+        let round = state
+            .cursor
+            .current
+            .as_ref()
+            .expect("a generation is only counted when a round completes");
+        self.generation = state.cursor.generation;
+
+        if !round.shm_formats.contains(&wl_shm::Format::Argb8888) {
+            return Err("the cursor session offers no ARGB layout".to_owned());
+        }
+        let (width, height) = round
+            .size
+            .ok_or_else(|| "the cursor session named no size".to_owned())?;
+        if self
+            .buffer
+            .as_ref()
+            .is_some_and(|had| had.size == (width, height))
+        {
+            return Ok(());
+        }
+        tracing::debug!(width, height, "the cursor session named its buffer");
+        let built = CursorBuffer::allocate(&self.shm, width, height, handle)
+            .map_err(|error| error.to_string())?;
+        // Replacing the buffer strands whatever frame was copying into the old
+        // one, so that frame is dropped rather than waited for.
+        if let Some(frame) = self.armed.take() {
+            frame.destroy();
+        }
+        if let Some(previous) = self.buffer.replace(built) {
+            previous.buffer.destroy();
+        }
+        Ok(())
+    }
+
+    /// Reads the picture the compositor just copied in, or reports why not.
+    fn read(&self) -> Option<CursorImage> {
+        let buffer = self.buffer.as_ref()?;
+        let (width, height) = buffer.size;
+        let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+        match buffer.storage.read_exact_at(&mut pixels, 0) {
+            Ok(()) => Some(CursorImage {
+                width,
+                height,
+                pixels,
+            }),
+            Err(error) => {
+                tracing::warn!(%error, "cannot read the captured cursor");
+                None
             }
         }
-        if !state.cursor.done || state.cursor.stopped {
-            tracing::info!("the compositor offered no cursor session");
-            return None;
-        }
-        if !state.cursor.shm_formats.contains(&wl_shm::Format::Argb8888) {
-            tracing::info!("the cursor session offers no ARGB layout");
-            return None;
-        }
-        let (width, height) = state.cursor.size?;
-        let stride = width.checked_mul(4)?;
-        let length = stride.checked_mul(height)?;
+    }
 
-        let storage = std::fs::File::from(
-            rustix::fs::memfd_create("tachyx-cursor", rustix::fs::MemfdFlags::CLOEXEC).ok()?,
-        );
-        storage.set_len(u64::from(length)).ok()?;
+    fn destroy(self) {
+        if let Some(frame) = self.armed {
+            frame.destroy();
+        }
+        if let Some(buffer) = self.buffer {
+            buffer.buffer.destroy();
+        }
+        self.session.destroy();
+        self.cursor.destroy();
+    }
+}
+
+impl CursorBuffer {
+    fn allocate(
+        shm: &wl_shm::WlShm,
+        width: u32,
+        height: u32,
+        handle: &QueueHandle<State>,
+    ) -> Result<Self, std::io::Error> {
+        let (stride, length) = width
+            .checked_mul(4)
+            .and_then(|stride| Some((stride, stride.checked_mul(height)?)))
+            .and_then(|(stride, length)| Some((i32::try_from(stride).ok()?, length)))
+            .and_then(|(stride, length)| Some((stride, i32::try_from(length).ok()?)))
+            .filter(|(_, length)| *length > 0)
+            .ok_or_else(|| {
+                std::io::Error::other(format!("a {width}x{height} cursor is not a buffer"))
+            })?;
+        let storage = std::fs::File::from(rustix::fs::memfd_create(
+            "tachyx-cursor",
+            rustix::fs::MemfdFlags::CLOEXEC,
+        )?);
+        storage.set_len(u64::try_from(length).unwrap_or_default())?;
+        let pool = shm.create_pool(storage.as_fd(), length, handle, ());
         #[expect(
             clippy::cast_possible_wrap,
-            reason = "a cursor is a few tens of pixels across"
-        )]
-        let pool = shm.create_pool(storage.as_fd(), length as i32, handle, ());
-        #[expect(
-            clippy::cast_possible_wrap,
-            reason = "a cursor is a few tens of pixels across"
+            reason = "a stride that fits an i32 bounds the width it was four times"
         )]
         let buffer = pool.create_buffer(
             0,
             width as i32,
             height as i32,
-            stride as i32,
+            stride,
             wl_shm::Format::Argb8888,
             handle,
             (),
         );
         pool.destroy();
-        Some(Self {
-            session,
+        Ok(Self {
             buffer,
             storage,
             size: (width, height),
-            armed: None,
-        })
-    }
-
-    fn read(&self) -> Result<CursorImage, std::io::Error> {
-        let mut pixels = vec![0u8; (self.size.0 * self.size.1 * 4) as usize];
-        self.storage.read_exact_at(&mut pixels, 0)?;
-        Ok(CursorImage {
-            width: self.size.0,
-            height: self.size.1,
-            pixels,
         })
     }
 }

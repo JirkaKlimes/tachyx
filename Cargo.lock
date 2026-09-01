@@ -2303,6 +2303,7 @@ version = "0.1.0"
 dependencies = [
  "quinn",
  "serde",
+ "tachyx-congestion",
  "tachyx-input",
  "tachyx-media",
  "tachyx-proto",
@@ -2343,7 +2344,6 @@ dependencies = [
  "gstreamer-video",
  "rustix",
  "tachyx-dmabuf",
- "tachyx-input",
  "tachyx-proto",
  "thiserror 2.0.20",
  "tracing",

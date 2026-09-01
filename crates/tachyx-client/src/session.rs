@@ -19,6 +19,7 @@ use tachyx_proto::input::InputEvent;
 use tachyx_proto::media::{FrameId, MalformedPacket, Timestamp};
 use tachyx_proto::packet::{Frame, Reassembler, ReassemblyStats};
 
+use crate::cursor::{CursorTracker, CursorView, Spot};
 use crate::input::InputQueue;
 
 /// How long a frame waits for the fragment that would complete it.
@@ -143,6 +144,7 @@ pub struct Session {
     heard: Instant,
     saw: Option<Instant>,
     beat: Option<Heartbeat>,
+    cursor: CursorTracker,
 }
 
 impl Session {
@@ -170,6 +172,7 @@ impl Session {
             heard: now,
             saw: None,
             beat: None,
+            cursor: CursorTracker::new(),
         }
     }
 
@@ -229,12 +232,23 @@ impl Session {
     /// Takes one message the host sent.
     ///
     /// Any message is proof the host is alive, not only a heartbeat.
-    pub fn host(&mut self, message: HostMessage, now: Instant) {
+    pub fn host(&mut self, message: HostMessage, now: Instant, round_trip: Duration) {
         self.heard = now;
         match message {
             HostMessage::Stream(stream) => self.stream = Some(stream),
             HostMessage::Heartbeat(beat) => self.beat = Some(beat),
+            HostMessage::Cursor(update) => self.cursor.reported(now, &update, round_trip),
         }
+    }
+
+    /// Where to draw the host's pointer, or `None` when there is nothing to
+    /// draw.
+    ///
+    /// The position is the client's own, moved by the user's own input and
+    /// corrected by what the host reports, so reading it costs no round trip.
+    #[must_use]
+    pub fn cursor(&self) -> Option<CursorView> {
+        self.cursor.view()
     }
 
     /// Takes one video datagram.
@@ -301,8 +315,34 @@ impl Session {
     ///
     /// `at` is when the client saw the event, not when this was called, so that
     /// batching does not hide inside the latency measurement.
-    pub fn input(&mut self, at: Timestamp, event: InputEvent) {
+    pub fn input(&mut self, at: Timestamp, now: Instant, event: InputEvent) {
+        self.predict(now, &event);
         self.input.push(at, event);
+    }
+
+    /// Moves the client's own pointer by what the user just did.
+    ///
+    /// The wire carries a displacement in pixels of the streamed picture, so
+    /// dividing by that picture is what turns it into the units the tracker
+    /// works in. What the host then does with it is measured rather than
+    /// assumed: see [`crate::cursor::CursorTracker`].
+    fn predict(&mut self, now: Instant, event: &InputEvent) {
+        let Some(stream) = self.stream else {
+            // Nothing is drawn before the host has said how it is encoding, so
+            // there is nothing to move yet.
+            return;
+        };
+        let across = f32::from(stream.visible.width.get());
+        let down = f32::from(stream.visible.height.get());
+        match *event {
+            InputEvent::PointerMotion { dx, dy } => {
+                self.cursor.moved(now, dx / across, dy / down);
+            }
+            InputEvent::PointerMotionAbsolute { x, y } => {
+                self.cursor.placed(now, Spot { x, y });
+            }
+            _ => {}
+        }
     }
 
     /// Whether anything is waiting for the next tick to carry it.
@@ -387,6 +427,10 @@ mod tests {
     fn session() -> Session {
         Session::new(caps(), Instant::now())
     }
+
+    /// A round trip for the tests that hand the session a host message. Only
+    /// the cursor reads it, and only to age a report forward.
+    const RTT: Duration = Duration::from_millis(10);
 
     fn stream() -> StreamConfig {
         StreamConfig {
@@ -495,7 +539,7 @@ mod tests {
         assert_eq!(session.stream(), None);
 
         let now = Instant::now();
-        session.host(HostMessage::Stream(stream()), now);
+        session.host(HostMessage::Stream(stream()), now, RTT);
         assert_eq!(session.stream(), Some(stream()));
 
         let smaller = StreamConfig {
@@ -503,7 +547,7 @@ mod tests {
             visible: Size::new(1280, 720).expect("a size"),
             ..stream()
         };
-        session.host(HostMessage::Stream(smaller), now);
+        session.host(HostMessage::Stream(smaller), now, RTT);
         assert_eq!(
             session.stream(),
             Some(smaller),
@@ -515,16 +559,20 @@ mod tests {
     fn input_leaves_only_when_the_tick_ends() {
         let mut session = session();
 
+        let now = Instant::now();
         session.input(
             Timestamp::from_session_micros(1_000),
+            now,
             InputEvent::PointerMotion { dx: 2.0, dy: 3.0 },
         );
         session.input(
             Timestamp::from_session_micros(2_000),
+            now,
             InputEvent::PointerMotion { dx: 4.0, dy: 1.0 },
         );
         session.input(
             Timestamp::from_session_micros(3_000),
+            now,
             InputEvent::PointerButton {
                 button: PointerButton::Left,
                 press: Press::Down,
@@ -788,16 +836,13 @@ mod tests {
             last_frame: Some(FrameId(0)),
             frames_sent: 1,
             frames_gated: 0,
-            frames_refused: 0,
             pacing_rate: None,
-            estimate: None,
-            padding_sent: 0,
             pipeline_micros: 4_200,
         };
         let mut at = start;
         while at < start + still {
             at += HEARTBEAT_INTERVAL;
-            session.host(HostMessage::Heartbeat(beat), at);
+            session.host(HostMessage::Heartbeat(beat), at, RTT);
         }
         assert_eq!(
             session.liveness(start + still),

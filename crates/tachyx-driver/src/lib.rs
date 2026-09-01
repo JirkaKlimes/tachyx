@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use quinn::{Connection, VarInt};
-use tachyx_client::{Liveness, Session};
+use tachyx_client::{CursorView, Liveness, Session};
 use tachyx_proto::control::{Capabilities, CodedSize, Heartbeat, Size, StreamConfig};
 use tachyx_proto::input::InputEvent;
 use tachyx_proto::media::Timestamp;
@@ -95,6 +95,7 @@ struct State {
     saw: Option<Instant>,
     ended: Option<String>,
     sink: Option<Arc<dyn FrameSink>>,
+    cursor: Option<CursorView>,
 }
 
 /// The one thing the loop and the handle share.
@@ -115,6 +116,7 @@ impl Shared {
                 saw: None,
                 ended: None,
                 sink: None,
+                cursor: None,
             }),
         }
     }
@@ -221,6 +223,17 @@ impl Link {
             host: state.beat,
             ended: state.ended.clone(),
         }
+    }
+
+    /// Where to draw the host's pointer, or `None` when there is nothing to
+    /// draw.
+    ///
+    /// Read once a frame by whatever draws it. The position is the client's
+    /// own, moved by the user's own input and corrected by what the host
+    /// reports, so it costs no round trip and it is never behind the finger.
+    #[must_use]
+    pub fn cursor(&self) -> Option<CursorView> {
+        self.shared.state().cursor.clone()
     }
 
     /// Sends the pictures that arrive from now on to `sink`.

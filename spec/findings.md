@@ -110,6 +110,30 @@ The cursor is excluded from the frame unless asked for, and a separate cursor
 session supplies position, hotspot and a 48x48 ARGB image. This is exactly the
 client-side cursor rendering the architecture asks for, at no cost.
 
+### The cursor session describes its buffer only once the cursor moves
+
+An earlier revision of the line above was measured with a mouse that had just
+been moved, and it hid the trap.
+
+`ext_image_copy_capture_cursor_session_v1.get_capture_session` returns a session
+that sends `enter` and `position` at once and then says nothing at all. The
+buffer constraints, `shm_format`, `dmabuf_format`, `dmabuf_device`,
+`buffer_size` and `done`, arrive on the first cursor update after the session
+was created, and not before. On a still pointer they never arrive. Measured on
+Hyprland 0.56.2 with a probe run repeatedly against one compositor: five runs in
+a row with `done` inside 0.2 ms while the mouse was in use, and `done` never at
+all a few minutes later with the mouse untouched, from the same binary.
+
+`hotspot` is delayed the same way, which the protocol allows in writing:
+"compositors may delay this event until the client captures a new frame".
+
+So a client that waits a bounded number of round trips for `done` and gives up
+is a client that works when the daemon is started with one hand on the mouse and
+not otherwise. That is what a session has to be written for: create it, arm
+nothing, and build the shared buffer whenever the constraints turn up. The same
+handling covers a compositor re-sending constraints for a cursor that changed
+size, which the protocol also allows at any time.
+
 Direct capture requires no user consent on Hyprland. Anything that can reach the
 Wayland socket can record the screen. That is a property of the compositor, not of
 this daemon, but it belongs in the security notes.

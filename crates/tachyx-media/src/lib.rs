@@ -20,6 +20,12 @@
 //! Three buffers rather than two. With two, a buffer that the encoder still
 //! holds when the next one becomes ready leaves the capture thread with nothing
 //! to arm, and capture stalls until the encoder returns.
+//!
+//! The cursor is not in the picture. The compositor leaves it out unless asked,
+//! and a second session on the same connection reports where it is, what its
+//! hotspot is and what it looks like. That is what lets a client draw the
+//! pointer itself and move it the instant the finger does, rather than watching
+//! it arrive one whole pipeline late. [`Capture::cursor`] is where it comes out.
 
 mod capture;
 mod encode;
@@ -28,7 +34,7 @@ mod slot;
 use core::num::NonZeroU32;
 
 pub use capture::{
-    Capture, CaptureFormat, CaptureStats, Cursor, CursorImage, Frame, Frames, Plane,
+    Capture, CaptureFormat, CaptureStats, Cursor, CursorImage, Frame, Frames, Plane, Pointer,
 };
 pub use encode::{
     AccessUnit, AccessUnits, EncodeConfig, EncodeStats, Encoder, Idle, Percentiles, StreamGeometry,

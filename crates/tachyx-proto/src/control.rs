@@ -296,42 +296,14 @@ pub struct Heartbeat {
     pub last_frame: Option<FrameId>,
     /// Frames sent this session.
     pub frames_sent: u64,
-    /// Frames the host declined because the send buffer had no room for them
-    /// whole, or because capture had nowhere to put them.
-    ///
-    /// A safety interlock rather than a rate control: with the pacer keeping
-    /// the transport's queue one or two datagrams deep it should never fire,
-    /// and a session in which it does is a session with something else wrong.
+    /// Frames the host declined to encode because the send buffer had no room
+    /// for them whole.
     pub frames_gated: u64,
-    /// Frames the rate limiter refused because the picture would have cost more
-    /// than the link carries.
-    ///
-    /// Counted apart from `frames_gated` because the two name different faults,
-    /// and the session that reported "179 gated" could not say which mechanism
-    /// did it.
-    pub frames_refused: u64,
     /// The transport's own bandwidth estimate, in bits per second.
     ///
     /// `None` under a congestion controller that does not pace, which is every
-    /// controller but BBR. It is a diagnostic and nothing reads it as a target:
-    /// measured, it reported 0.00 Mbit/s on a healthy hundred-megabit path for
-    /// every sample of a twenty-second run, because its sampler discards any
-    /// measurement taken while the sender is limited by its own supply and a
-    /// sender producing sixty frames a second always is.
+    /// controller but BBR.
     pub pacing_rate: Option<u64>,
-    /// What the host's own congestion controller believes the path will carry,
-    /// in bits per second.
-    ///
-    /// This is the number the session is actually run against, and it is beside
-    /// `pacing_rate` rather than instead of it because the difference between
-    /// the two is the whole reason this controller exists.
-    pub estimate: Option<u32>,
-    /// Datagrams of padding released to time the path.
-    ///
-    /// A still desktop produces no frames, so a controller that only learned
-    /// from media would never learn that the link had recovered. These carry no
-    /// picture and exist to be timed.
-    pub padding_sent: u64,
     /// Median capture to wire latency over the last interval, in microseconds.
     pub pipeline_micros: u32,
 }
@@ -452,13 +424,122 @@ pub enum ClientMessage {
     Feedback(Feedback),
 }
 
+/// Where the host's pointer is and what it looks like.
+///
+/// The client draws the pointer itself, over the video. Capture deliberately
+/// leaves the cursor out of the picture, so this is the only thing that puts it
+/// back, and it is a correction rather than a source: a client that waited for
+/// one of these before moving its pointer would put a round trip inside every
+/// gesture. See [`CursorReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorUpdate {
+    /// The compositor reports the pointer.
+    Tracked(CursorReport),
+    /// The compositor offers no cursor session, so the host cannot say where
+    /// the pointer is or what it looks like. Sent once, and nothing follows it.
+    ///
+    /// A client that is told this draws a pointer of its own at the place its
+    /// own input has been steering. That drifts, because nothing corrects it,
+    /// and it is still far better than a touch surface with nothing on it.
+    Untracked,
+}
+
+/// One report of the pointer, in pixels of the captured screen.
+///
+/// The captured screen, not the encoded picture: the resolution ladder changes
+/// the second at any moment and would otherwise change the meaning of every
+/// figure here in the middle of a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorReport {
+    /// The captured screen, which every other figure here is measured in.
+    pub screen: Size,
+    /// Where the pointer is, or `None` while it is not over the captured
+    /// screen.
+    pub at: Option<CursorPoint>,
+    /// The picture, carried by the update that changes it and by no other.
+    ///
+    /// It is thousands of times the size of a position and changes thousands of
+    /// times less often, and this stream is the same reliable stream input
+    /// travels on, so resending it with every position would put the pointer's
+    /// own picture in front of the user's next click.
+    pub image: Option<CursorImage>,
+}
+
+/// Where the pointer's hotspot is, and where that sits inside the picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorPoint {
+    /// Distance from the left edge of the captured screen, in its pixels.
+    ///
+    /// May fall outside the screen: a cursor overlapping an edge has entered
+    /// the captured area while its hotspot has not.
+    pub x: i32,
+    /// Distance from the top edge.
+    pub y: i32,
+    /// Where the hotspot sits inside the picture, from its left edge.
+    pub hotspot_x: i32,
+    /// The same, from its top edge.
+    pub hotspot_y: i32,
+}
+
+/// A pointer picture, as premultiplied BGRA rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorImage {
+    /// Width in pixels of the captured screen.
+    pub width: NonZeroU16,
+    /// Height.
+    pub height: NonZeroU16,
+    /// `width * height` pixels, row by row, four bytes each: blue, green, red,
+    /// then alpha, with the colour already multiplied by the alpha.
+    ///
+    /// Arrives from the far end, so [`CursorImage::pixels`] is what to read it
+    /// through rather than this field.
+    pixels: Vec<u8>,
+}
+
+impl CursorImage {
+    /// The largest picture one control message carries.
+    ///
+    /// A control message is capped at 64 KiB and four bytes a pixel is what
+    /// this format costs, so this is a cursor of 120 pixels square with room to
+    /// spare for the rest of the update. Every cursor theme in use is far
+    /// smaller: 48 square is what this host was measured serving.
+    pub const MAX_BYTES: usize = 120 * 120 * 4;
+
+    /// Describes a picture, rejecting one whose rows do not add up.
+    #[must_use]
+    pub fn new(width: NonZeroU16, height: NonZeroU16, pixels: Vec<u8>) -> Option<Self> {
+        let image = Self {
+            width,
+            height,
+            pixels,
+        };
+        image.is_whole().then_some(image)
+    }
+
+    /// The rows, once they are known to be the rows this picture claims.
+    ///
+    /// `None` for a picture that arrived from the far end with the wrong number
+    /// of bytes in it, which is the one thing serialisation cannot rule out.
+    #[must_use]
+    pub fn pixels(&self) -> Option<&[u8]> {
+        self.is_whole().then_some(&self.pixels)
+    }
+
+    fn is_whole(&self) -> bool {
+        let expected = usize::from(self.width.get()) * usize::from(self.height.get()) * 4;
+        self.pixels.len() == expected && expected <= Self::MAX_BYTES
+    }
+}
+
 /// Anything the host sends.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HostMessage {
     /// How the host has decided to encode.
     Stream(StreamConfig),
     /// Proof the host is alive, and what it has been doing.
     Heartbeat(Heartbeat),
+    /// Where the pointer is and what it looks like.
+    Cursor(CursorUpdate),
 }
 
 #[cfg(test)]
@@ -588,10 +669,7 @@ mod tests {
             last_frame: Some(FrameId(42)),
             frames_sent: 42,
             frames_gated: 1,
-            frames_refused: 9,
             pacing_rate: Some(940_000_000),
-            estimate: Some(8_500_000),
-            padding_sent: 15,
             pipeline_micros: 7300,
         });
         for message in [stream, heartbeat] {
@@ -633,5 +711,112 @@ mod tests {
                 message
             );
         }
+    }
+
+    fn edge(size: u16) -> NonZeroU16 {
+        NonZeroU16::new(size).unwrap()
+    }
+
+    fn arrow() -> CursorImage {
+        CursorImage::new(edge(48), edge(48), vec![0x7f; 48 * 48 * 4]).unwrap()
+    }
+
+    #[test]
+    fn a_cursor_update_survives_the_round_trip() {
+        let messages = [
+            HostMessage::Cursor(CursorUpdate::Untracked),
+            HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
+                screen: Size::new(3440, 1440).unwrap(),
+                at: Some(CursorPoint {
+                    x: 1436,
+                    y: 710,
+                    hotspot_x: 5,
+                    hotspot_y: 1,
+                }),
+                image: Some(arrow()),
+            })),
+            HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
+                screen: Size::new(3440, 1440).unwrap(),
+                at: None,
+                image: None,
+            })),
+        ];
+        for message in messages {
+            let bytes = postcard::to_stdvec(&message).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<HostMessage>(&bytes).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn a_position_costs_a_fraction_of_the_picture_it_carries_without() {
+        let screen = Size::new(3440, 1440).unwrap();
+        let at = Some(CursorPoint {
+            x: 1436,
+            y: 710,
+            hotspot_x: 5,
+            hotspot_y: 1,
+        });
+        let moved =
+            postcard::to_stdvec(&HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
+                screen,
+                at,
+                image: None,
+            })))
+            .unwrap();
+        let redrawn =
+            postcard::to_stdvec(&HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
+                screen,
+                at,
+                image: Some(arrow()),
+            })))
+            .unwrap();
+        assert!(
+            moved.len() < 24,
+            "a position that carries no picture must stay small, was {} bytes",
+            moved.len()
+        );
+        assert!(
+            redrawn.len() > 100 * moved.len(),
+            "the picture is what this message avoids resending, and it is {} bytes",
+            redrawn.len()
+        );
+    }
+
+    #[test]
+    fn a_picture_whose_rows_do_not_add_up_is_refused() {
+        assert!(
+            CursorImage::new(edge(48), edge(48), vec![0; 48 * 48 * 4 - 1]).is_none(),
+            "a short buffer would be read past its end by whatever draws it"
+        );
+        assert!(
+            CursorImage::new(edge(512), edge(512), vec![0; 512 * 512 * 4]).is_none(),
+            "a picture larger than a control message cannot be sent"
+        );
+    }
+
+    #[test]
+    fn a_picture_that_arrives_malformed_reads_as_nothing() {
+        // What a peer that lies about its own rows puts on the wire. Nothing in
+        // the encoding rules it out, so the reader has to.
+        #[derive(Serialize)]
+        struct Claimed {
+            width: u16,
+            height: u16,
+            pixels: Vec<u8>,
+        }
+
+        let whole = arrow();
+        assert_eq!(whole.pixels().map(<[u8]>::len), Some(48 * 48 * 4));
+        let bytes = postcard::to_stdvec(&Claimed {
+            width: 48,
+            height: 48,
+            pixels: vec![0; 16],
+        })
+        .unwrap();
+        let lie: CursorImage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(lie.pixels(), None);
     }
 }

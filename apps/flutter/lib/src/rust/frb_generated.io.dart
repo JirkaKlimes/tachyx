@@ -74,6 +74,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  bool dco_decode_bool(dynamic raw);
+
+  @protected
+  Cursor dco_decode_box_autoadd_cursor(dynamic raw);
+
+  @protected
+  CursorImage dco_decode_box_autoadd_cursor_image(dynamic raw);
+
+  @protected
+  CursorShape dco_decode_box_autoadd_cursor_shape(dynamic raw);
+
+  @protected
   Encoding dco_decode_box_autoadd_encoding(dynamic raw);
 
   @protected
@@ -90,6 +102,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt dco_decode_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  Cursor dco_decode_cursor(dynamic raw);
+
+  @protected
+  CursorImage dco_decode_cursor_image(dynamic raw);
+
+  @protected
+  CursorShape dco_decode_cursor_shape(dynamic raw);
 
   @protected
   Encoding dco_decode_encoding(dynamic raw);
@@ -126,6 +147,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  Cursor? dco_decode_opt_box_autoadd_cursor(dynamic raw);
+
+  @protected
+  CursorImage? dco_decode_opt_box_autoadd_cursor_image(dynamic raw);
+
+  @protected
+  CursorShape? dco_decode_opt_box_autoadd_cursor_shape(dynamic raw);
 
   @protected
   Encoding? dco_decode_opt_box_autoadd_encoding(dynamic raw);
@@ -215,6 +245,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
+  bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
+  Cursor sse_decode_box_autoadd_cursor(SseDeserializer deserializer);
+
+  @protected
+  CursorImage sse_decode_box_autoadd_cursor_image(SseDeserializer deserializer);
+
+  @protected
+  CursorShape sse_decode_box_autoadd_cursor_shape(SseDeserializer deserializer);
+
+  @protected
   Encoding sse_decode_box_autoadd_encoding(SseDeserializer deserializer);
 
   @protected
@@ -233,6 +275,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  Cursor sse_decode_cursor(SseDeserializer deserializer);
+
+  @protected
+  CursorImage sse_decode_cursor_image(SseDeserializer deserializer);
+
+  @protected
+  CursorShape sse_decode_cursor_shape(SseDeserializer deserializer);
 
   @protected
   Encoding sse_decode_encoding(SseDeserializer deserializer);
@@ -269,6 +320,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  Cursor? sse_decode_opt_box_autoadd_cursor(SseDeserializer deserializer);
+
+  @protected
+  CursorImage? sse_decode_opt_box_autoadd_cursor_image(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  CursorShape? sse_decode_opt_box_autoadd_cursor_shape(
+    SseDeserializer deserializer,
+  );
 
   @protected
   Encoding? sse_decode_opt_box_autoadd_encoding(SseDeserializer deserializer);
@@ -318,9 +382,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   VideoStats sse_decode_video_stats(SseDeserializer deserializer);
-
-  @protected
-  bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
   void sse_encode_AnyhowException(
@@ -374,6 +435,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
+  void sse_encode_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_cursor(Cursor self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_cursor_image(
+    CursorImage self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_cursor_shape(
+    CursorShape self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_encoding(Encoding self, SseSerializer serializer);
 
   @protected
@@ -402,6 +481,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_cursor(Cursor self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_cursor_image(CursorImage self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_cursor_shape(CursorShape self, SseSerializer serializer);
 
   @protected
   void sse_encode_encoding(Encoding self, SseSerializer serializer);
@@ -441,6 +529,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_cursor(
+    Cursor? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_cursor_image(
+    CursorImage? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_cursor_shape(
+    CursorShape? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_opt_box_autoadd_encoding(
@@ -495,9 +601,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_video_stats(VideoStats self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_bool(bool self, SseSerializer serializer);
 }
 
 // Section: wire_class

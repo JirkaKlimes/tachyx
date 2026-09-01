@@ -64,7 +64,7 @@ pub(crate) async fn session(
             },
             message = from_reader.recv() => match message {
                 Some(Ok(message)) => {
-                    session.host(message, Instant::now());
+                    session.host(message, Instant::now(), connection.rtt());
                     None
                 }
                 Some(Err(fault)) => Some(fault.to_string()),
@@ -72,7 +72,7 @@ pub(crate) async fn session(
             },
             command = commands.recv() => match command {
                 Some(Command::Input(at, event)) => {
-                    session.input(at, event);
+                    session.input(at, Instant::now(), event);
                     flush_at.get_or_insert_with(|| Instant::now() + INPUT_TICK);
                     None
                 }
@@ -162,6 +162,7 @@ fn publish(shared: &Arc<Shared>, session: &Session) {
     state.beat = session.heartbeat();
     state.heard = session.heard_at();
     state.saw = session.saw_at();
+    state.cursor = session.cursor();
 }
 
 /// Reads the control stream into a channel the loop can select on.

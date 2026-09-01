@@ -11,6 +11,7 @@ import 'package:flutter/services.dart';
 import 'package:tachyx/src/input/keyboard.dart';
 import 'package:tachyx/src/input/touchpad.dart';
 import 'package:tachyx/src/rust/api/session.dart';
+import 'package:tachyx/src/session/cursor.dart';
 import 'package:tachyx/src/session/pipe.dart';
 import 'package:tachyx/src/session/present.dart';
 import 'package:tachyx/src/session/viewport.dart';
@@ -52,7 +53,7 @@ class SessionScreen extends StatefulWidget {
 }
 
 class _SessionScreenState extends State<SessionScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   /// How often the panel reads the counters. Often enough that the last event
   /// looks live, rarely enough that a panel of text is not redrawn per touch
   /// sample.
@@ -62,6 +63,7 @@ class _SessionScreenState extends State<SessionScreen>
   static const double _unknownAspect = 16 / 9;
 
   final InputPipe _pipe = InputPipe();
+  late final CursorFeed _cursor;
   late final Touchpad _pad;
   late final HardwareKeys _keys;
   late final SoftKeyboard _soft;
@@ -80,6 +82,7 @@ class _SessionScreenState extends State<SessionScreen>
     if (session != null) {
       _pipe.attach(session);
     }
+    _cursor = CursorFeed(session: session, vsync: this);
     _soft = SoftKeyboard(_pipe.sendUnstamped);
     _pad = Touchpad(
       emit: _pipe.send,
@@ -136,6 +139,7 @@ class _SessionScreenState extends State<SessionScreen>
     WidgetsBinding.instance.removeObserver(this);
     _keys.detach();
     _soft.hide();
+    _cursor.dispose();
     _pipe.detach();
     unawaited(_presentation?.close() ?? Future<void>.value());
     super.dispose();
@@ -235,6 +239,7 @@ class _SessionScreenState extends State<SessionScreen>
           ? _unknownAspect
           : encoding.aspectWidth / encoding.aspectHeight,
       crop: presentation.crop(encoding),
+      cursor: _cursor.cursor,
     );
   }
 

@@ -13,7 +13,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cursor;
 pub mod input;
 pub mod session;
 
+pub use cursor::{CursorShape, CursorTracker, CursorView, Spot, Tracking};
 pub use session::{BITRATE_CEILING, Liveness, Session, capabilities};

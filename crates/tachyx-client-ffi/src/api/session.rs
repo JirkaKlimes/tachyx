@@ -174,6 +174,68 @@ impl FrameSink for Present {
     }
 }
 
+/// Where to draw the host's pointer, in fractions of the video picture.
+///
+/// Capture leaves the cursor out of the picture on purpose, so this is what
+/// puts it back, and it is drawn over the video rather than in it: the position
+/// is the client's own, moved by the user's own touches the moment they happen
+/// and corrected by what the host reports. Nothing here waits for a round trip.
+///
+/// Fractions rather than pixels because the host encodes at whatever rung of
+/// the resolution ladder the link allows, and the picture is drawn into a box
+/// of whatever size the window is. Both change under this without changing what
+/// a fraction means.
+#[derive(Debug, Clone)]
+pub struct Cursor {
+    /// The hotspot, from the left edge of the picture.
+    pub x: f32,
+    /// The hotspot, from the top edge.
+    pub y: f32,
+    /// Whether the host has confirmed this position.
+    ///
+    /// False on a compositor that offers no cursor session: the client is then
+    /// steering a pointer nothing corrects, so it drifts, and a client that
+    /// showed that silently would be lying about what it knows.
+    pub confirmed: bool,
+    /// The picture, once the host has sent one.
+    ///
+    /// `None` means draw a pointer of the client's own. Fetched through
+    /// [`Session::cursor_image`] rather than carried here, because it changes
+    /// thousands of times less often than the position and this is read once a
+    /// frame.
+    pub image: Option<CursorShape>,
+}
+
+/// The geometry of the pointer's picture, in fractions of the video picture.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorShape {
+    /// Which picture this is. It changes only when the picture does, so a
+    /// drawing layer decodes each one once.
+    pub serial: u64,
+    /// The picture's width, as a fraction of the video's width.
+    pub width: f32,
+    /// Its height, as a fraction of the video's height.
+    pub height: f32,
+    /// How far left of the hotspot the picture starts.
+    pub hotspot_x: f32,
+    /// How far above the hotspot it starts.
+    pub hotspot_y: f32,
+}
+
+/// The pointer's picture, ready for the platform to turn into an image.
+#[derive(Debug, Clone)]
+pub struct CursorImage {
+    /// Which picture this is, matching [`CursorShape::serial`].
+    pub serial: u64,
+    /// Width in pixels.
+    pub width: u16,
+    /// Height in pixels.
+    pub height: u16,
+    /// `width * height` pixels, row by row, four bytes each: blue, green, red,
+    /// then alpha, with the colour already multiplied by the alpha.
+    pub pixels: Vec<u8>,
+}
+
 /// A live session with a host.
 ///
 /// It holds [`tachyx_driver::Link`] and adds nothing but the translation: the
@@ -260,6 +322,50 @@ impl Session {
                     .or_else(|| present.refused.get().cloned())
             }),
         }
+    }
+
+    /// Where to draw the host's pointer, or `None` when there is nothing to
+    /// draw: before the host has said anything, or while the pointer is on
+    /// another monitor.
+    ///
+    /// Synchronous, and read once a frame by the layer that draws it. A round
+    /// trip through the isolate for a pointer position would be the one round
+    /// trip this whole path exists to avoid.
+    #[frb(sync)]
+    #[must_use]
+    pub fn cursor(&self) -> Option<Cursor> {
+        self.link.cursor().map(|view| Cursor {
+            x: view.at.x,
+            y: view.at.y,
+            confirmed: view.tracking == tachyx_client::Tracking::Reported,
+            image: view.shape.map(|shape| CursorShape {
+                serial: shape.serial,
+                width: shape.width,
+                height: shape.height,
+                hotspot_x: shape.hotspot_x,
+                hotspot_y: shape.hotspot_y,
+            }),
+        })
+    }
+
+    /// The rows of the pointer's current picture, if it is the one asked for.
+    ///
+    /// `serial` is what [`CursorShape::serial`] last reported. Passing it keeps
+    /// the picture off this boundary except on the frame it changes, which is
+    /// once every few seconds against sixty reads of the position a second.
+    #[frb(sync)]
+    #[must_use]
+    pub fn cursor_image(&self, serial: u64) -> Option<CursorImage> {
+        let shape = self.link.cursor()?.shape?;
+        if shape.serial != serial {
+            return None;
+        }
+        Some(CursorImage {
+            serial: shape.serial,
+            width: shape.image.width.get(),
+            height: shape.image.height.get(),
+            pixels: shape.image.pixels()?.to_vec(),
+        })
     }
 
     /// Records what the user did.

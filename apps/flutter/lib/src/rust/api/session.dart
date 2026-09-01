@@ -12,7 +12,7 @@ import 'video.dart';
 
 // These functions are ignored because they are not marked as `pub`: `asked_for`, `present`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Present`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `push`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `push`
 
 /// The protocol version this build speaks.
 ///
@@ -48,6 +48,22 @@ Future<Session> connect({
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Session>>
 abstract class Session implements RustOpaqueInterface {
+  /// Where to draw the host's pointer, or `None` when there is nothing to
+  /// draw: before the host has said anything, or while the pointer is on
+  /// another monitor.
+  ///
+  /// Synchronous, and read once a frame by the layer that draws it. A round
+  /// trip through the isolate for a pointer position would be the one round
+  /// trip this whole path exists to avoid.
+  Cursor? cursor();
+
+  /// The rows of the pointer's current picture, if it is the one asked for.
+  ///
+  /// `serial` is what [`CursorShape::serial`] last reported. Passing it keeps
+  /// the picture off this boundary except on the frame it changes, which is
+  /// once every few seconds against sixty reads of the position a second.
+  CursorImage? cursorImage({required BigInt serial});
+
   /// Records what the user did.
   ///
   /// `at_micros` is when the client saw the event, taken from
@@ -87,6 +103,144 @@ abstract class Session implements RustOpaqueInterface {
     required int viewportHeight,
     required int refreshHz,
   });
+}
+
+/// Where to draw the host's pointer, in fractions of the video picture.
+///
+/// Capture leaves the cursor out of the picture on purpose, so this is what
+/// puts it back, and it is drawn over the video rather than in it: the position
+/// is the client's own, moved by the user's own touches the moment they happen
+/// and corrected by what the host reports. Nothing here waits for a round trip.
+///
+/// Fractions rather than pixels because the host encodes at whatever rung of
+/// the resolution ladder the link allows, and the picture is drawn into a box
+/// of whatever size the window is. Both change under this without changing what
+/// a fraction means.
+class Cursor {
+  /// The hotspot, from the left edge of the picture.
+  final double x;
+
+  /// The hotspot, from the top edge.
+  final double y;
+
+  /// Whether the host has confirmed this position.
+  ///
+  /// False on a compositor that offers no cursor session: the client is then
+  /// steering a pointer nothing corrects, so it drifts, and a client that
+  /// showed that silently would be lying about what it knows.
+  final bool confirmed;
+
+  /// The picture, once the host has sent one.
+  ///
+  /// `None` means draw a pointer of the client's own. Fetched through
+  /// [`Session::cursor_image`] rather than carried here, because it changes
+  /// thousands of times less often than the position and this is read once a
+  /// frame.
+  final CursorShape? image;
+
+  const Cursor({
+    required this.x,
+    required this.y,
+    required this.confirmed,
+    this.image,
+  });
+
+  @override
+  int get hashCode =>
+      x.hashCode ^ y.hashCode ^ confirmed.hashCode ^ image.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Cursor &&
+          runtimeType == other.runtimeType &&
+          x == other.x &&
+          y == other.y &&
+          confirmed == other.confirmed &&
+          image == other.image;
+}
+
+/// The pointer's picture, ready for the platform to turn into an image.
+class CursorImage {
+  /// Which picture this is, matching [`CursorShape::serial`].
+  final BigInt serial;
+
+  /// Width in pixels.
+  final int width;
+
+  /// Height in pixels.
+  final int height;
+
+  /// `width * height` pixels, row by row, four bytes each: blue, green, red,
+  /// then alpha, with the colour already multiplied by the alpha.
+  final Uint8List pixels;
+
+  const CursorImage({
+    required this.serial,
+    required this.width,
+    required this.height,
+    required this.pixels,
+  });
+
+  @override
+  int get hashCode =>
+      serial.hashCode ^ width.hashCode ^ height.hashCode ^ pixels.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CursorImage &&
+          runtimeType == other.runtimeType &&
+          serial == other.serial &&
+          width == other.width &&
+          height == other.height &&
+          pixels == other.pixels;
+}
+
+/// The geometry of the pointer's picture, in fractions of the video picture.
+class CursorShape {
+  /// Which picture this is. It changes only when the picture does, so a
+  /// drawing layer decodes each one once.
+  final BigInt serial;
+
+  /// The picture's width, as a fraction of the video's width.
+  final double width;
+
+  /// Its height, as a fraction of the video's height.
+  final double height;
+
+  /// How far left of the hotspot the picture starts.
+  final double hotspotX;
+
+  /// How far above the hotspot it starts.
+  final double hotspotY;
+
+  const CursorShape({
+    required this.serial,
+    required this.width,
+    required this.height,
+    required this.hotspotX,
+    required this.hotspotY,
+  });
+
+  @override
+  int get hashCode =>
+      serial.hashCode ^
+      width.hashCode ^
+      height.hashCode ^
+      hotspotX.hashCode ^
+      hotspotY.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is CursorShape &&
+          runtimeType == other.runtimeType &&
+          serial == other.serial &&
+          width == other.width &&
+          height == other.height &&
+          hotspotX == other.hotspotX &&
+          hotspotY == other.hotspotY;
 }
 
 /// How the host said it is encoding.

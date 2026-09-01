@@ -180,8 +180,7 @@ statuses, and drops to every 250 ms while the host's announced bitrate is under
   before it has received one: what it reads is the *absence* of a heartbeat.
 
 `CursorUpdate`
-: Cursor position and shape. The client renders the cursor locally so that pointer
-  movement is not gated on a round trip.
+: Where the pointer is and what it looks like. Specified below.
 
 `ClockSyncReply`
 : The client's timestamp, the host's receive timestamp, and the host's send
@@ -189,6 +188,102 @@ statuses, and drops to every 250 ms while the host's announced bitrate is under
 
 `HostStats`
 : Per-stage timings measured on the host, for the client's statistics overlay.
+
+### The cursor
+
+Capture asks the compositor to leave the cursor out of the frame, and asks a
+separate cursor session for its position, its hotspot and its picture. So the
+pointer is not in the video, and this message is the only thing that puts it
+back.
+
+That is deliberate rather than a limitation. A pointer that arrived inside the
+picture would move only as fast as a frame could be captured, encoded, sent,
+decoded and drawn, so every flick of the finger would drag a pointer that lags
+by the whole pipeline. Drawn locally it moves with the finger, and these updates
+correct it.
+
+```rust
+pub enum CursorUpdate {
+    /// The compositor reports the pointer.
+    Tracked(CursorReport),
+    /// The compositor offers no cursor session. Sent once; nothing follows it.
+    Untracked,
+}
+
+pub struct CursorReport {
+    /// The captured screen, which every other figure here is measured in.
+    pub screen: Size,
+    /// Where the pointer is, or `None` while it is not over that screen.
+    pub at: Option<CursorPoint>,
+    /// The picture, in the update that changes it and in no other.
+    pub image: Option<CursorImage>,
+}
+
+pub struct CursorPoint {
+    /// The hotspot, from the left edge of the captured screen, in its pixels.
+    pub x: i32,
+    /// The same, from the top edge.
+    pub y: i32,
+    /// Where the hotspot sits inside the picture, from its left edge.
+    pub hotspot_x: i32,
+    /// The same, from its top edge.
+    pub hotspot_y: i32,
+}
+
+pub struct CursorImage {
+    pub width: NonZeroU16,
+    pub height: NonZeroU16,
+    /// `width * height` pixels, row by row, four bytes each: blue, green, red,
+    /// then alpha, with the colour already multiplied by the alpha.
+    pixels: Vec<u8>,
+}
+```
+
+Every figure is in pixels of the **captured screen**, not of the encoded
+picture. The resolution ladder changes the second at any moment, and it would
+otherwise change the meaning of every number here in the middle of a session.
+The client divides by `screen` and multiplies by the box it draws the video
+into, which is also what makes a capture whose aspect ratio the encoder
+corrected come out right: the two axes are scaled independently.
+
+`screen` travels with every report rather than once. It is four bytes and it
+makes the message answerable on its own, which the alternative -- deriving it
+from `StreamConfig` -- would not, because `StreamConfig` describes the encoded
+picture and this does not.
+
+**The picture travels only when it changes.** A 48-pixel cursor is 9216 bytes,
+about seven hundred times a bare position, and this is the same reliable stream
+input travels on: resending it with every step of the pointer would put the
+pointer's own picture in front of the user's next click. A picture larger than
+`120 x 120` does not fit in one control message and is not sent; the position
+still is, and the client draws a pointer of its own.
+
+`pixels` is private, and read through an accessor that returns `None` unless the
+length is exactly `width * height * 4`. Nothing in the encoding rules out a peer
+that lies about its own rows, and what would read them is a rasteriser.
+
+The host looks at the pointer every 16 ms and sends only what changed, so a
+still pointer costs nothing. `at` of `None` means the pointer is on another
+monitor: the client draws nothing rather than pinning it to an edge.
+
+#### What the client does with it
+
+The client keeps its own position, as a fraction of the screen, and moves it the
+instant the user's finger does. A host report is a correction, and correcting is
+not the same as obeying: the report describes the host as it was about half a
+round trip ago, so everything the client has done since is replayed on top of it
+before the two are compared. Without that replay a steady drag rubber-bands, one
+report per frame.
+
+A disagreement under 5% of the screen is eased away at 35% per report, which
+clears it inside a tenth of a second and cannot jump the pointer on one wrong
+report. A disagreement above that is not drift -- somebody moved the host's own
+mouse -- and is taken outright.
+
+`Untracked` is answered by drawing the client's own arrow at the position it has
+been steering. Nothing corrects it, so it drifts, and it is drawn as the
+client's own mark rather than as the host's cursor. A trackpad with a pointer
+that drifts is usable; one with no pointer at all is what this exists to fix.
 
 ## Input events
 
