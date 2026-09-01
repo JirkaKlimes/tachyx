@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use keycode::{KeyMap, KeyMapping};
 use keymap::TextKeymap;
-use tachyx_proto::input::{HidUsage, InputEvent, PointerButton, Press, ScrollSource};
+use tachyx_proto::input::{HidUsage, InputEvent, PointerButton, Press};
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
 use wayland_protocols::xdg::xdg_output::zv1::client::{
@@ -254,8 +254,20 @@ impl Injector {
                     .button(time, button_code(button), press_state(press));
                 true
             }
-            InputEvent::Scroll { dx, dy, source } => {
-                self.scroll(time, dx, dy, source);
+            InputEvent::Wheel { dx, dy } => {
+                self.scroll(time, dx, dy, wl_pointer::AxisSource::Wheel);
+                true
+            }
+            InputEvent::FingerScroll { dx, dy } => {
+                self.scroll(time, dx, dy, wl_pointer::AxisSource::Finger);
+                true
+            }
+            InputEvent::FingerScrollEnd => {
+                self.pointer.axis_source(wl_pointer::AxisSource::Finger);
+                self.pointer
+                    .axis_stop(time, wl_pointer::Axis::VerticalScroll);
+                self.pointer
+                    .axis_stop(time, wl_pointer::Axis::HorizontalScroll);
                 true
             }
             InputEvent::Key { usage, press } => {
@@ -269,12 +281,8 @@ impl Injector {
         }
     }
 
-    fn scroll(&self, time: u32, dx: f32, dy: f32, source: ScrollSource) {
-        let (wl_source, discrete) = match source {
-            ScrollSource::Wheel => (wl_pointer::AxisSource::Wheel, true),
-            ScrollSource::Finger => (wl_pointer::AxisSource::Finger, false),
-        };
-        self.pointer.axis_source(wl_source);
+    fn scroll(&self, time: u32, dx: f32, dy: f32, source: wl_pointer::AxisSource) {
+        self.pointer.axis_source(source);
         for (axis, delta) in [
             (wl_pointer::Axis::HorizontalScroll, dx),
             (wl_pointer::Axis::VerticalScroll, dy),
@@ -283,7 +291,7 @@ impl Injector {
                 continue;
             }
             self.pointer.axis(time, axis, f64::from(delta));
-            if discrete {
+            if source == wl_pointer::AxisSource::Wheel {
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "a detent count is small by construction"
@@ -296,30 +304,27 @@ impl Injector {
                 );
             }
         }
-        if matches!(source, ScrollSource::Finger) && dx == 0.0 && dy == 0.0 {
-            self.pointer
-                .axis_stop(time, wl_pointer::Axis::VerticalScroll);
-            self.pointer
-                .axis_stop(time, wl_pointer::Axis::HorizontalScroll);
-        }
     }
 
     fn key(&mut self, time: u32, usage: HidUsage, press: Press) {
-        if usage.page() != HidUsage::KEYBOARD_PAGE {
-            tracing::debug!(usage = usage.0, "dropping a key outside the keyboard page");
+        if usage.page != HidUsage::KEYBOARD_PAGE {
+            tracing::debug!(
+                page = usage.page,
+                "dropping a key outside the keyboard page"
+            );
             return;
         }
-        let Ok(mapping) = KeyMap::from_key_mapping(KeyMapping::Usb(usage.id())) else {
-            tracing::debug!(usage = usage.0, "dropping a key with no evdev equivalent");
+        let Ok(mapping) = KeyMap::from_key_mapping(KeyMapping::Usb(usage.id)) else {
+            tracing::debug!(id = usage.id, "dropping a key with no evdev equivalent");
             return;
         };
 
         let before = (self.held, self.locked);
-        let held = held_modifier(usage.id());
+        let held = held_modifier(usage.id);
         match press {
             Press::Down => {
                 self.held |= held;
-                self.locked ^= locking_modifier(usage.id());
+                self.locked ^= locking_modifier(usage.id);
             }
             Press::Up => self.held &= !held,
         }

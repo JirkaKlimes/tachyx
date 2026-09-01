@@ -8,40 +8,46 @@
 //! authentication tag. QUIC already supplies encryption, connection identity and
 //! path management. Dropping RTP is what buys the room for a real timestamp.
 
-use core::num::NonZeroU16;
+use core::num::{NonZeroU16, NonZeroUsize};
 
 /// Length of a packet header in bytes.
 pub const HEADER_LEN: usize = 16;
 
-/// A capture instant, relative to the start of the session, in units of 100
-/// microseconds.
+/// A capture instant, counted in units of 100 microseconds.
 ///
-/// Microseconds would overflow a `u32` after 71 minutes, and a remote desktop
-/// session routinely runs longer than that. At 100-microsecond resolution the
-/// same four bytes last 119 hours, which removes the wraparound entirely rather
-/// than asking every receiver to unwrap it correctly.
+/// Microseconds would overflow four bytes after 71 minutes, and a remote desktop
+/// session routinely runs longer than that. At this resolution the same four
+/// bytes span 119 hours before they wrap, and the resolution is still finer than
+/// anything that reads them: latency is reported in milliseconds and congestion
+/// feedback measures arrival deltas in units of 250 microseconds.
 ///
-/// The resolution is finer than anything that consumes it: latency is reported in
-/// milliseconds, and congestion feedback measures arrival deltas in units of 250
-/// microseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// The counter wraps rather than saturating, and differences are taken circularly
+/// by [`Timestamp::micros_since`]. Saturating would leave a session open past 119
+/// hours emitting one identical timestamp forever, which stops presentation pacing
+/// with nothing to indicate why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp(u32);
 
 impl Timestamp {
     /// The number of microseconds in one tick.
     const TICK_US: u64 = 100;
 
-    /// Quantises a session-relative duration to a timestamp, saturating at the
-    /// 119-hour ceiling rather than wrapping.
+    /// Quantises a session-relative duration to a timestamp.
     #[must_use]
     pub fn from_session_micros(micros: u64) -> Self {
-        Self(u32::try_from(micros / Self::TICK_US).unwrap_or(u32::MAX))
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the counter is defined to wrap; differences are taken circularly"
+        )]
+        Self((micros / Self::TICK_US) as u32)
     }
 
-    /// The instant in microseconds since the session began.
+    /// Microseconds elapsed between `earlier` and this instant.
+    ///
+    /// Correct across the wrap, for any pair less than 119 hours apart.
     #[must_use]
-    pub fn as_session_micros(self) -> u64 {
-        u64::from(self.0) * Self::TICK_US
+    pub fn micros_since(self, earlier: Self) -> u64 {
+        u64::from(self.0.wrapping_sub(earlier.0)) * Self::TICK_US
     }
 }
 
@@ -57,11 +63,32 @@ pub struct Fragment {
 }
 
 impl Fragment {
-    /// Describes packet `index` of `count`.
+    /// Divides a slice of encoded video across the packets it needs, yielding
+    /// each packet's descriptor and the bytes it carries.
     ///
-    /// Returns `None` unless the index falls inside the count.
-    #[must_use]
-    pub const fn new(index: u16, count: NonZeroU16) -> Option<Self> {
+    /// The sender never constructs a descriptor itself, so an index outside its
+    /// count cannot be written in the first place.
+    ///
+    /// # Panics
+    /// If the slice would need more than `u16::MAX` packets. At any datagram size
+    /// a transport can negotiate, that is a slice larger than any encoder emits.
+    pub fn split(
+        len: usize,
+        per_packet: NonZeroUsize,
+    ) -> impl Iterator<Item = (Self, core::ops::Range<usize>)> {
+        let per = per_packet.get();
+        let packets = len.div_ceil(per).max(1);
+        let count =
+            NonZeroU16::new(u16::try_from(packets).expect("slice exceeds the packet space"))
+                .expect("div_ceil floored at one is never zero");
+        (0..count.get()).map(move |index| {
+            let start = usize::from(index) * per;
+            (Self { count, index }, start..(start + per).min(len))
+        })
+    }
+
+    /// Describes packet `index` of `count`, rejecting an index outside the count.
+    const fn checked(index: u16, count: NonZeroU16) -> Option<Self> {
         if index < count.get() {
             Some(Self { count, index })
         } else {
@@ -82,12 +109,6 @@ impl Fragment {
     #[must_use]
     pub const fn index(self) -> u16 {
         self.index
-    }
-
-    /// Whether this is the last packet of the slice.
-    #[must_use]
-    pub const fn is_last(self) -> bool {
-        self.index + 1 == self.count.get()
     }
 }
 
@@ -162,12 +183,10 @@ impl PacketHeader {
     const FLAG_KEY: u8 = 1 << 0;
     const FLAG_LAST_SLICE: u8 = 1 << 1;
 
-    /// Writes the header into the first [`HEADER_LEN`] bytes of `out`.
-    ///
-    /// # Panics
-    /// If `out` is shorter than [`HEADER_LEN`].
-    pub fn write(self, out: &mut [u8]) {
-        let (head, _) = out.split_at_mut(HEADER_LEN);
+    /// The header as it appears on the wire.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; HEADER_LEN] {
+        let mut head = [0u8; HEADER_LEN];
         let mut flags = 0;
         if matches!(self.kind, FrameKind::Key) {
             flags |= Self::FLAG_KEY;
@@ -182,6 +201,7 @@ impl PacketHeader {
         head[12..14].copy_from_slice(&self.fragment.index.to_le_bytes());
         head[14] = self.slice;
         head[15] = flags;
+        head
     }
 
     /// Splits a received datagram into its header and its video payload.
@@ -202,7 +222,7 @@ impl PacketHeader {
         let count = NonZeroU16::new(u16::from_le_bytes([head[10], head[11]]))
             .ok_or(MalformedPacket::EmptySlice)?;
         let index = u16::from_le_bytes([head[12], head[13]]);
-        let fragment = Fragment::new(index, count).ok_or(MalformedPacket::IndexOutOfRange)?;
+        let fragment = Fragment::checked(index, count).ok_or(MalformedPacket::IndexOutOfRange)?;
         let flags = head[15];
         Ok((
             Self {
@@ -249,7 +269,10 @@ mod tests {
             frame: FrameId(0x0123_4567),
             capture: Timestamp::from_session_micros(9_999_900),
             seq: Seq(0xBEEF),
-            fragment: Fragment::new(2, NonZeroU16::new(7).unwrap()).unwrap(),
+            fragment: Fragment::split(7 * 100, NonZeroUsize::new(100).unwrap())
+                .nth(2)
+                .expect("seven packets exist")
+                .0,
             slice: 3,
             kind: FrameKind::Key,
             last_slice: true,
@@ -258,42 +281,58 @@ mod tests {
 
     #[test]
     fn header_survives_a_round_trip() {
-        let mut buf = [0u8; HEADER_LEN + 4];
-        header().write(&mut buf);
-        buf[HEADER_LEN..].copy_from_slice(b"data");
+        let mut buf = header().to_bytes().to_vec();
+        buf.extend_from_slice(b"data");
         let (parsed, payload) = PacketHeader::parse(&buf).unwrap();
         assert_eq!(parsed, header());
         assert_eq!(payload, b"data");
     }
 
     #[test]
-    fn header_occupies_exactly_sixteen_bytes() {
-        let mut buf = [0xAAu8; HEADER_LEN + 1];
-        header().write(&mut buf);
-        assert_eq!(buf[HEADER_LEN], 0xAA, "write overran the header");
-    }
-
-    #[test]
     fn unknown_flag_bits_do_not_reject_a_packet() {
-        let mut buf = [0u8; HEADER_LEN + 1];
-        header().write(&mut buf);
+        let mut buf = header().to_bytes().to_vec();
         buf[15] |= 0b1111_1100;
-        buf[HEADER_LEN] = 1;
+        buf.push(1);
         let (parsed, _) = PacketHeader::parse(&buf).expect("later versions may set spare bits");
         assert_eq!(parsed.kind, FrameKind::Key);
         assert!(parsed.last_slice);
     }
 
     #[test]
-    fn a_fragment_index_outside_its_count_cannot_be_built() {
-        assert!(Fragment::new(7, NonZeroU16::new(7).unwrap()).is_none());
-        assert!(Fragment::new(6, NonZeroU16::new(7).unwrap()).is_some());
+    fn splitting_covers_every_byte_exactly_once() {
+        let per = NonZeroUsize::new(1418).unwrap();
+        for len in [1usize, 1417, 1418, 1419, 100_000] {
+            let parts: Vec<_> = Fragment::split(len, per).collect();
+            assert_eq!(usize::from(parts[0].0.count().get()), parts.len());
+            let mut covered = 0;
+            for (index, (fragment, range)) in parts.iter().enumerate() {
+                assert_eq!(usize::from(fragment.index()), index);
+                assert_eq!(range.start, covered);
+                covered = range.end;
+            }
+            assert_eq!(covered, len, "len {len} was not fully covered");
+        }
+    }
+
+    #[test]
+    fn an_empty_slice_still_produces_one_packet() {
+        let parts: Vec<_> = Fragment::split(0, NonZeroUsize::new(1418).unwrap()).collect();
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn a_fragment_index_outside_its_count_cannot_be_parsed() {
+        assert!(Fragment::checked(7, NonZeroU16::new(7).unwrap()).is_none());
+        assert!(Fragment::checked(6, NonZeroU16::new(7).unwrap()).is_some());
     }
 
     #[test]
     fn malformed_packets_are_named() {
-        let mut buf = [0u8; HEADER_LEN + 1];
-        header().write(&mut buf);
+        let buf = {
+            let mut b = header().to_bytes().to_vec();
+            b.push(1);
+            b
+        };
         assert_eq!(
             PacketHeader::parse(&buf[..HEADER_LEN - 1]),
             Err(MalformedPacket::TooShort)
@@ -302,7 +341,7 @@ mod tests {
             PacketHeader::parse(&buf[..HEADER_LEN]),
             Err(MalformedPacket::NoPayload)
         );
-        let mut empty_slice = buf;
+        let mut empty_slice = buf.clone();
         empty_slice[10..12].copy_from_slice(&0u16.to_le_bytes());
         assert_eq!(
             PacketHeader::parse(&empty_slice),
@@ -325,12 +364,18 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_spans_a_session_longer_than_any_desktop_stays_open() {
-        let ceiling = Timestamp::from_session_micros(u64::from(u32::MAX) * 100);
-        assert!(ceiling.as_session_micros() / 1_000_000 / 3600 > 100);
+    fn timestamps_measure_correctly_across_the_wrap() {
+        let late = Timestamp::from_session_micros(u64::from(u32::MAX) * 100);
+        let wrapped = Timestamp::from_session_micros((u64::from(u32::MAX) + 3) * 100);
         assert_eq!(
-            Timestamp::from_session_micros(12_345_600).as_session_micros(),
-            12_345_600
+            wrapped.micros_since(late),
+            300,
+            "a session that outlives the counter must still measure elapsed time"
+        );
+        assert_eq!(
+            Timestamp::from_session_micros(12_345_600)
+                .micros_since(Timestamp::from_session_micros(12_000_000)),
+            345_600
         );
     }
 }

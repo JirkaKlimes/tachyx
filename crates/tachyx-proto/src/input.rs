@@ -12,89 +12,65 @@ use serde::{Deserialize, Serialize};
 /// Whether a key or button went down or came up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Press {
-    /// The key or button is now held.
+    /// Now held.
     Down,
-    /// The key or button was released.
+    /// Now released.
     Up,
 }
 
 /// A pointer button.
-///
-/// The set a remote desktop needs. Higher buttons exist in evdev but no client
-/// we ship can produce them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointerButton {
-    /// Primary button.
+    /// The left physical button, whichever hand the user has configured.
     Left,
-    /// Context-menu button.
+    /// The right physical button.
     Right,
-    /// Wheel button.
+    /// The wheel button.
     Middle,
-    /// Navigate back.
+    /// The button a mouse dedicates to navigating back.
     Back,
-    /// Navigate forward.
+    /// The button a mouse dedicates to navigating forward.
     Forward,
 }
 
-/// What produced a scroll, which decides whether the host reports it as a
-/// discrete wheel detent or as smooth finger motion.
+/// A USB HID usage: which page it belongs to, and which usage within that page.
+///
+/// Flutter reports the two packed into one integer. They are separate here
+/// because every use site needs one or the other, never the pair, and because a
+/// page is what decides whether the host can act on the usage at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ScrollSource {
-    /// A mouse wheel, which moves in detents.
-    Wheel,
-    /// A touch surface, which moves continuously and can be flung.
-    Finger,
+pub struct HidUsage {
+    /// The usage page. Android reports a value outside any HID page when an input
+    /// method intercepts a key, so this is checked before the usage is trusted.
+    pub page: u16,
+    /// The usage within the page.
+    pub id: u16,
 }
 
-/// A USB HID usage, as a usage page in the high sixteen bits and a usage
-/// identifier in the low sixteen.
-///
-/// This is exactly the encoding Flutter's `PhysicalKeyboardKey.usbHidUsage`
-/// produces, so a client copies the value onto the wire without touching it.
-/// The host resolves it to a Linux evdev keycode and drops what it cannot
-/// resolve rather than guessing.
-///
-/// Carrying the page costs one byte and keeps the consumer page, where the
-/// volume and media keys live, reachable without a protocol break.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HidUsage(pub u32);
-
 impl HidUsage {
-    /// The keyboard usage page, the only page the host currently injects.
+    /// The keyboard page, the only one the host injects from.
     pub const KEYBOARD_PAGE: u16 = 0x0007;
-
-    /// The usage page.
-    ///
-    /// Android reports a value outside any HID page when an input method
-    /// intercepts a key, so this must be checked before the identifier is used.
-    #[must_use]
-    pub const fn page(self) -> u16 {
-        let [_, _, a, b] = self.0.to_le_bytes();
-        u16::from_le_bytes([a, b])
-    }
-
-    /// The usage identifier within the page.
-    #[must_use]
-    pub const fn id(self) -> u16 {
-        let [a, b, _, _] = self.0.to_le_bytes();
-        u16::from_le_bytes([a, b])
-    }
 }
 
 /// One thing the user did.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
-    /// Pointer moved by this much, in host pixels. This is what a touch screen
-    /// used as a trackpad produces, and what a captured mouse produces.
+    /// The pointer moved by this much, measured in pixels of the streamed image.
+    ///
+    /// The host scales by whatever ratio its capture bears to the resolution it
+    /// is currently encoding, so the pointer keeps the same feel when congestion
+    /// steps the resolution down. A client cannot express this in the host's own
+    /// pixels, because it is never told what they are.
     PointerMotion {
         /// Horizontal displacement.
         dx: f32,
         /// Vertical displacement.
         dy: f32,
     },
-    /// Pointer moved to this position, as a fraction of the streamed image in
-    /// each axis. A desktop client whose real mouse hovers over the video knows
-    /// where the user is pointing and should say so directly.
+    /// The pointer moved to this position, as a fraction of the streamed image.
+    ///
+    /// A desktop client whose real mouse hovers over the video knows where the
+    /// user is pointing and says so, rather than accumulating deltas.
     PointerMotionAbsolute {
         /// Horizontal position, `0.0` at the left edge and `1.0` at the right.
         x: f32,
@@ -108,24 +84,43 @@ pub enum InputEvent {
         /// Its new state.
         press: Press,
     },
-    /// The surface under the pointer was scrolled, in host pixels.
-    Scroll {
-        /// Horizontal scroll distance, positive to the right.
+    /// A wheel turned, in pixels of the streamed image.
+    ///
+    /// Separate from finger scrolling because a wheel moves in detents and has no
+    /// end: there is no moment at which the user stops touching it.
+    Wheel {
+        /// Horizontal distance, positive to the right.
         dx: f32,
-        /// Vertical scroll distance, positive downwards.
+        /// Vertical distance, positive downwards.
         dy: f32,
-        /// What produced it.
-        source: ScrollSource,
     },
+    /// Fingers dragged across a touch surface, in pixels of the streamed image.
+    FingerScroll {
+        /// Horizontal distance, positive to the right.
+        dx: f32,
+        /// Vertical distance, positive downwards.
+        dy: f32,
+    },
+    /// The fingers left the touch surface.
+    ///
+    /// Applications need this to start their own kinetic scrolling and, more
+    /// importantly, to stop it. Without it a flung surface never settles.
+    FingerScrollEnd,
     /// A key changed state.
+    ///
+    /// A client sends only genuine transitions. The host repeats a held key
+    /// itself, so forwarding a platform's own repeat events would double it.
     Key {
-        /// Which key, as a USB HID usage code.
+        /// Which key.
         usage: HidUsage,
         /// Its new state.
         press: Press,
     },
     /// Text the user entered by some means that is not a key press, such as a
-    /// phone's on-screen keyboard or a dictation engine. The host synthesises
-    /// whatever key presses are needed to produce it.
+    /// phone's on-screen keyboard.
+    ///
+    /// Insertion only. Deleting and entering a newline have real HID usages, so a
+    /// client sends those as [`InputEvent::Key`] and they pass through the host's
+    /// own layout untouched.
     Text(String),
 }

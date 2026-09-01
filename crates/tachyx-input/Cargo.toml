@@ -8,15 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tachyx-proto = { path = "../tachyx-proto" }
-keycode = "1.0"
-rustix = { version = "1.1", features = ["fs", "pipe"] }
-thiserror = "2.0"
-tracing = "0.1"
-wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
-wayland-protocols-misc = { version = "0.3", features = ["client"] }
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+tachyx-proto.workspace = true
+keycode.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-misc.workspace = true
+wayland-protocols-wlr.workspace = true
 
 [lints]
 workspace = true

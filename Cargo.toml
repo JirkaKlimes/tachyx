@@ -5,18 +5,60 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Set by gstreamer 0.25, the oldest-tolerant version exposing the GStreamer 1.26
+# surface the media pipeline needs.
+rust-version = "1.92"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/JirkaKlimes/tachyx"
 
+[workspace.dependencies]
+tachyx-dmabuf = { path = "crates/tachyx-dmabuf" }
+tachyx-input = { path = "crates/tachyx-input" }
+tachyx-media = { path = "crates/tachyx-media" }
+tachyx-proto = { path = "crates/tachyx-proto" }
+tachyx-transport = { path = "crates/tachyx-transport" }
+
+anyhow = "1.0"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+keycode = "1.0"
+postcard = { version = "1.1", features = ["use-std"] }
+quinn = { version = "0.11", default-features = false, features = [
+  "runtime-tokio",
+  "rustls-ring",
+  "log",
+] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustix = { version = "1.1", features = ["fs", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The GStreamer crates must move in lockstep; a mismatched pair fails to link.
+gstreamer = { version = "0.25", features = ["v1_26"] }
+gstreamer-allocators = { version = "0.25", features = ["v1_26"] }
+gstreamer-app = "0.25"
+gstreamer-video = "0.25"
+
+drm-fourcc = "2.2"
+gbm = { version = "0.18", default-features = false }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
-missing_docs = "warn"
-missing_debug_implementations = "warn"
-unreachable_pub = "warn"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 
 [profile.release]
 opt-level = 3
@@ -24,7 +66,11 @@ lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
 
-# The media path is unusable at `opt-level = 0`. Optimise dependencies even in
-# debug builds so latency measurements taken during development mean something.
+# A latency measurement taken from an unoptimised build measures nothing. This
+# applies to our own crates as well as to dependencies, because the packetiser
+# and the reassembler are on the hot path.
+[profile.dev]
+opt-level = 1
+
 [profile.dev.package."*"]
 opt-level = 2
