@@ -935,6 +935,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "goog_cc"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28400404562baaf6e5a31428d0a29842d7247ca873eb0748ceef6fddfb9637d2"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "gstreamer"
 version = "0.25.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2249,6 +2258,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachyx-congestion"
+version = "0.1.0"
+dependencies = [
+ "goog_cc",
+ "tachyx-proto",
+]
+
+[[package]]
 name = "tachyx-dmabuf"
 version = "0.1.0"
 dependencies = [
@@ -2326,6 +2343,7 @@ dependencies = [
  "gstreamer-video",
  "rustix",
  "tachyx-dmabuf",
+ "tachyx-input",
  "tachyx-proto",
  "thiserror 2.0.20",
  "tracing",

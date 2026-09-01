@@ -1,0 +1,32 @@
+[package]
+name = "tachyx-congestion"
+description = "Delay-based congestion control for the tachyx video path, driven by the client's receiver report"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tachyx-proto.workspace = true
+
+# The conformance oracle, and nothing else. `goog_cc` is a direct port of
+# libwebrtc's GoogCC whose every algorithm module is private: `lib.rs` uses
+# `mod x; use x::*;` rather than `pub mod`, so `TrendlineEstimator`,
+# `AimdRateControl`, `DelayBasedBwe`, `ProbeController` and the rest are all
+# unreachable and only their configuration structs are public. Taking it as a
+# dependency would mean taking `GoogCcNetworkController` whole, behind a
+# twelve-method interface built for a WebRTC-shaped world, and wiring it
+# carelessly would give a controller that misbehaves in ways no instrumentation
+# can see, because the parts that would show the misbehaviour are private.
+#
+# So the six hundred lines of arithmetic this crate needs are written here, and
+# the nine and a half thousand lines that cannot be opened are used for the one
+# thing they are good for: `GoogCcNetworkController` is drivable from a
+# synthetic feedback trace, so our controller can be run against the same trace
+# as the reference and held to it. Nothing here ships.
+[dev-dependencies]
+goog_cc = "0.1.4"
+
+[lints]
+workspace = true
