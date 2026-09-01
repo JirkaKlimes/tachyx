@@ -1080,7 +1080,7 @@ Mbit/s. This is the case that argues for having both.
 The bandwidth arithmetic is worth stating plainly, because "20% FEC" sounds
 expensive and is not. At 8.5 Mbit/s of picture, 20% parity is 1.7 Mbit/s. One
 recovery key frame is 130 kB, which is 1.04 Mbit. Today's scheme spends 3.4 key
-frames a second at this loss rate, which is 3.5 Mbit/s of key frames alone. **The
+frames a second at this loss rate, which is 3.7 Mbit/s of key frames alone. **The
 scheme with no parity is the more expensive one.** Measured: 11.89 Mbit/s for
 today against 10.73 Mbit/s for 20% parity everywhere, and the second one shows
 99.9% of frames against 1.5%.
