@@ -185,12 +185,27 @@ pub struct EncodeStats {
     pub bytes: u64,
     /// Bytes of filler the encoder emitted and this crate discarded.
     pub filler_bytes: u64,
-    /// Frames the admission gate refused, which were therefore never encoded.
+    /// Frames the token bucket refused, which were therefore never encoded.
     ///
-    /// Counted apart from the frames capture dropped at the slot, because the
-    /// two name different bottlenecks: this one is the wire, that one is the
-    /// encoder.
+    /// This is the rate limiter doing its job: the picture would have cost more
+    /// than the link carries. Counted apart from [`EncodeStats::gated`] because
+    /// the two name different faults, and the session that reported "179 gated"
+    /// could not say which mechanism did it.
     pub refused: u64,
+    /// Frames the transport's admission gate refused.
+    ///
+    /// A safety interlock against quinn's own eviction path, not a rate
+    /// control. With the pacer keeping that queue one or two datagrams deep it
+    /// should never fire, and a session in which it does is a session with
+    /// something else wrong.
+    pub gated: u64,
+    /// Frames dropped to honour the declared frame rate.
+    ///
+    /// The encoder budgets its bits as the bitrate divided by the rate declared
+    /// in the caps and ignores when frames actually arrive, so a declared rate
+    /// the pump does not deliver at is a bitrate setting that means something
+    /// else. This is the pump delivering at it.
+    pub paced: u64,
     /// Time from handing a frame to the pipeline to holding its access unit.
     pub latency: Percentiles,
 }
@@ -273,6 +288,42 @@ impl Bucket {
         }
     }
 }
+
+/// Delivers capture frames at the rate declared to the encoder, and no faster.
+///
+/// The encoder budgets bits per frame as the bitrate divided by the rate in the
+/// caps and ignores presentation timestamps entirely, so caps declaring 60
+/// while capture delivers 75 is a bitrate setting a quarter higher than the one
+/// asked for. This is what makes the two agree.
+///
+/// It is a deadline rather than a count of every nth frame because capture
+/// blocks while the screen is static: on an idle output frames arrive about
+/// once a second, and dropping two of every three of those would make a screen
+/// that has just started moving look broken.
+#[derive(Debug, Default)]
+struct Cadence(Option<Instant>);
+
+impl Cadence {
+    fn admits(&mut self, declared: crate::Framerate, now: Instant) -> bool {
+        let interval =
+            Duration::from_nanos(1_000_000_000_000 / u64::from(declared.millihertz().max(1)));
+        if self
+            .0
+            .is_some_and(|last| now.saturating_duration_since(last) + SLACK < interval)
+        {
+            return false;
+        }
+        self.0 = Some(now);
+        true
+    }
+}
+
+/// How early a capture frame may arrive and still count for its slot.
+///
+/// Capture is refresh-locked and the deadline is a whole multiple of the
+/// refresh interval, so without a little slack every frame arrives a few
+/// microseconds early and the pump delivers at half the declared rate.
+const SLACK: Duration = Duration::from_micros(500);
 
 /// A running encode of one capture.
 ///
@@ -759,20 +810,28 @@ fn pump(
     let mut next = 0u32;
     let mut scratch = Vec::new();
     let mut bucket = Bucket::new(Instant::now());
+    let mut cadence = Cadence::default();
     let mut key_frame_bits = 0.0f64;
     while let Some(frame) = frames.next() {
-        // Two separate refusals, counted together and meaning different things.
-        // The bucket is the rate limiter and refuses because the picture would
-        // cost more than the link carries; the gate is a safety interlock
-        // against the transport's own eviction path and should never fire while
-        // the pacer is keeping its queue shallow.
-        let admitted = bucket.admits(
-            budget.load(Ordering::Relaxed),
-            key_frame_bits,
-            Instant::now(),
-        ) && admission.load(Ordering::Relaxed);
-        if !admitted {
-            counters.refused.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        // Three separate refusals, and they mean different things. The cadence
+        // is the declared frame rate being honoured, which is half the
+        // encoder's bitrate setting rather than a shortage. The bucket is the
+        // rate limiter, refusing a picture that would cost more than the link
+        // carries. The gate is a safety interlock against the transport's own
+        // eviction path, and should never fire while the pacer is keeping that
+        // queue shallow.
+        let refusal = if !cadence.admits(control.settings().rate.framerate, now) {
+            Some(&counters.paced)
+        } else if !bucket.admits(budget.load(Ordering::Relaxed), key_frame_bits, now) {
+            Some(&counters.refused)
+        } else if !admission.load(Ordering::Relaxed) {
+            Some(&counters.gated)
+        } else {
+            None
+        };
+        if let Some(counter) = refusal {
+            counter.fetch_add(1, Ordering::Relaxed);
             // Dropping the frame is what returns its buffer to the ring, so a
             // refusal costs capture nothing.
             drop(frame);
@@ -910,6 +969,8 @@ struct Counters {
     bytes: AtomicU64,
     filler: AtomicU64,
     refused: AtomicU64,
+    gated: AtomicU64,
+    paced: AtomicU64,
     latency: Mutex<Samples>,
 }
 
@@ -927,6 +988,8 @@ impl Counters {
             bytes: self.bytes.load(Ordering::Relaxed),
             filler_bytes: self.filler.load(Ordering::Relaxed),
             refused: self.refused.load(Ordering::Relaxed),
+            gated: self.gated.load(Ordering::Relaxed),
+            paced: self.paced.load(Ordering::Relaxed),
             latency: self
                 .latency
                 .lock()
@@ -998,6 +1061,48 @@ mod tests {
             }
         }
         admitted
+    }
+
+    #[test]
+    fn the_pump_delivers_at_the_rate_declared_to_the_encoder() {
+        // The encoder budgets bits per frame as the bitrate divided by the rate
+        // in the caps and ignores when frames actually arrive, so caps
+        // declaring 25 while capture delivers 75 is three times the bitrate
+        // that was asked for.
+        let declared = crate::Framerate::from_millihertz(74_983 / 3).expect("nonzero");
+        let mut cadence = Cadence::default();
+        let start = Instant::now();
+        let mut admitted = 0;
+        // Three hundred capture frames at the output's own refresh.
+        for slot in 0..300u32 {
+            let now = start + Duration::from_nanos(u64::from(slot) * 13_336_000);
+            if cadence.admits(declared, now) {
+                admitted += 1;
+            }
+        }
+        assert!(
+            (98..=102).contains(&admitted),
+            "a stride of three admitted {admitted} of 300"
+        );
+    }
+
+    #[test]
+    fn an_idle_screen_is_not_thinned_further() {
+        // Capture blocks while the screen is static: frames arrive about once a
+        // second. Counting every nth frame would drop two of every three of
+        // those, and the screen that has just started moving would look broken.
+        let declared = crate::Framerate::from_millihertz(74_983 / 3).expect("nonzero");
+        let mut cadence = Cadence::default();
+        let start = Instant::now();
+        for slot in 0..10u32 {
+            assert!(
+                cadence.admits(
+                    declared,
+                    start + Duration::from_millis(u64::from(slot) * 900)
+                ),
+                "a frame a second must always be delivered"
+            );
+        }
     }
 
     #[test]
