@@ -828,15 +828,21 @@ impl Reassembler {
         self.open.values().map(|partial| partial.deadline).min()
     }
 
-    /// Takes one datagram.
+    /// Takes one datagram, reporting where it sat in the session's sequence.
     ///
     /// Runs [`Reassembler::expire`] first, so a caller that keeps feeding
     /// datagrams needs no timer of its own. Whatever this completed or rebuilt
     /// comes out of [`Reassembler::pop`].
     ///
+    /// The sequence number is returned because the receiver report is keyed on
+    /// it and this is where the header is already parsed. Parsing it a second
+    /// time in the caller would be sixteen bytes of work per datagram on a
+    /// phone, thousands of times a second, to recover something this function
+    /// already holds.
+    ///
     /// # Errors
     /// If the datagram is not a video packet.
-    pub fn push(&mut self, datagram: &[u8], now: Instant) -> Result<(), MalformedPacket> {
+    pub fn push(&mut self, datagram: &[u8], now: Instant) -> Result<Seq, MalformedPacket> {
         self.expire(now);
         let (header, payload) = PacketHeader::parse(datagram)?;
         self.stats.packets_received += 1;
@@ -846,7 +852,7 @@ impl Reassembler {
         // else. Every field that would say which frame it belongs to means
         // nothing on it, so it must not reach reassembly.
         if matches!(header.role, Role::Padding) {
-            return Ok(());
+            return Ok(header.seq);
         }
         let parity = matches!(header.role, Role::Parity(_));
         if parity {
@@ -856,7 +862,7 @@ impl Reassembler {
             if !parity {
                 self.stats.packets_late += 1;
             }
-            return Ok(());
+            return Ok(header.seq);
         }
         if header.frame.0 > self.floor {
             for partial in self.open.range_mut(..header.frame.0).map(|(_, v)| v) {
@@ -880,7 +886,7 @@ impl Reassembler {
                 partial.deadline = partial.deadline.min(now + REORDER_WINDOW);
             }
         }
-        Ok(())
+        Ok(header.seq)
     }
 
     /// Files one parity shard against a frame that is already open.

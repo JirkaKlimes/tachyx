@@ -9,6 +9,9 @@
 //! lives here rather than in the transport so that a client can reassemble
 //! video without linking a QUIC server to do it.
 //!
+//! [`report`] is the other half of that sequence accounting: when each datagram
+//! arrived, which is the only measurement of the path the host can have.
+//!
 //! Everything else travels on the reliable control stream as ordinary Rust types
 //! serialised with `postcard`. That encoding is not self-describing, so
 //! [`VERSION`] is checked before anything else is read and a mismatch is reported
@@ -18,6 +21,7 @@ pub mod control;
 pub mod input;
 pub mod media;
 pub mod packet;
+pub mod report;
 
 /// The protocol version both peers must agree on.
 ///
