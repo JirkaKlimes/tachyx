@@ -8,7 +8,11 @@ import 'input.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `fmt`
+import 'video.dart';
+
+// These functions are ignored because they are not marked as `pub`: `asked_for`, `present`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Present`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `push`
 
 /// The protocol version this build speaks.
 ///
@@ -17,56 +21,283 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 int protocolVersion() => RustLib.instance.api.crateApiSessionProtocolVersion();
 
 /// Opens a session with the host at `address`, for a video surface of this size
-/// in physical pixels.
+/// in physical pixels on a display that refreshes this often.
+///
+/// `state_directory` is where the host's fingerprint is remembered, so that a
+/// host presenting a different key on a later connection is refused rather than
+/// silently accepted.
 ///
 /// # Errors
-/// Every call, for now, and deliberately. A session needs a QUIC connection to
-/// carry its bytes and the crate that dials one is still a placeholder. This
-/// says so rather than handing back a session that takes input and drops it: a
-/// client that looks connected and does nothing is harder to diagnose than one
-/// that names what is missing.
+/// If the address names nothing, the viewport has no area, the host presents a
+/// key other than the one already pinned for it, or the host refuses the
+/// session. A refusal carries the host's own words, so a version mismatch reads
+/// as one.
 Future<Session> connect({
   required String address,
   required int viewportWidth,
   required int viewportHeight,
+  required int refreshHz,
+  required String stateDirectory,
 }) => RustLib.instance.api.crateApiSessionConnect(
   address: address,
   viewportWidth: viewportWidth,
   viewportHeight: viewportHeight,
+  refreshHz: refreshHz,
+  stateDirectory: stateDirectory,
 );
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Session>>
 abstract class Session implements RustOpaqueInterface {
-  /// Ends an input tick and queues everything recorded during it.
-  ///
-  /// Called on a short timer rather than per event, so that a drag at the
-  /// touch sample rate costs one packet instead of one packet per sample.
-  ///
-  /// # Errors
-  /// If the batch does not fit a control message.
-  Future<void> flushInput();
-
   /// Records what the user did.
   ///
   /// `at_micros` is when the client saw the event, taken from
   /// `PointerEvent.timeStamp` rather than from the moment this was called, so
   /// that batching does not hide inside the latency measurement.
-  Future<void> input({required BigInt atMicros, required InputEvent event});
-
-  /// What the video path has seen so far.
   ///
-  /// Synchronous, because the overlay reads it once a frame and a round trip
-  /// through the isolate to fetch six counters would cost more than the
-  /// counters are worth.
-  VideoStats videoStats();
+  /// Synchronous, because a touch sample every eight milliseconds cannot
+  /// afford a round trip through the isolate to be recorded.
+  void input({required BigInt atMicros, required InputEvent event});
+
+  /// Decodes into a Flutter texture and reports its identifier, for a
+  /// `Texture` widget to draw.
+  ///
+  /// `engine_handle` comes from the `irondash_engine_context` Dart plugin.
+  /// Synchronous so that it runs on the thread that called it, which is the
+  /// only one that can reach the engine's texture registry.
+  ///
+  /// # Errors
+  /// If GStreamer will not start, a decoder element is missing, the engine
+  /// refuses the texture, or this target presents some other way.
+  PlatformInt64 presentOn({required PlatformInt64 engineHandle});
+
+  /// What this session has done.
+  ///
+  /// Synchronous, because the overlay reads it several times a second and a
+  /// round trip through the isolate to fetch a page of counters would cost
+  /// more than the counters are worth.
+  SessionStats stats();
+
+  /// Tells the host the client can take something different now, after a
+  /// rotation, a resize, or a change of resolution mode.
+  ///
+  /// # Errors
+  /// If the viewport has no area or the display never refreshes.
+  void viewportChanged({
+    required int viewportWidth,
+    required int viewportHeight,
+    required int refreshHz,
+  });
+}
+
+/// How the host said it is encoding.
+///
+/// The decoder needs none of this: the parameter sets travel in the bitstream
+/// before every key frame, so a resolution change reconfigures it without a word
+/// from here. What the application needs is the shape, which the bitstream does
+/// not carry.
+///
+/// Not called `Stream`, because Dart already has one and a client that imported
+/// both would have to say which it meant on every line.
+class Encoding {
+  /// The width the encoder codes.
+  final int codedWidth;
+
+  /// The height the encoder codes, which is the visible height rounded up to
+  /// a multiple of sixteen.
+  final int codedHeight;
+
+  /// The visible width, which is what a pointer delta is measured in.
+  final int visibleWidth;
+
+  /// The visible height.
+  final int visibleHeight;
+
+  /// The width term of the shape to draw the picture at.
+  final int aspectWidth;
+
+  /// The height term of that shape.
+  final int aspectHeight;
+
+  /// The frame rate declared to the encoder.
+  final int framerate;
+
+  /// The target bitrate, in bits per second.
+  final int bitrate;
+
+  const Encoding({
+    required this.codedWidth,
+    required this.codedHeight,
+    required this.visibleWidth,
+    required this.visibleHeight,
+    required this.aspectWidth,
+    required this.aspectHeight,
+    required this.framerate,
+    required this.bitrate,
+  });
+
+  @override
+  int get hashCode =>
+      codedWidth.hashCode ^
+      codedHeight.hashCode ^
+      visibleWidth.hashCode ^
+      visibleHeight.hashCode ^
+      aspectWidth.hashCode ^
+      aspectHeight.hashCode ^
+      framerate.hashCode ^
+      bitrate.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Encoding &&
+          runtimeType == other.runtimeType &&
+          codedWidth == other.codedWidth &&
+          codedHeight == other.codedHeight &&
+          visibleWidth == other.visibleWidth &&
+          visibleHeight == other.visibleHeight &&
+          aspectWidth == other.aspectWidth &&
+          aspectHeight == other.aspectHeight &&
+          framerate == other.framerate &&
+          bitrate == other.bitrate;
+}
+
+/// What the host says about itself, which is the only second-hand thing here.
+class HostReport {
+  /// Frames the host put on the wire.
+  final BigInt framesSent;
+
+  /// Frames the host declined to encode because its send buffer had no room
+  /// for them whole.
+  final BigInt framesGated;
+
+  /// The transport's own bandwidth estimate, in bits per second.
+  final BigInt? pacingRate;
+
+  /// Median capture to wire latency over the last interval, in microseconds.
+  final int pipelineUs;
+
+  const HostReport({
+    required this.framesSent,
+    required this.framesGated,
+    this.pacingRate,
+    required this.pipelineUs,
+  });
+
+  @override
+  int get hashCode =>
+      framesSent.hashCode ^
+      framesGated.hashCode ^
+      pacingRate.hashCode ^
+      pipelineUs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is HostReport &&
+          runtimeType == other.runtimeType &&
+          framesSent == other.framesSent &&
+          framesGated == other.framesGated &&
+          pacingRate == other.pacingRate &&
+          pipelineUs == other.pipelineUs;
+}
+
+/// What the session is doing, as far as the client can tell.
+///
+/// Silence on the video path is not a fault. The host's capture blocks while the
+/// screen is static, with idle gaps measured up to 1.53 seconds, so a still
+/// screen says [`Liveness::Idle`] and only a host that has stopped answering
+/// says [`Liveness::Lost`].
+enum Liveness {
+  /// Pictures are arriving.
+  streaming,
+
+  /// The host is answering and the screen is not changing.
+  idle,
+
+  /// The host has said nothing for three heartbeat intervals.
+  lost,
+}
+
+/// Everything one session has to report.
+class SessionStats {
+  /// Whether pictures are arriving, the screen is still, or the host is gone.
+  final Liveness liveness;
+
+  /// The transport's own round trip estimate, in microseconds.
+  ///
+  /// quinn measures it from its own acknowledgements, so it is the real path
+  /// and costs no message of ours. It is a round trip and stays one: splitting
+  /// it into two one-way times would need the two clocks related, which this
+  /// milestone does not do.
+  final int rttUs;
+
+  /// Input batches put on the wire.
+  final BigInt batches;
+
+  /// What reassembly saw.
+  final VideoStats video;
+
+  /// How the host is encoding, once it has said.
+  final Encoding? encoding;
+
+  /// What the host last said about itself.
+  final HostReport? host;
+
+  /// What the decode and present path measured, once there is one.
+  final PresentStats? present;
+
+  /// Why the session ended, if it has.
+  final String? ended;
+
+  /// The first thing the decode path complained about, if it has.
+  final String? videoFault;
+
+  const SessionStats({
+    required this.liveness,
+    required this.rttUs,
+    required this.batches,
+    required this.video,
+    this.encoding,
+    this.host,
+    this.present,
+    this.ended,
+    this.videoFault,
+  });
+
+  @override
+  int get hashCode =>
+      liveness.hashCode ^
+      rttUs.hashCode ^
+      batches.hashCode ^
+      video.hashCode ^
+      encoding.hashCode ^
+      host.hashCode ^
+      present.hashCode ^
+      ended.hashCode ^
+      videoFault.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SessionStats &&
+          runtimeType == other.runtimeType &&
+          liveness == other.liveness &&
+          rttUs == other.rttUs &&
+          batches == other.batches &&
+          video == other.video &&
+          encoding == other.encoding &&
+          host == other.host &&
+          present == other.present &&
+          ended == other.ended &&
+          videoFault == other.videoFault;
 }
 
 /// What the client's own video path has seen.
 ///
 /// Every field is something this client counted. Nothing here is a figure the
 /// host reported about itself, and nothing is an estimate: a statistics overlay
-/// built to measure latency is worth less than nothing if it shows a number
-/// that was made up.
+/// built to measure latency is worth less than nothing if it shows a number that
+/// was made up.
 class VideoStats {
   /// Datagrams parsed.
   final BigInt packetsReceived;
@@ -83,6 +314,9 @@ class VideoStats {
   /// Frames abandoned with fragments missing.
   final BigInt framesDropped;
 
+  /// Frames the host numbered and of which nothing arrived at all.
+  final BigInt framesMissing;
+
   /// Frames that arrived whole and were thrown away anyway, because the
   /// frames they refer back to did not.
   final BigInt framesUndecodable;
@@ -93,6 +327,7 @@ class VideoStats {
     required this.packetsLate,
     required this.framesDelivered,
     required this.framesDropped,
+    required this.framesMissing,
     required this.framesUndecodable,
   });
 
@@ -103,6 +338,7 @@ class VideoStats {
       packetsLate.hashCode ^
       framesDelivered.hashCode ^
       framesDropped.hashCode ^
+      framesMissing.hashCode ^
       framesUndecodable.hashCode;
 
   @override
@@ -115,5 +351,6 @@ class VideoStats {
           packetsLate == other.packetsLate &&
           framesDelivered == other.framesDelivered &&
           framesDropped == other.framesDropped &&
+          framesMissing == other.framesMissing &&
           framesUndecodable == other.framesUndecodable;
 }

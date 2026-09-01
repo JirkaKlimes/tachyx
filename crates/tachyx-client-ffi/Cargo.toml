@@ -14,6 +14,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 tachyx-client.workspace = true
+tachyx-driver.workspace = true
 tachyx-proto.workspace = true
 tachyx-video.workspace = true
 anyhow.workspace = true

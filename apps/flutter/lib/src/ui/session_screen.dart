@@ -5,6 +5,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:irondash_engine_context/irondash_engine_context.dart';
 
 import 'package:tachyx/src/input/keyboard.dart';
 import 'package:tachyx/src/input/touchpad.dart';
@@ -13,6 +14,7 @@ import 'package:tachyx/src/session/pipe.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 import 'package:tachyx/src/ui/theme.dart';
 import 'package:tachyx/src/ui/video_surface.dart';
+import 'package:tachyx/src/ui/video_texture_view.dart';
 
 /// The remote desktop, and the touch surface that drives it.
 ///
@@ -53,19 +55,27 @@ class _SessionScreenState extends State<SessionScreen>
   /// sample.
   static const Duration _sampleEvery = Duration(milliseconds: 100);
 
+  /// The shape a picture is drawn at before the host has said what it is.
+  static const double _unknownAspect = 16 / 9;
+
   final InputPipe _pipe = InputPipe();
   late final Touchpad _pad;
   late final HardwareKeys _keys;
   late final SoftKeyboard _soft;
   Timer? _sampler;
   bool _showStats = true;
-  VideoStats? _video;
+  SessionStats? _stats;
+  int? _textureId;
+  String? _videoFault;
 
   @override
   void initState() {
     super.initState();
     final Session? session = widget.session;
-    if (session != null) _pipe.attach(session);
+    if (session != null) {
+      _pipe.attach(session);
+      unawaited(_present(session));
+    }
     _soft = SoftKeyboard(_pipe.sendUnstamped);
     _pad = Touchpad(
       emit: _pipe.send,
@@ -80,16 +90,7 @@ class _SessionScreenState extends State<SessionScreen>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    final MediaQueryData media = MediaQuery.of(context);
-    // Until the host has said how it is encoding, the best the client knows is
-    // what it asked for: a stream of its own viewport in physical pixels. So
-    // one logical pixel is one device pixel ratio of image pixels. This becomes
-    // the ratio of the stream configuration to the surface once a stream
-    // configuration exists.
-    _pad.scale = ImageScale.of(
-      image: media.size * media.devicePixelRatio,
-      box: media.size,
-    );
+    _rescale();
   }
 
   @override
@@ -112,9 +113,42 @@ class _SessionScreenState extends State<SessionScreen>
     super.dispose();
   }
 
+  /// Points the session's decoder at a texture this screen draws.
+  ///
+  /// The engine handle arrives asynchronously and the registration itself has
+  /// to happen on the thread that asked for it, which is why this is not part
+  /// of connecting.
+  Future<void> _present(Session session) async {
+    try {
+      final int handle = await EngineContext.instance.getEngineHandle();
+      final int id = session.presentOn(engineHandle: handle);
+      if (mounted) setState(() => _textureId = id);
+    } on Object catch (refused) {
+      if (mounted) setState(() => _videoFault = '$refused');
+    }
+  }
+
   void _sample() {
     if (!mounted) return;
-    setState(() => _video = widget.session?.videoStats());
+    setState(() => _stats = widget.session?.stats());
+    _rescale();
+  }
+
+  /// Puts pointer deltas into the units the host injects them in.
+  ///
+  /// Until the host has said how it is encoding, the best the client knows is
+  /// what it asked for: a stream of its own viewport in physical pixels. After
+  /// that it is the ratio of the visible picture to the box it is drawn in.
+  void _rescale() {
+    final MediaQueryData media = MediaQuery.of(context);
+    final Encoding? encoding = _stats?.encoding;
+    final Size image = encoding == null
+        ? media.size * media.devicePixelRatio
+        : Size(
+            encoding.visibleWidth.toDouble(),
+            encoding.visibleHeight.toDouble(),
+          );
+    _pad.scale = ImageScale.of(image: image, box: media.size);
   }
 
   void _toggleKeyboard() {
@@ -122,9 +156,27 @@ class _SessionScreenState extends State<SessionScreen>
     setState(() {});
   }
 
-  void _buzz() => unawaited(
-    HapticFeedback.selectionClick().catchError((Object _) {}),
-  );
+  void _buzz() =>
+      unawaited(HapticFeedback.selectionClick().catchError((Object _) {}));
+
+  /// The picture, or the reason there is none.
+  Widget _picture() {
+    final int? id = _textureId;
+    if (id == null) {
+      return VideoSurface(reason: _videoFault ?? _noSessionReason());
+    }
+    final Encoding? encoding = _stats?.encoding;
+    return VideoTextureView(
+      textureId: id,
+      aspectRatio: encoding == null
+          ? _unknownAspect
+          : encoding.aspectWidth / encoding.aspectHeight,
+    );
+  }
+
+  String? _noSessionReason() => widget.session == null
+      ? 'no host — this surface reports input and nothing else'
+      : null;
 
   @override
   Widget build(BuildContext context) {
@@ -145,10 +197,7 @@ class _SessionScreenState extends State<SessionScreen>
               child: Stack(
                 children: <Widget>[
                   Positioned.fill(
-                    child: TouchSurface(
-                      pad: _pad,
-                      child: const VideoSurface(),
-                    ),
+                    child: TouchSurface(pad: _pad, child: _picture()),
                   ),
                   if (_showStats)
                     Positioned(
@@ -159,11 +208,9 @@ class _SessionScreenState extends State<SessionScreen>
                           host: widget.address,
                           protocolVersion: widget.protocolVersion,
                           eventsSent: _pipe.sent,
-                          batchesSent: _pipe.isAttached ? _pipe.batches : null,
                           lastEvent: _pipe.last,
                           keyboardUp: keyboardUp,
-                          video: _video,
-                          fault: _pipe.fault,
+                          stats: _stats,
                         ),
                       ),
                     ),

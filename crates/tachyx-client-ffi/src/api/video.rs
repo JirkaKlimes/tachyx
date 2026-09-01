@@ -48,6 +48,19 @@ pub struct PresentStats {
     pub present: Latency,
 }
 
+impl From<tachyx_video::Stats> for PresentStats {
+    fn from(stats: tachyx_video::Stats) -> Self {
+        Self {
+            pushed: stats.pushed,
+            decoded: stats.decoded,
+            presented: stats.presented,
+            superseded: stats.superseded,
+            decode: stats.decode.into(),
+            present: stats.present.into(),
+        }
+    }
+}
+
 /// A decoded stream, drawn by a Flutter `Texture` widget.
 ///
 /// Holds [`tachyx_video::VideoTexture`] and adds nothing.
@@ -98,15 +111,7 @@ impl VideoTexture {
     #[frb(sync)]
     #[must_use]
     pub fn stats(&self) -> PresentStats {
-        let stats = self.core.stats();
-        PresentStats {
-            pushed: stats.pushed,
-            decoded: stats.decoded,
-            presented: stats.presented,
-            superseded: stats.superseded,
-            decode: stats.decode.into(),
-            present: stats.present.into(),
-        }
+        self.core.stats().into()
     }
 }
 

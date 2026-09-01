@@ -4,20 +4,66 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tachyx/src/rust/api/input.dart';
-import 'package:tachyx/src/rust/api/session.dart' show VideoStats;
+import 'package:tachyx/src/rust/api/session.dart'
+    show Encoding, HostReport, Liveness, SessionStats, VideoStats;
+import 'package:tachyx/src/rust/api/video.dart' show Latency, PresentStats;
 import 'package:tachyx/src/session/link.dart';
 import 'package:tachyx/src/ui/connect_screen.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 
 Widget _wrap(Widget child) => MaterialApp(home: child);
 
-VideoStats _stats() => VideoStats(
+VideoStats _video() => VideoStats(
   packetsReceived: BigInt.from(2000),
   packetsLost: BigInt.from(7),
   packetsLate: BigInt.from(1),
   framesDelivered: BigInt.from(120),
   framesDropped: BigInt.from(3),
+  framesMissing: BigInt.zero,
   framesUndecodable: BigInt.from(2),
+);
+
+Latency _latency(int median) => Latency(
+  minUs: median - 100,
+  medianUs: median,
+  p95Us: median + 200,
+  maxUs: median + 700,
+);
+
+SessionStats _stats({
+  Liveness liveness = Liveness.streaming,
+  bool presenting = true,
+}) => SessionStats(
+  liveness: liveness,
+  rttUs: 1234,
+  batches: BigInt.from(9),
+  video: _video(),
+  encoding: const Encoding(
+    codedWidth: 1920,
+    codedHeight: 1088,
+    visibleWidth: 1920,
+    visibleHeight: 1080,
+    aspectWidth: 16,
+    aspectHeight: 9,
+    framerate: 60,
+    bitrate: 8000000,
+  ),
+  host: HostReport(
+    framesSent: BigInt.from(130),
+    framesGated: BigInt.from(4),
+    pacingRate: BigInt.from(240000000),
+    pipelineUs: 4200,
+  ),
+  present: presenting
+      ? PresentStats(
+          pushed: BigInt.from(120),
+          decoded: BigInt.from(119),
+          presented: BigInt.from(118),
+          superseded: BigInt.from(1),
+          decode: _latency(630),
+          present: _latency(1870),
+        )
+      : null,
 );
 
 void main() {
@@ -31,7 +77,6 @@ void main() {
             host: null,
             protocolVersion: 1,
             eventsSent: 0,
-            batchesSent: null,
             lastEvent: null,
             keyboardUp: false,
           ),
@@ -40,6 +85,7 @@ void main() {
 
       expect(find.textContaining('no session'), findsOneWidget);
       expect(find.textContaining('frames in'), findsNothing);
+      expect(find.textContaining('round trip'), findsNothing);
       expect(find.text('nothing yet'), findsOneWidget);
     });
 
@@ -52,20 +98,87 @@ void main() {
             host: '10.0.0.4:4433',
             protocolVersion: 1,
             eventsSent: 42,
-            batchesSent: 9,
             lastEvent: const InputEvent.fingerScrollEnd(),
             keyboardUp: true,
-            video: _stats(),
+            stats: _stats(),
           ),
         ),
       );
 
       expect(find.textContaining('no session'), findsNothing);
-      expect(find.text('120'), findsOneWidget);
-      expect(find.text('3'), findsOneWidget);
-      expect(find.text('42'), findsOneWidget);
+      expect(
+        find.text('120 in, 3 dropped, 0 missing, 2 undecodable'),
+        findsOneWidget,
+      );
+      expect(find.text('2000 in, 7 lost, 1 late'), findsOneWidget);
+      expect(find.text('42'), findsOneWidget, reason: 'events sent');
+      expect(find.text('9'), findsOneWidget, reason: 'batches');
       expect(find.text('scroll end'), findsOneWidget);
       expect(find.text('up'), findsOneWidget);
+      expect(find.text('streaming'), findsOneWidget);
+      expect(find.text('1.23 ms'), findsOneWidget, reason: 'the round trip');
+      expect(find.text('1920x1080 @60 8.0 Mbit/s'), findsOneWidget);
+    });
+
+    testWidgets('reports the stages it can measure without the host clock', (
+      WidgetTester tester,
+    ) async {
+      await tester.pumpWidget(
+        _wrap(
+          StatsOverlay(
+            host: '10.0.0.4:4433',
+            protocolVersion: 1,
+            eventsSent: 0,
+            lastEvent: null,
+            keyboardUp: false,
+            stats: _stats(),
+          ),
+        ),
+      );
+
+      expect(find.text('0.63 ms / 0.83 ms p95'), findsOneWidget);
+      expect(find.text('1.87 ms / 2.07 ms p95'), findsOneWidget);
+      expect(
+        find.text('130 sent, 4 gated, 4.20 ms pipeline'),
+        findsOneWidget,
+        reason: "the host's own report, marked as its word",
+      );
+    });
+
+    testWidgets('a still screen reads as idle rather than as no frames', (
+      WidgetTester tester,
+    ) async {
+      await tester.pumpWidget(
+        _wrap(
+          StatsOverlay(
+            host: '10.0.0.4:4433',
+            protocolVersion: 1,
+            eventsSent: 0,
+            lastEvent: null,
+            keyboardUp: false,
+            stats: _stats(liveness: Liveness.idle, presenting: false),
+          ),
+        ),
+      );
+
+      expect(find.textContaining('idle'), findsOneWidget);
+      expect(find.textContaining('0 fps'), findsNothing);
+      expect(
+        find.text(describeLiveness(Liveness.lost)),
+        findsNothing,
+        reason: 'a still screen is not a lost host',
+      );
+      expect(
+        find.text('decode'),
+        findsNothing,
+        reason: 'nothing has decoded, so there is no decode latency to show',
+      );
+    });
+
+    test('a lost host is the only state that reads as a fault', () {
+      expect(describeLiveness(Liveness.streaming), 'streaming');
+      expect(describeLiveness(Liveness.idle), contains('idle'));
+      expect(describeLiveness(Liveness.lost), contains('no heartbeat'));
     });
 
     test('every kind of event has a description', () {

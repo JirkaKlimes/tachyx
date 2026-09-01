@@ -48,12 +48,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Session
-  dco_decode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
-    dynamic raw,
-  );
-
-  @protected
-  Session
   dco_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     dynamic raw,
   );
@@ -80,16 +74,34 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  Encoding dco_decode_box_autoadd_encoding(dynamic raw);
+
+  @protected
   HidUsage dco_decode_box_autoadd_hid_usage(dynamic raw);
 
   @protected
+  HostReport dco_decode_box_autoadd_host_report(dynamic raw);
+
+  @protected
   InputEvent dco_decode_box_autoadd_input_event(dynamic raw);
+
+  @protected
+  PresentStats dco_decode_box_autoadd_present_stats(dynamic raw);
+
+  @protected
+  BigInt dco_decode_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  Encoding dco_decode_encoding(dynamic raw);
 
   @protected
   double dco_decode_f_32(dynamic raw);
 
   @protected
   HidUsage dco_decode_hid_usage(dynamic raw);
+
+  @protected
+  HostReport dco_decode_host_report(dynamic raw);
 
   @protected
   int dco_decode_i_32(dynamic raw);
@@ -110,7 +122,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  Liveness dco_decode_liveness(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  Encoding? dco_decode_opt_box_autoadd_encoding(dynamic raw);
+
+  @protected
+  HostReport? dco_decode_opt_box_autoadd_host_report(dynamic raw);
+
+  @protected
+  PresentStats? dco_decode_opt_box_autoadd_present_stats(dynamic raw);
+
+  @protected
+  BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
 
   @protected
   PointerButton dco_decode_pointer_button(dynamic raw);
@@ -120,6 +147,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Press dco_decode_press(dynamic raw);
+
+  @protected
+  SessionStats dco_decode_session_stats(dynamic raw);
 
   @protected
   int dco_decode_u_16(dynamic raw);
@@ -159,12 +189,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Session
-  sse_decode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
-    SseDeserializer deserializer,
-  );
-
-  @protected
-  Session
   sse_decode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     SseDeserializer deserializer,
   );
@@ -191,16 +215,36 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
+  Encoding sse_decode_box_autoadd_encoding(SseDeserializer deserializer);
+
+  @protected
   HidUsage sse_decode_box_autoadd_hid_usage(SseDeserializer deserializer);
 
   @protected
+  HostReport sse_decode_box_autoadd_host_report(SseDeserializer deserializer);
+
+  @protected
   InputEvent sse_decode_box_autoadd_input_event(SseDeserializer deserializer);
+
+  @protected
+  PresentStats sse_decode_box_autoadd_present_stats(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  BigInt sse_decode_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  Encoding sse_decode_encoding(SseDeserializer deserializer);
 
   @protected
   double sse_decode_f_32(SseDeserializer deserializer);
 
   @protected
   HidUsage sse_decode_hid_usage(SseDeserializer deserializer);
+
+  @protected
+  HostReport sse_decode_host_report(SseDeserializer deserializer);
 
   @protected
   int sse_decode_i_32(SseDeserializer deserializer);
@@ -221,7 +265,26 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  Liveness sse_decode_liveness(SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  Encoding? sse_decode_opt_box_autoadd_encoding(SseDeserializer deserializer);
+
+  @protected
+  HostReport? sse_decode_opt_box_autoadd_host_report(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  PresentStats? sse_decode_opt_box_autoadd_present_stats(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
 
   @protected
   PointerButton sse_decode_pointer_button(SseDeserializer deserializer);
@@ -231,6 +294,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Press sse_decode_press(SseDeserializer deserializer);
+
+  @protected
+  SessionStats sse_decode_session_stats(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_16(SseDeserializer deserializer);
@@ -278,13 +344,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void
-  sse_encode_Auto_RefMut_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
-    Session self,
-    SseSerializer serializer,
-  );
-
-  @protected
-  void
   sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerSession(
     Session self,
     SseSerializer serializer,
@@ -315,8 +374,17 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_encoding(Encoding self, SseSerializer serializer);
+
+  @protected
   void sse_encode_box_autoadd_hid_usage(
     HidUsage self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_host_report(
+    HostReport self,
     SseSerializer serializer,
   );
 
@@ -327,10 +395,25 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_box_autoadd_present_stats(
+    PresentStats self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_encoding(Encoding self, SseSerializer serializer);
+
+  @protected
   void sse_encode_f_32(double self, SseSerializer serializer);
 
   @protected
   void sse_encode_hid_usage(HidUsage self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_host_report(HostReport self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_32(int self, SseSerializer serializer);
@@ -354,7 +437,31 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_liveness(Liveness self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_encoding(
+    Encoding? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_host_report(
+    HostReport? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_present_stats(
+    PresentStats? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
 
   @protected
   void sse_encode_pointer_button(PointerButton self, SseSerializer serializer);
@@ -364,6 +471,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_press(Press self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_session_stats(SessionStats self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_16(int self, SseSerializer serializer);

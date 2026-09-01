@@ -1,9 +1,12 @@
 /// How far the client has got with a host.
 library;
 
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException, PanicException;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:tachyx/src/rust/api/session.dart';
@@ -92,14 +95,25 @@ class HostLink extends ChangeNotifier {
   }
 
   /// Opens a session with the host at [address], for a video surface of
-  /// [viewport] physical pixels.
-  Future<void> dial(String address, {required (int, int) viewport}) async {
+  /// [viewport] physical pixels on a display that refreshes [refreshHz] times a
+  /// second.
+  Future<void> dial(
+    String address, {
+    required (int, int) viewport,
+    required int refreshHz,
+  }) async {
     _set(Dialling(address));
     try {
+      // The host's key is pinned here, so it must outlive the run. Anywhere the
+      // system may clear would silently turn every reconnection into a first
+      // meeting, which is the one moment trust on first use cannot defend.
+      final Directory state = await getApplicationSupportDirectory();
       final Session session = await connect(
         address: address,
         viewportWidth: viewport.$1,
         viewportHeight: viewport.$2,
+        refreshHz: refreshHz,
+        stateDirectory: state.path,
       );
       await _remember(address);
       _set(Live(address, session));

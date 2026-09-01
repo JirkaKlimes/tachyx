@@ -2156,6 +2156,7 @@ dependencies = [
  "anyhow",
  "flutter_rust_bridge",
  "tachyx-client",
+ "tachyx-driver",
  "tachyx-proto",
  "tachyx-video",
 ]
@@ -2166,6 +2167,21 @@ version = "0.1.0"
 dependencies = [
  "gstreamer",
  "gstreamer-allocators",
+]
+
+[[package]]
+name = "tachyx-driver"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "quinn",
+ "serde",
+ "tachyx-client",
+ "tachyx-proto",
+ "tachyx-transport",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2181,11 +2197,17 @@ dependencies = [
 name = "tachyx-hostd"
 version = "0.1.0"
 dependencies = [
+ "quinn",
  "serde",
+ "tachyx-input",
+ "tachyx-media",
  "tachyx-proto",
+ "tachyx-transport",
  "thiserror 2.0.20",
+ "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
 ]

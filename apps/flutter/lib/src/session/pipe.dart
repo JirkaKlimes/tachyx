@@ -1,8 +1,6 @@
 /// Where input goes once a gesture has decided what it was.
 library;
 
-import 'dart:async';
-
 import 'package:tachyx/src/rust/api/input.dart';
 import 'package:tachyx/src/rust/api/session.dart';
 
@@ -11,19 +9,13 @@ import 'package:tachyx/src/rust/api/session.dart';
 /// The counters are here rather than in the overlay because they are the only
 /// thing the client knows for certain about its own input: they count events
 /// handed over, not events it hopes arrived.
+///
+/// Nothing is batched here. Handing an event over is a synchronous call into
+/// the client core, which merges it with the one before and sends a batch on
+/// its own tick. A timer on this side would be a second one measuring the same
+/// thing.
 class InputPipe {
-  /// A pipe that ends a batch every [tick].
-  InputPipe({this.tick = const Duration(milliseconds: 4)});
-
-  /// How often a batch leaves.
-  ///
-  /// Short enough to disappear next to a frame at any rate this client will
-  /// ever see, long enough that a drag at the touch sample rate costs one
-  /// packet rather than one packet per sample.
-  final Duration tick;
-
   Session? _session;
-  Timer? _timer;
 
   /// The event clock reading the session's own clock is measured from.
   Duration? _origin;
@@ -32,22 +24,14 @@ class InputPipe {
   Duration _latest = Duration.zero;
 
   int _sent = 0;
-  int _batches = 0;
   InputEvent? _last;
-  String? _fault;
 
   /// Input events handed to a session, or counted while there was none.
   int get sent => _sent;
 
-  /// Batches ended since the pipe was attached.
-  int get batches => _batches;
-
   /// The most recent event, which is what tells a reader the gesture machine is
   /// alive.
   InputEvent? get last => _last;
-
-  /// What the session last complained about, if it has.
-  String? get fault => _fault;
 
   /// Whether anything is on the other end.
   bool get isAttached => _session != null;
@@ -60,17 +44,10 @@ class InputPipe {
   Duration get latest => _latest;
 
   /// Sends everything from now on to [session].
-  void attach(Session session) {
-    _session = session;
-    _timer ??= Timer.periodic(tick, (_) => _flush());
-  }
+  void attach(Session session) => _session = session;
 
   /// Stops sending. The counters stay, because they describe the run.
-  void detach() {
-    _timer?.cancel();
-    _timer = null;
-    _session = null;
-  }
+  void detach() => _session = null;
 
   /// Records what the user did at [at] on the event clock.
   ///
@@ -81,32 +58,12 @@ class InputPipe {
     if (at > _latest) _latest = at;
     _sent++;
     _last = event;
-    final Session? session = _session;
-    if (session == null) return;
-    _guard(session.input(atMicros: _sessionMicros(at), event: event));
+    _session?.input(atMicros: _sessionMicros(at), event: event);
   }
 
   /// Records something the platform reported with no clock reading of its own,
   /// which is everything the on-screen keyboard produces.
   void sendUnstamped(InputEvent event) => send(_latest, event);
-
-  void _flush() {
-    final Session? session = _session;
-    if (session == null) return;
-    _batches++;
-    _guard(session.flushInput());
-  }
-
-  /// Keeps a failure on the far side of the bridge out of the zone's unhandled
-  /// error path, where it would take the application down, and puts it
-  /// somewhere the overlay can show it instead.
-  void _guard(Future<void> work) {
-    unawaited(
-      work.catchError((Object error) {
-        _fault = '$error';
-      }),
-    );
-  }
 
   BigInt _sessionMicros(Duration at) {
     final Duration origin = _origin ??= at;

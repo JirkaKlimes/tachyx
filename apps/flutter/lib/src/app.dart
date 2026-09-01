@@ -46,8 +46,22 @@ class _TachyxAppState extends State<TachyxApp> {
           (size.width * ratio).round().clamp(1, 0xFFFF),
           (size.height * ratio).round().clamp(1, 0xFFFF),
         ),
+        refreshHz: _refreshHz(context),
       ),
     );
+  }
+
+  /// What the display refreshes at, in hertz.
+  ///
+  /// It bounds the frame rate the client asks for, because a frame the display
+  /// never shows costs everything a shown one costs. An embedder that does not
+  /// know reports zero, and asking a host for zero frames a second would be
+  /// asking it for none, so the fallback is sixty.
+  static int _refreshHz(BuildContext context) {
+    final double reported = View.of(context).display.refreshRate;
+    return reported.isFinite && reported >= 1
+        ? reported.round().clamp(1, 0xFFFF)
+        : 60;
   }
 
   @override
