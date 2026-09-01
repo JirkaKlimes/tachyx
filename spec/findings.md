@@ -4,7 +4,13 @@ What was measured on the target machine, and which assumptions in
 [`architecture.md`](architecture.md) did not survive contact with it.
 
 Target: NixOS 26.05, Hyprland 0.56.2, AMD Radeon 780M at `/dev/dri/renderD128`
-(Mesa 26.1.2, VA-API 1.23), NVIDIA RTX 4060 Laptop, GStreamer 1.26.11.
+(Mesa 26.1.2, VA-API 1.24 with libva 2.24.0), NVIDIA RTX 4060 Laptop,
+GStreamer 1.28.6. Two outputs: eDP-1 at 2880x1800 and 120 Hz, DP-2 at 3440x1440
+and 74.983 Hz.
+
+An earlier revision of this line said VA-API 1.23 and GStreamer 1.26.11. The
+development shell now supplies 1.24 and 1.28.6, so any figure below that is not
+dated to a re-measurement was taken on the older pair.
 
 Everything below was executed, not read. Where something is quoted from
 documentation rather than run, it says so.
@@ -25,8 +31,12 @@ full-frame damage on every frame, on both `ext-image-copy-capture-v1` and
 
 Idle suppression arrives from somewhere better instead. `capture()` blocks until
 the screen changes, so a static desktop produces no frames at all rather than
-cheap ones. Idle inter-frame time measured at 91 ms median with a 1.53 second
-maximum. The damage handler is still wired, because it costs nothing and a later
+cheap ones. On an output holding an empty workspace, capture yields 37 frames in
+30 seconds, 1.23 per second, with about one second between them, and the whole
+process spends 10 ms of processor time over that window, which is 0.03 percent
+of one core. It blocks; it does not spin. An earlier revision recorded 91 ms
+median between idle frames, which was an output that still had something small
+moving on it. The damage handler is still wired, because it costs nothing and a later
 compositor may narrow it, but nothing depends on it.
 
 ### Portal RemoteDesktop does not exist on this compositor
@@ -69,10 +79,32 @@ protocol supplies, and the separate cursor metadata channel.
 no portal. Both are advertised by Hyprland 0.56.2, alongside `zwlr-screencopy-v1`
 version 3 as a fallback for compositors without the ext protocol.
 
-Measured on eDP-1 (2880x1800 at 120 Hz): 123.6 frames per second under motion,
-8.3 ms median between frames, refresh-locked. `presentation_time` is
-`CLOCK_MONOTONIC` and lands 1 to 4 ms in the past at the moment the frame is
-ready.
+Re-measured with the crate that does this for real, `tachyx-media`, rather than
+with a probe.
+
+On DP-2 (3440x1440 at 74.983 Hz) under continuous motion: 600 frames in 8.000
+seconds, 75.0 per second, refresh-locked. The consumer waits 13.33 ms between
+frames at the median, 13.62 at the ninetieth percentile and 15.10 at worst.
+Nothing dropped, nothing failed.
+
+`presentation_time` is `CLOCK_MONOTONIC`, and it lands 0.04 ms in the past at the
+median and 0.09 ms at worst, not the 1 to 4 ms an earlier revision of this
+document recorded. Hyprland stamps the copy, not the scan-out, so the field is
+not a measure of how long the picture has been on the glass.
+
+### eDP-1 could not be made to present under motion
+
+The 123.6 frames per second an earlier revision recorded for eDP-1 did not
+reproduce. With the laptop panel connected, enabled, lid open, DPMS on, holding
+its own workspace, and a `videotestsrc` window running full screen on it at 144
+frames per second, capture of eDP-1 yields 2.7 frames per second, with waits of
+about one second between them. The same binary on DP-2, at the same moment,
+yields 75.0. Hyprland is not repainting that output, and neither VRR being on for
+it nor `solitary` nor direct scan-out explains it: both are reported blocked.
+
+So the refresh-locked claim holds and is measured, but on DP-2. Nothing is known
+about capture at 120 Hz on this machine, and the 8.3 ms figure should not be
+relied on until eDP-1 can be made to present again.
 
 The cursor is excluded from the frame unless asked for, and a separate cursor
 session supplies position, hotspot and a 48x48 ARGB image. This is exactly the
@@ -94,12 +126,31 @@ loud failure.
 `DRM_FORMAT_MOD_INVALID` appears in the advertised modifier list and must be
 removed before the list is offered to the allocator.
 
-A single-plane `XR24` buffer reports three planes under the AMD compression
-modifiers, because the compression metadata occupies planes of its own. Every
-plane must be added to the buffer parameters; assuming one plane fails.
+A single-plane `XR24` buffer can report several planes under an AMD compression
+modifier, because the compression metadata occupies planes of its own, so every
+plane must be added to the buffer parameters.
+
+Under the one modifier this pair actually negotiates, `0x0200000010401b04`, it
+does not. Delta colour compression is off in that modifier, bit 13 clear, so
+there is no metadata plane and the allocator reports exactly one plane: offset 0,
+stride 11776 on eDP-1 and 13824 on DP-2. An earlier revision said three planes
+without naming a modifier. The loop over planes stays, because it costs nothing
+and the count comes from the allocator rather than from an assumption, but the
+common case is one.
 
 A session permits one capture in flight. Concurrent sessions on one output do
 work, if overlap is ever needed.
+
+### The compositor's buffer imports into the encoder
+
+This was the one integration nothing had exercised, and it works. A buffer object
+allocated by GBM on the render node the session named, filled by the compositor,
+handed to GStreamer as a single memory covering the whole object with a
+`GstVideoMeta` carrying the plane offsets and strides, imports into `vapostproc`
+and reaches `vah264enc`. The output decodes, and a decoded picture is the desktop:
+right colours, right geometry, no shearing and no tearing. So the single-memory
+plus video-meta description is correct for this layout, and neither fallback the
+handoff note listed was needed.
 
 ## Encode
 
@@ -223,10 +274,106 @@ compositor offers and what the encoder will import, rather than from the
 compositor's list alone. Negotiating the two independently produces an import
 failure at run time on any machine whose lists differ.
 
-Restating the input size on a filter that does not change it is not free: it
-defeats the scaler's pass-through and doubles its cost, from 9.2 to 18.6
-milliseconds at full resolution. The filter is set only when the encode size
-genuinely differs from the capture size.
+### Restating the input size on the filter is free, and the memory feature is not
+
+An earlier revision of this document said the opposite: that restating a size the
+scaler is not changing defeats a pass-through and doubles the cost, from 9.2 to
+18.6 milliseconds at full resolution. **That is wrong.** Measured on the real
+pipeline, 400 access units per run, three runs of each variant, every run at the
+refresh rate, at 3440x1440:
+
+| filter caps | median | ninetieth |
+|---|---|---|
+| left open, `ANY` | 7.64, 7.64, 7.64 ms | 7.83, 7.80, 7.79 ms |
+| `video/x-raw(memory:VAMemory)` with the same size | 7.64, 7.62, 7.57 ms | 7.82, 7.78, 7.78 ms |
+| bare `video/x-raw` with the same size | 7.60, 7.64, 7.61 ms | 7.80, 7.81, 7.80 ms |
+
+There is no difference at all, let alone a doubling. The filter is therefore set
+unconditionally, which removes a branch and keeps one negotiated memory type for
+the life of the pipeline instead of two.
+
+The memory feature does decide what gets negotiated, though. Reading the caps
+back off the pads proves it:
+
+- filter left open: `video/x-raw(memory:DMABuf), format=DMA_DRM,
+  drm-format=NV12:0x0200000010401b04`. The scaler hands the encoder a descriptor.
+- `(memory:VAMemory)`: `video/x-raw(memory:VAMemory), format=NV12`. A VA surface.
+- bare `video/x-raw`: `video/x-raw, format=NV12`. **System memory**, on every pad.
+
+So caps with no feature field really do mean system memory, and both elements
+honour that. It costs nothing measurable here because an integrated part shares
+one physical memory with the processor, but it would on a discrete GPU, and it is
+free to state. The filter carries `(memory:VAMemory)`.
+
+### The whole chain, measured end to end
+
+Time from handing a shared buffer to `appsrc` to holding the access unit, so
+scaler and encoder together rather than the encoder alone. Captured at 3440x1440,
+four interleaved passes of each size, every pass at about 72 frames per second:
+
+| encode size | median | ninetieth | ninety-ninth | worst |
+|---|---|---|---|---|
+| 3440x1440, no scaling | 7.61 to 9.15 ms | 7.79 to 9.38 ms | 7.94 to 9.54 ms | 16.75 ms |
+| 2580x1080 | 8.99 to 9.82 ms | 9.91 to 9.97 ms | 10.01 to 10.10 ms | 15.37 ms |
+| 1720x720 | 5.04 to 5.11 ms | 5.22 to 5.25 ms | 5.36 to 5.43 ms | 11.33 ms |
+
+The middle rung is the slowest, which is the interesting part. 1720x720 is
+exactly half of 3440x1440 in both axes and costs 5.1 ms; 2580x1080 is
+three quarters and costs 9.8 ms, more than not scaling at all. **The ladder
+should be built from halvings**, because an arbitrary ratio makes the scaler
+cost more than the encoder saves.
+
+Encode latency also roughly doubles when frames arrive intermittently rather than
+at the refresh rate: the same native size measures 7.6 ms at 72 frames per second
+and 15.0 ms over a run averaging 34. The part downclocks between frames. Any
+latency figure is only meaningful next to the rate it was taken at.
+
+### Variable bitrate emits no filler, and the bitrate is not a ceiling
+
+Filler measured 0.000 percent of the bitstream in every run at every size, which
+confirms the switch away from constant bitrate.
+
+The configured rate is a target and not a limit. Against 20 Mbit/s configured,
+the achieved rate at 3440x1440 ranged from 20.7 to 35.8 Mbit/s depending on how
+hard the picture was, and the lower rungs came in under it: 13.7 to 14.0 Mbit/s
+at 2580x1080 and 7.0 to 8.7 at 1720x720. Congestion control must treat the
+bitrate property as a request, not as a bound it can rely on.
+
+### Three shared buffers is the measured minimum
+
+Not a margin. With the ring cut to two, `publish` reaches a state where no buffer
+is free to arm and none can be freed by displacing the pending frame, within a
+second of starting, every time. With three it never happens under the encoder:
+over about eleven thousand frames the starvation path, where nothing is free
+until the pending frame is displaced, was taken 0 to 56 times per run and always
+recovered on the same pass, so no vertical blank was missed.
+
+Pushing a buffer and immediately pulling the sample does make the chain serial,
+as was reasoned but not measured before. Pushes and pulled samples stayed one to
+one across every run, and a decoded frame shows no tearing, so the return of the
+pull really is a safe signal that the scaler has finished with the shared buffer.
+
+### Live reconfiguration, measured on one pipeline
+
+Seven changes on a pipeline that was never torn down, 300 access units collected
+after each:
+
+| change | applied in | took effect on | dropped |
+|---|---|---|---|
+| 3440x1440 to 2580x1080 | 0.052 ms | next unit | 0 |
+| 2580x1080 to 1720x720 | 0.054 ms | second unit | 0 |
+| back to 3440x1440 | 0.034 ms | next unit | 0 |
+| bitrate doubled | 0.058 ms | next unit | 0 |
+| declared frame rate halved | 0.063 ms | next unit | 0 |
+
+Every one of them forces a key frame, resolution changes included, and the
+encoder renegotiates its level in place: the streams report level 3.2 at
+1720x720 and 5.0 at 2580x1080 and above. Each phase was written to its own file
+and every one decodes through `h264parse ! avdec_h264` with no error, including
+across the resolution change in the middle of it.
+
+"Second unit" rather than "next" is the frame that was already inside the
+pipeline when the property was set, not a delay in applying it.
 
 ## Input injection
 
