@@ -340,8 +340,13 @@ fn video_input_and_liveness_all_cross_a_real_socket() {
 
 #[test]
 fn a_still_screen_is_idle_rather_than_a_lost_host() {
-    let loopback = Loopback::open("idle", |mut host, report| {
+    let loopback = Loopback::open("idle", |host, report| {
         Box::pin(async move {
+            // Taken whole. A block that touched only the fields it uses would
+            // capture only those, and dropping the reading half of the control
+            // stream sends `STOP_SENDING`, which makes the client's next write
+            // fail. A real host holds the session.
+            let mut host = host;
             host.to_client
                 .send(&HostMessage::Stream(stream()))
                 .await

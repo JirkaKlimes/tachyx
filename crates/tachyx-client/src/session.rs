@@ -31,13 +31,19 @@ const FRAME_DEADLINE: Duration = Duration::from_millis(50);
 
 /// The shortest interval between two key frame requests.
 ///
-/// The request itself travels on the reliable stream, so it never needs
-/// repeating: a second one can only ask for a key frame the host is already
-/// encoding. What this bounds is flapping, where a link losing packets steadily
-/// breaks and repairs the reference chain over and over. A 1080p key frame was
-/// measured at 130 KB, which is 130 ms of an 8 Mbit/s stream, so this is about
-/// two key frames of wire time and a request inside it would be answered by a
-/// frame already on its way.
+/// The request arrives: it travels on the reliable stream. Being answered is
+/// another matter. The host draws every cause of a key frame from one budget, so
+/// a bitrate step taken a moment earlier makes it refuse this one and say
+/// nothing, and it holds no record of the refusal to act on later. A client that
+/// asked once would then wait for a picture nobody is going to send, for the
+/// rest of the session. So the request is repeated for as long as the decoder is
+/// stuck, and this is what bounds the repetition.
+///
+/// A 1080p key frame was measured at 130 KB, which is 130 ms of an 8 Mbit/s
+/// stream, so this is about two key frames of wire time: a request inside it
+/// would be answered by a frame already on its way. It also bounds flapping,
+/// where a link losing packets steadily breaks and repairs the reference chain
+/// over and over.
 const KEYFRAME_REQUEST_GAP: Duration = Duration::from_millis(250);
 
 /// How long without a picture before the client says the screen is still rather
@@ -50,10 +56,15 @@ const STILL: Duration = Duration::from_millis(200);
 
 /// How long without a word from the host before the connection is called lost.
 ///
-/// Three missed heartbeats. Two would fire on one lost wake-up on a busy phone,
-/// and the transport's own five-second idle timeout is the next signal after
-/// this one, so anything longer would make this report redundant.
-const LOST_AFTER: Duration = HEARTBEAT_INTERVAL.saturating_mul(3);
+/// Generous, because a heartbeat is a stream frame and video datagrams are
+/// written into a packet ahead of stream frames. A saturated link therefore
+/// delays heartbeats long before it drops the connection, and a tight deadline
+/// here reports a dead host when the truth is a busy one. Measured on Wi-Fi:
+/// three missed beats fired within seconds while video was still arriving.
+///
+/// The transport's own idle timeout is the next signal after this one, so this
+/// stays below it and above anything congestion alone can cause.
+const LOST_AFTER: Duration = HEARTBEAT_INTERVAL.saturating_mul(16);
 
 /// The most the client will let the stream cost, in bits per second.
 ///
@@ -127,7 +138,6 @@ pub struct Session {
     input: InputQueue,
     video: Reassembler,
     decoded: Option<FrameId>,
-    asked_for_key: bool,
     ask_again_at: Instant,
     heard: Instant,
     saw: Option<Instant>,
@@ -149,9 +159,12 @@ impl Session {
             video: Reassembler::new(FRAME_DEADLINE),
             decoded: None,
             // The reassembler starts wanting a key frame and the host starts by
-            // sending one, so asking for it would be noise.
-            asked_for_key: true,
-            ask_again_at: now,
+            // sending one, so asking inside the first gap would be noise. Asking
+            // after it is not: that key frame is the largest frame of the
+            // session and therefore the likeliest to be lost, and a client that
+            // stayed quiet about it would show nothing for as long as it stayed
+            // connected.
+            ask_again_at: now + KEYFRAME_REQUEST_GAP,
             heard: now,
             saw: None,
             beat: None,
@@ -240,13 +253,23 @@ impl Session {
         Ok(frame)
     }
 
-    /// When the earliest incomplete frame gives up, if one is open.
+    /// When the session next has something to do without being spoken to.
+    ///
+    /// Two things: the earliest incomplete frame giving up, and the next key
+    /// frame request while the decoder is stuck. The second matters because the
+    /// host can stop sending video altogether, and a client that only revisited
+    /// the question on the arrival of a datagram would then never revisit it.
     ///
     /// A receive loop waits on this rather than on a fixed tick, so a session
     /// watching a static screen costs no wake-ups.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.video.next_deadline()
+        let expiry = self.video.next_deadline();
+        let retry = self.video.needs_keyframe().then_some(self.ask_again_at);
+        match (expiry, retry) {
+            (Some(expiry), Some(retry)) => Some(expiry.min(retry)),
+            (one, None) | (None, one) => one,
+        }
     }
 
     /// Gives up on frames whose wait has run out.
@@ -296,32 +319,29 @@ impl Session {
     pub fn decoder_started_late(&mut self, now: Instant) {
         self.outgoing
             .push_back(ClientMessage::KeyframeRequest { after: None });
-        self.asked_for_key = true;
         self.ask_again_at = now + KEYFRAME_REQUEST_GAP;
     }
 
-    /// Asks for a key frame on the edge where the decoder becomes stuck, and
-    /// arms the next request on the edge where it is unstuck again.
+    /// Asks for a key frame while the decoder is stuck, no more often than
+    /// [`KEYFRAME_REQUEST_GAP`].
     ///
-    /// One request per lost packet would put a burst of them on the control
-    /// stream and earn a burst of key frames back, and on this host every key
-    /// frame is a full IDR: neither intra-refresh nor long-term reference frames
-    /// are reachable through its encoder. [`KEYFRAME_REQUEST_GAP`] bounds the
-    /// remaining case, a link breaking and repairing the chain repeatedly.
+    /// Level-triggered, not edge-triggered. The host is free to refuse a request
+    /// and keeps no record of having refused one, so a client that asked on the
+    /// edge where it became stuck and then went quiet would stay stuck for the
+    /// rest of the session on a single refusal.
+    ///
+    /// One request per lost packet would go the other way and put a burst of
+    /// them on the control stream, earning a burst of key frames back, and on
+    /// this host every key frame is a full IDR: neither intra-refresh nor
+    /// long-term reference frames are reachable through its encoder. The gap is
+    /// what holds both ends.
     fn request_key_if_needed(&mut self, now: Instant) {
-        if !self.video.needs_keyframe() {
-            self.asked_for_key = false;
-            return;
-        }
-        // Already asked, or asked too recently. Neither forgets: the next
-        // datagram or expiry asks again once the gap has passed.
-        if self.asked_for_key || now < self.ask_again_at {
+        if !self.video.needs_keyframe() || now < self.ask_again_at {
             return;
         }
         self.outgoing.push_back(ClientMessage::KeyframeRequest {
             after: self.decoded,
         });
-        self.asked_for_key = true;
         self.ask_again_at = now + KEYFRAME_REQUEST_GAP;
     }
 }
@@ -542,15 +562,18 @@ mod tests {
 
     #[test]
     fn loss_asks_for_one_key_frame_and_not_one_per_packet() {
-        let mut session = session();
+        let opened = Instant::now();
+        let mut session = Session::new(caps(), opened);
         let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
         let payload = payload();
-        let now = Instant::now();
-
+        // The opening key frame arrives inside the gap the session opens with,
+        // where the one the host sends unasked is waited for rather than asked
+        // about. Everything after it is past that gap.
         for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload) {
-            session.datagram(&datagram, now).expect("a video packet");
+            session.datagram(&datagram, opened).expect("a video packet");
         }
-        let _ = queued(&mut session);
+        assert_eq!(session.poll_control(), None, "nothing to ask about yet");
+        let now = opened + KEYFRAME_REQUEST_GAP;
 
         // Lose the last fragment of the next picture, then deliver the one after
         // it: a later frame arriving is what proves the earlier one will never
@@ -571,9 +594,19 @@ mod tests {
             "one request, naming the last picture that did decode"
         );
 
-        // More loss while the decoder is already stuck asks for nothing more.
-        session.expire(now + Duration::from_secs(2));
+        // More loss inside the gap asks for nothing more.
+        session.expire(now + Duration::from_millis(1));
         assert_eq!(session.poll_control(), None);
+
+        // Past it, the request is repeated: the host may have refused the first
+        // one, and it holds no record of having done so.
+        session.expire(now + KEYFRAME_REQUEST_GAP);
+        assert_eq!(
+            queued(&mut session),
+            vec![ClientMessage::KeyframeRequest {
+                after: Some(FrameId(0))
+            }]
+        );
 
         // The key frame that answers it arms the next request without sending
         // one.
@@ -586,18 +619,100 @@ mod tests {
     }
 
     #[test]
-    fn a_link_that_breaks_repeatedly_cannot_spam_the_host() {
-        let mut session = session();
+    fn a_key_frame_the_host_refuses_is_asked_for_again() {
+        // The host may refuse: its key frame budget is shared with the bitrate
+        // and resolution causes, and a bitrate step spends it. A client that
+        // asks once and then waits shows a broken picture for the rest of the
+        // session, because nothing else on either side ever revisits the
+        // decision.
+        let opened = Instant::now();
+        let mut session = Session::new(caps(), opened);
         let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
         let payload = payload();
-        let start = Instant::now();
-        let mut id = 0;
+        for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload) {
+            session.datagram(&datagram, opened).expect("a video packet");
+        }
+        let start = opened + KEYFRAME_REQUEST_GAP;
 
-        // The first break happens before anything has decoded, so it is the one
-        // the session was built already expecting a key frame for.
-        for datagram in picture(&mut packetiser, id, FrameKind::Key, &payload) {
+        // Break the chain and take the one request it earns.
+        let damaged = picture(&mut packetiser, 1, FrameKind::Delta, &payload);
+        for datagram in &damaged[..damaged.len() - 1] {
+            session.datagram(datagram, start).expect("a video packet");
+        }
+        for datagram in picture(&mut packetiser, 2, FrameKind::Delta, &payload) {
             session.datagram(&datagram, start).expect("a video packet");
         }
+        assert_eq!(queued(&mut session).len(), 1, "the first request");
+
+        // The host refuses it and carries on sending delta frames. Five seconds
+        // of them, which is longer than any interval the host's budget imposes.
+        let mut asked = 0;
+        let mut now = start;
+        for id in 3..303u32 {
+            now += Duration::from_millis(16);
+            for datagram in picture(&mut packetiser, id, FrameKind::Delta, &payload) {
+                session.datagram(&datagram, now).expect("a video packet");
+            }
+            asked += queued(&mut session).len();
+        }
+        assert!(
+            asked > 0,
+            "a request the host refused must be repeated, or the picture never returns"
+        );
+    }
+
+    #[test]
+    fn a_stuck_client_asks_again_even_when_the_host_sends_nothing() {
+        // The gate on the host can shut the video path entirely, so a client
+        // that only revisits the question when a datagram arrives never
+        // revisits it at all. The deadline the receive loop already sleeps on is
+        // what has to carry the retry.
+        let opened = Instant::now();
+        let mut session = Session::new(caps(), opened);
+        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let payload = payload();
+        let start = opened + KEYFRAME_REQUEST_GAP;
+
+        let delta = picture(&mut packetiser, 0, FrameKind::Delta, &payload);
+        for datagram in &delta {
+            session.datagram(datagram, start).expect("a video packet");
+        }
+        assert_eq!(
+            session.video_stats().frames_undecodable,
+            1,
+            "a delta frame with nothing before it leaves the decoder stuck"
+        );
+        assert_eq!(queued(&mut session).len(), 1, "the first request");
+
+        // Nothing else arrives, ever. The reassembler holds no open frame, so
+        // its own deadline is gone and only the retry is left to wake the loop.
+        let deadline = session
+            .next_deadline()
+            .expect("a stuck session must give the loop something to wait on");
+        assert!(deadline <= start + KEYFRAME_REQUEST_GAP);
+        session.expire(deadline);
+        assert_eq!(
+            queued(&mut session).len(),
+            1,
+            "the retry the deadline was for"
+        );
+    }
+
+    #[test]
+    fn a_link_that_breaks_repeatedly_cannot_spam_the_host() {
+        let opened = Instant::now();
+        let mut session = Session::new(caps(), opened);
+        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let payload = payload();
+        let start = opened + KEYFRAME_REQUEST_GAP;
+        let mut id = 0;
+
+        // The opening key frame arrives inside the gap the session opens with,
+        // so it is waited for rather than asked about.
+        for datagram in picture(&mut packetiser, id, FrameKind::Key, &payload) {
+            session.datagram(&datagram, opened).expect("a video packet");
+        }
+        assert_eq!(session.poll_control(), None, "nothing to ask about yet");
         id += 1;
 
         // Ten breaks and ten repairs, every one a fresh edge, packed into one
