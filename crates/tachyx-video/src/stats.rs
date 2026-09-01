@@ -36,10 +36,10 @@ pub struct Stats {
 
 /// A rolling window of one measurement.
 #[derive(Debug, Default)]
-pub(super) struct Window(VecDeque<u32>);
+pub(crate) struct Window(VecDeque<u32>);
 
 impl Window {
-    pub(super) fn record(&mut self, elapsed: Duration) {
+    pub(crate) fn record(&mut self, elapsed: Duration) {
         if self.0.len() == WINDOW {
             self.0.pop_front();
         }
@@ -47,7 +47,7 @@ impl Window {
             .push_back(u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX));
     }
 
-    pub(super) fn summary(&self) -> Latency {
+    pub(crate) fn summary(&self) -> Latency {
         if self.0.is_empty() {
             return Latency::default();
         }

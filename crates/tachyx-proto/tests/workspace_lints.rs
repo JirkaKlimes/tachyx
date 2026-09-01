@@ -18,9 +18,18 @@ use std::path::Path;
 /// current and describes it to GStreamer: no type can prove a raw EGL handle
 /// names a live display or context.
 ///
-/// All three keep the rest of the workspace lint set, which the first test below
+/// `tachyx-surface` turns the Java surface Flutter's Android producer offers
+/// into the window the platform decoder writes into: no type can prove a Java
+/// object reference names a live `android.view.Surface`.
+///
+/// All four keep the rest of the workspace lint set, which the first test below
 /// checks, and none holds any decision of its own.
-const UNSAFE_EXCEPTIONS: [&str; 3] = ["tachyx-dmabuf", "tachyx-client-ffi", "tachyx-glctx"];
+const UNSAFE_EXCEPTIONS: [&str; 4] = [
+    "tachyx-dmabuf",
+    "tachyx-client-ffi",
+    "tachyx-glctx",
+    "tachyx-surface",
+];
 
 #[test]
 fn every_crate_opts_in_to_the_workspace_lints() {

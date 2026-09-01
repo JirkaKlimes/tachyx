@@ -1,0 +1,24 @@
+[package]
+name = "tachyx-surface"
+description = "The one place on the Android client where unsafe is permitted: turning Flutter's Java surface into a window the platform decoder writes into"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true
+ndk.workspace = true
+
+# This crate cannot take the workspace lints, because they forbid unsafe and a
+# `forbid` cannot be lifted from inside the crate it applies to. The set below is
+# the workspace set with that one line changed, so nothing else is lost.
+[lints.rust]
+unsafe_code = "warn"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }

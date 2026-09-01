@@ -20,6 +20,7 @@ tachyx-hostd = { path = "crates/tachyx-hostd" }
 tachyx-input = { path = "crates/tachyx-input" }
 tachyx-media = { path = "crates/tachyx-media" }
 tachyx-proto = { path = "crates/tachyx-proto" }
+tachyx-surface = { path = "crates/tachyx-surface" }
 tachyx-transport = { path = "crates/tachyx-transport" }
 tachyx-video = { path = "crates/tachyx-video" }
 
@@ -63,6 +64,18 @@ gstreamer-video = { version = "0.25", features = ["v1_26"] }
 # embedder offers for a texture the application draws itself.
 irondash_engine_context = "0.5"
 irondash_texture = "0.5"
+
+# The Android platform decoder and the window Flutter's surface producer stands
+# on. `default-features = false` drops a raw window handle integration nothing
+# here asks for.
+ndk = { version = "0.9", default-features = false, features = [
+  "media",
+  "nativewindow",
+  "api-level-28",
+] }
+# Pinned exactly. 0.22 changed the pointer type inside `JNIEnv`, which no longer
+# matches the one `ndk` takes, and every call to it then needs a cast.
+jni = "=0.21.1"
 
 drm-fourcc = "2.2"
 gbm = { version = "0.18", default-features = false }

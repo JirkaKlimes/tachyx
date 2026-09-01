@@ -1,5 +1,4 @@
 mod decoder;
-mod stats;
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -15,9 +14,8 @@ use irondash_texture::{
 };
 use tachyx_glctx::AdoptedContext;
 
+use crate::stats::{Stats, Window};
 use decoder::Decoder;
-use stats::Window;
-pub use stats::{Latency, Stats};
 
 /// `GL_TEXTURE_2D`. Flutter's Impeller renderer ignores the target a callback
 /// returns and samples every external texture as this one, so returning any
