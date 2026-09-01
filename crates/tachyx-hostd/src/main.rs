@@ -37,22 +37,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&state)?;
 
     let identity = HostIdentity::load_or_create(&state)?;
-    // Sized before any client says what it wants, so it is sized for the
-    // largest picture this host could ever be asked for. Over-sizing costs
-    // nothing: the send gate bounds what is actually queued, and a buffer too
-    // small to hold one key frame would shred every key frame instead of merely
-    // slowing the stream.
-    let ceiling = CodedSize::new(3840, 2160).ok_or("4K is not a valid coded size")?;
-    let host = Host::bind(config.listen, &identity, Tuning::for_stream(ceiling))?;
 
-    tracing::info!(
-        address = %host.local_address()?,
-        fingerprint = %identity.fingerprint().to_hex(),
-        "tachyx-hostd listening"
-    );
-    tracing::warn!(
-        "no authentication: anything that can reach this port can watch and control this machine"
-    );
+    // Sized before any client says what it wants, so it is sized for the largest
+    // picture this host could ever be asked for. Over-sizing costs nothing: the
+    // send gate bounds what is actually queued, while a buffer too small to hold
+    // one key frame would shred every key frame rather than merely slow the
+    // stream down.
+    let ceiling = CodedSize::new(3840, 2160).ok_or("3840x2160 is not a valid coded size")?;
 
     // Injection owns a Wayland connection of its own, so that a stall in it
     // cannot hold up capture.
@@ -62,6 +53,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
+        // Bound inside the runtime: the endpoint takes its driver from the
+        // ambient runtime when it is created, not when it is first used.
+        let host = Host::bind(config.listen, &identity, Tuning::for_stream(ceiling))?;
+        tracing::info!(
+            address = %host.local_address()?,
+            fingerprint = %identity.fingerprint().to_hex(),
+            "tachyx-hostd listening"
+        );
+        tracing::warn!(
+            "no authentication: anything that can reach this port can watch and control this machine"
+        );
+
         loop {
             let session = host.accept().await?;
             let peer = session.connection.remote_address();
