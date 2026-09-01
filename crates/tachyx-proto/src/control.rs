@@ -312,13 +312,14 @@ pub struct Heartbeat {
 ///
 /// It is a constant rather than a field of the message because both ends need
 /// it and only one of them would carry it: a client reads liveness from the
-/// *absence* of a heartbeat, so it has to know the interval before it has
-/// received one.
+/// *absence* of a heartbeat, so it has to know the interval before it has ever
+/// received one. For the same reason there is one constant and not one at each
+/// end, which would be two numbers free to disagree about the same wire fact.
 ///
-/// Twice the transport's keep-alive, which is what makes the connection itself
-/// hold open, and short enough that three missed beats are noticed inside the
-/// five-second idle timeout that would otherwise be the only signal.
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+/// Four a second. Three missed beats are then noticed three quarters of a
+/// second in, well before the transport's own five second idle timeout, which
+/// is the next signal after this one and far too late to be the first.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Anything a client sends after its hello.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

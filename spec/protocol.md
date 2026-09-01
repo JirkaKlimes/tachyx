@@ -115,7 +115,7 @@ The video path does not use this encoding, or serde at all. See below.
 `Heartbeat`
 : Proof the host is alive, and what it has been doing: its session clock, the
   last frame it sent, frames sent and gated, the transport's bandwidth estimate,
-  and its median capture-to-wire latency. Sent every 500 milliseconds whether or
+  and its median capture-to-wire latency. Sent four times a second whether or
   not frames are flowing.
 
   The host must say this out loud, and the client must read liveness from it

@@ -10,7 +10,8 @@ use std::time::Instant;
 
 use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Rate};
 use tachyx_proto::control::{
-    Aspect, ClientMessage, Codec, CodedSize, Heartbeat, HostMessage, Size as WireSize, StreamConfig,
+    Aspect, ClientMessage, Codec, CodedSize, HEARTBEAT_INTERVAL, Heartbeat, HostMessage,
+    Size as WireSize, StreamConfig,
 };
 use tachyx_proto::media::Timestamp;
 use tachyx_proto::packet::AccessUnit as WireUnit;
@@ -22,13 +23,6 @@ use crate::ladder::{Ladder, Settings, Size as RungSize};
 
 /// How often the rate controller looks at what the link is carrying.
 const RATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// How often the host says it is alive while the screen is still.
-///
-/// Capture blocks until something changes, and a still desktop was measured
-/// producing one frame a second. Without this the client cannot tell a still
-/// desktop from a host that has gone away.
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Why a session ended.
 #[derive(Debug, thiserror::Error)]
@@ -204,6 +198,9 @@ async fn run(
     };
 
     let mut rate_tick = tokio::time::interval(RATE_INTERVAL);
+    // The interval is the protocol's, not this daemon's: the client reads
+    // liveness from a beat that did not arrive, so it has to expect the same
+    // one the host keeps.
     let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     let connection = session.connection.clone();
 

@@ -621,7 +621,9 @@ mod tests {
         assert_eq!(session.liveness(start), Liveness::Streaming);
 
         // The measured worst case: the host's capture blocks for 1.53 seconds on
-        // a screen nothing is drawing to, and says so on the control stream.
+        // a screen nothing is drawing to, and keeps saying so on the control
+        // stream throughout, because its heartbeat does not wait on capture.
+        let still = Duration::from_millis(1_530);
         let beat = Heartbeat {
             sent: Timestamp::from_session_micros(1_000_000),
             last_frame: Some(FrameId(0)),
@@ -630,11 +632,13 @@ mod tests {
             pacing_rate: None,
             pipeline_micros: 4_200,
         };
-        session.host(HostMessage::Heartbeat(beat), start + HEARTBEAT_INTERVAL);
-        session.host(HostMessage::Heartbeat(beat), start + HEARTBEAT_INTERVAL * 2);
-        session.host(HostMessage::Heartbeat(beat), start + HEARTBEAT_INTERVAL * 3);
+        let mut at = start;
+        while at < start + still {
+            at += HEARTBEAT_INTERVAL;
+            session.host(HostMessage::Heartbeat(beat), at);
+        }
         assert_eq!(
-            session.liveness(start + Duration::from_millis(1_530)),
+            session.liveness(start + still),
             Liveness::Idle,
             "1.53 seconds without a frame is a still screen, not a dead host"
         );
