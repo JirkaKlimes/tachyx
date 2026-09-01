@@ -409,8 +409,26 @@ fn rung(size: tachyx_media::Size) -> RungSize {
 /// nearest arbitrary fit is how a phone ended up being served the slowest size
 /// of the three.
 fn halving_for(capture_height: u32, wanted: u32) -> u32 {
+    let wanted = wanted.max(1);
     let mut height = capture_height;
-    while height / 2 >= wanted.max(1) {
+    // Nearest, not the smallest that still covers the viewport. Covering it
+    // sounds right and is not: a 1800-tall desktop on a 1080-tall phone has no
+    // halving above 1080, so "cover it" sends the full picture, 2.8 times the
+    // pixels the screen can show. Those pixels are not free. They are what
+    // makes the transport refuse frames, and a frame refused after it has been
+    // encoded breaks the encoder's reference chain, so everything after it is
+    // undecodable until the next key frame.
+    //
+    // A halving below the viewport is upscaled by the client and, on a screen
+    // held at arm's length, invisibly so. A halving above it costs four times
+    // the pixels for detail the panel cannot resolve.
+    while height / 2 >= wanted {
+        height /= 2;
+    }
+    // Between two halvings, take whichever is the smaller stretch. The break
+    // even point is the geometric mean, so halve when the viewport sits below
+    // `height / sqrt(2)`, written here without a square root.
+    if 2 * u64::from(wanted) * u64::from(wanted) < u64::from(height) * u64::from(height) {
         height /= 2;
     }
     height
@@ -427,4 +445,47 @@ fn fps(rate: tachyx_media::Framerate) -> u16 {
 /// a refusal the caller can act on rather than a small number that looks valid.
 fn narrow(value: u32) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::halving_for;
+
+    #[test]
+    fn a_viewport_no_halving_covers_is_not_answered_with_the_whole_picture() {
+        // The case that sent a phone 2.8 times the pixels it can show: an
+        // 1800-tall capture has no halving between 900 and 1800, and answering
+        // "cover the viewport" means answering 1800.
+        assert_eq!(halving_for(1800, 1080), 900);
+    }
+
+    #[test]
+    fn a_viewport_close_to_a_halving_gets_that_halving() {
+        assert_eq!(halving_for(1440, 720), 720);
+        assert_eq!(halving_for(1800, 900), 900);
+        assert_eq!(halving_for(2160, 1080), 1080);
+    }
+
+    #[test]
+    fn a_viewport_just_under_a_halving_keeps_it_rather_than_dropping_a_whole_step() {
+        // 1080 of 1440 is a stretch of 1.33; halving to 720 would be 1.5.
+        assert_eq!(halving_for(1440, 1080), 1440);
+    }
+
+    #[test]
+    fn the_answer_is_always_a_halving_of_the_capture() {
+        for wanted in (100..2000).step_by(37) {
+            let height = halving_for(1800, wanted);
+            assert!(
+                [1800, 900, 450, 225, 112, 56, 28, 14, 7, 3, 1].contains(&height),
+                "{wanted} gave {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_viewport_larger_than_the_capture_gets_the_capture() {
+        assert_eq!(halving_for(1800, 1800), 1800);
+        assert_eq!(halving_for(1800, 4000), 1800);
+    }
 }
