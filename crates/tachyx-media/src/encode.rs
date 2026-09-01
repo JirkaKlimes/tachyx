@@ -294,6 +294,15 @@ impl Encoder {
                 .settings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Writing the rate the element already has is not free: it has no
+            // equality guard of its own, so the write raises its reconfigure
+            // flag and the next picture is a key frame. Measured by writing
+            // 20000 over 20000 and watching an IDR come out. A caller that
+            // recomputes the same target every tick would otherwise spend the
+            // whole session sending key frames.
+            if settings.rate == rate {
+                return Ok(());
+            }
             settings.rate = rate;
         }
         self.control.apply_rate(rate)
@@ -566,7 +575,15 @@ fn configure_encoder(encoder: &gst::Element) {
     // stream that is mostly padding makes the transport's bandwidth estimator
     // measure our own padding.
     encoder.set_property_from_str("rate-control", "vbr");
-    encoder.set_property("target-percentage", 66u32);
+    // A hundred, not the sixty-six that reads as more headroom. The element
+    // derives its peak as `bitrate * 100 / target-percentage` and then floors
+    // the coded picture buffer at half of THAT, so sixty-six silently inflated
+    // a buffer asked for as half a second into two full seconds: the log says
+    // "Too small cpb_size: 4000, adjust to 24242". Two seconds of buffering is
+    // two seconds of latency to spend before the rate control reacts at all.
+    // Measured: at a hundred the requested buffer is honoured and no filler
+    // returns.
+    encoder.set_property("target-percentage", 100u32);
     encoder.set_property("key-int-max", 1024u32);
     encoder.set_property("b-frames", 0u32);
     encoder.set_property("ref-frames", 1u32);

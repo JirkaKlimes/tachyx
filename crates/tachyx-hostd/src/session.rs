@@ -265,7 +265,8 @@ async fn run(
                     let wanted = u32::from(changed.viewport.height.get())
                         .min(u32::from(changed.max_decode.height.get()))
                         .min(capture_size.height());
-                    if let Ok(size) = EncodeSize::fit(capture_size, wanted)
+                    if let Ok(size) =
+                        EncodeSize::fit(capture_size, halving_for(capture_size.height(), wanted))
                         && budget.request(Reason::Resolution, Instant::now()) == Verdict::Allow
                     {
                         encoder.set_resolution(size)?;

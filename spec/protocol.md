@@ -82,16 +82,61 @@ The video path does not use this encoding, or serde at all. See below.
   one packet.
 
 `Feedback`
-: The receiver report that drives congestion control. Arrival timestamps per
-  received packet group, cumulative loss, and the client's current jitter buffer
-  depth.
+: The receiver report that drives congestion control. When each video datagram
+  arrived, which never did, and cumulative counts of both. Specified below and
+  in [`congestion.md`](congestion.md).
 
 `KeyframeRequest`
 : Sent when reassembly failed and the client cannot continue from what it has.
 
 `ClockSyncRequest`
 : Carries the client's send timestamp. Used to put the two clocks on a common
-  basis so per-stage latency can be attributed.
+  basis so per-stage latency can be attributed. Congestion control does not need
+  it: every quantity the estimator reads from a `Feedback` is a difference
+  between two of the client's own arrival times, so a constant offset between
+  the clocks cancels exactly.
+
+### The receiver report
+
+```rust
+pub struct Feedback {
+    /// The `seq` of the first datagram this report accounts for.
+    pub base: Seq,
+    /// The client's own clock at the arrival of the first datagram in
+    /// `packets` that arrived, in 250-microsecond ticks since the client's
+    /// session began.
+    pub reference: u32,
+    /// One entry per sequence number from `base` upward, in order, no gaps.
+    pub packets: Vec<PacketArrival>,
+    /// Datagrams the client has never seen, since the session began.
+    pub lost: u64,
+    /// Datagrams the client has received, since the session began.
+    pub received: u64,
+}
+
+pub enum PacketArrival {
+    /// Not received when the report was built.
+    Missing,
+    /// Received this many 250-microsecond ticks after the previous datagram in
+    /// this report that arrived. Negative when the two were reordered. The
+    /// first arrival is measured from `reference`, so its delta is zero.
+    Received(i16),
+}
+```
+
+The key is the `seq` already in the media header, so nothing new identifies a
+packet. Deltas rather than offsets because `postcard` varint-encodes and a delta
+between consecutive datagrams is almost always one byte. Signed because
+reordering is real, and 250-microsecond ticks because a signed sixteen-bit tick
+count then spans 8.19 seconds, thirty times the longest report interval.
+
+The counters are cumulative rather than per-interval so that a delayed report is
+still exactly right about the interval it covers.
+
+A report goes out every 50 ms while datagrams are arriving, carries at most 512
+statuses, and drops to every 250 ms while the host's announced bitrate is under
+250 kbit/s. Measured with real encodings, a report describing 88 datagrams is
+192 bytes, which at twenty a second is 0.17% of the 20 Mbit/s it describes.
 
 ### Host to client
 
@@ -214,7 +259,7 @@ All fields are little-endian.
 | 10 | 2 | `slice_pkts` | Packets in this slice. Every packet carries it, so any one of them can size the reassembly buffer. |
 | 12 | 2 | `pkt_idx` | This packet's position in the slice. |
 | 14 | 1 | `slice_id` | Which slice of the frame. |
-| 15 | 1 | `flags` | Bit 0 marks a key frame, bit 1 the frame's last slice. The rest are spare and a receiver must ignore them. |
+| 15 | 1 | `flags` | Bit 0 marks a key frame, bit 1 the frame's last slice, bit 2 padding. The rest are spare and a receiver must ignore them. |
 
 The payload follows immediately. At the 1434-byte datagram this transport reaches
 on a 1500-byte path, that leaves 1418 bytes of video, or 94.5% of the wire frame.
@@ -273,6 +318,20 @@ a slice is a separate axis, carried by `slice_pkts` and `pkt_idx`. Fragmentation
 alone would not give the property, because a lost fragment still destroys its
 slice.
 
-`slice_id` 255 and the spare flag bits are reserved for forward error correction,
-which is not implemented. On a local network a retransmission costs about a
-millisecond, which is cheaper than paying for parity on every frame.
+### Padding carries no picture and exists to be timed
+
+A datagram with bit 2 of `flags` set carries the ordinary sixteen-byte header
+and a payload of zeroes. It exists so that the host can measure a rate the
+picture is not currently supplying, which is most of the time: a still desktop
+produces no frames at all, and a congestion controller that only learns from
+media never learns that the link has recovered.
+
+A receiver counts its sequence number, records its arrival for the next
+`Feedback`, and discards it. `frame_id`, `capture`, `slice_pkts`, `pkt_idx` and
+`slice_id` mean nothing on a padding packet and must not reach reassembly.
+Sequence accounting is the only thing padding takes part in, and it is the only
+thing it is for.
+
+`slice_id` 255 and the remaining spare flag bits are reserved for forward error
+correction, which is not implemented. On a local network a retransmission costs
+about a millisecond, which is cheaper than paying for parity on every frame.
