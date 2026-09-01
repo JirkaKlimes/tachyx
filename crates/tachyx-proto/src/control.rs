@@ -296,14 +296,42 @@ pub struct Heartbeat {
     pub last_frame: Option<FrameId>,
     /// Frames sent this session.
     pub frames_sent: u64,
-    /// Frames the host declined to encode because the send buffer had no room
-    /// for them whole.
+    /// Frames the host declined because the send buffer had no room for them
+    /// whole, or because capture had nowhere to put them.
+    ///
+    /// A safety interlock rather than a rate control: with the pacer keeping
+    /// the transport's queue one or two datagrams deep it should never fire,
+    /// and a session in which it does is a session with something else wrong.
     pub frames_gated: u64,
+    /// Frames the rate limiter refused because the picture would have cost more
+    /// than the link carries.
+    ///
+    /// Counted apart from `frames_gated` because the two name different faults,
+    /// and the session that reported "179 gated" could not say which mechanism
+    /// did it.
+    pub frames_refused: u64,
     /// The transport's own bandwidth estimate, in bits per second.
     ///
     /// `None` under a congestion controller that does not pace, which is every
-    /// controller but BBR.
+    /// controller but BBR. It is a diagnostic and nothing reads it as a target:
+    /// measured, it reported 0.00 Mbit/s on a healthy hundred-megabit path for
+    /// every sample of a twenty-second run, because its sampler discards any
+    /// measurement taken while the sender is limited by its own supply and a
+    /// sender producing sixty frames a second always is.
     pub pacing_rate: Option<u64>,
+    /// What the host's own congestion controller believes the path will carry,
+    /// in bits per second.
+    ///
+    /// This is the number the session is actually run against, and it is beside
+    /// `pacing_rate` rather than instead of it because the difference between
+    /// the two is the whole reason this controller exists.
+    pub estimate: Option<u32>,
+    /// Datagrams of padding released to time the path.
+    ///
+    /// A still desktop produces no frames, so a controller that only learned
+    /// from media would never learn that the link had recovered. These carry no
+    /// picture and exist to be timed.
+    pub padding_sent: u64,
     /// Median capture to wire latency over the last interval, in microseconds.
     pub pipeline_micros: u32,
 }
@@ -669,7 +697,10 @@ mod tests {
             last_frame: Some(FrameId(42)),
             frames_sent: 42,
             frames_gated: 1,
+            frames_refused: 9,
             pacing_rate: Some(940_000_000),
+            estimate: Some(8_500_000),
+            padding_sent: 15,
             pipeline_micros: 7300,
         });
         for message in [stream, heartbeat] {

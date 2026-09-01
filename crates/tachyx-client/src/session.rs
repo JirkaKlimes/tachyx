@@ -12,12 +12,13 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::time::{Duration, Instant};
 
 use tachyx_proto::control::{
-    Capabilities, ClientHello, ClientMessage, HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size,
-    StreamConfig,
+    Capabilities, ClientHello, ClientMessage, FEEDBACK_INTERVAL, FEEDBACK_SLOW_BELOW,
+    FEEDBACK_SLOW_INTERVAL, HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size, StreamConfig,
 };
 use tachyx_proto::input::InputEvent;
 use tachyx_proto::media::{FrameId, MalformedPacket, Timestamp};
 use tachyx_proto::packet::{Frame, Reassembler, ReassemblyStats};
+use tachyx_proto::report::Reporter;
 
 use crate::cursor::{CursorTracker, CursorView, Spot};
 use crate::input::InputQueue;
@@ -144,6 +145,7 @@ pub struct Session {
     heard: Instant,
     saw: Option<Instant>,
     beat: Option<Heartbeat>,
+    reports: Reporter,
     cursor: CursorTracker,
 }
 
@@ -172,6 +174,7 @@ impl Session {
             heard: now,
             saw: None,
             beat: None,
+            reports: Reporter::new(now),
             cursor: CursorTracker::new(),
         }
     }
@@ -260,9 +263,11 @@ impl Session {
     /// # Errors
     /// If the datagram is not a video packet.
     pub fn datagram(&mut self, datagram: &[u8], now: Instant) -> Result<(), MalformedPacket> {
-        self.video.push(datagram, now)?;
+        let seq = self.video.push(datagram, now)?;
+        self.reports.record(seq, now);
         self.collect(now);
         self.request_key_if_needed(now);
+        self.report(now);
         Ok(())
     }
 
@@ -296,12 +301,14 @@ impl Session {
     /// watching a static screen costs no wake-ups.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
-        let expiry = self.video.next_deadline();
-        let retry = self.video.needs_keyframe().then_some(self.ask_again_at);
-        match (expiry, retry) {
-            (Some(expiry), Some(retry)) => Some(expiry.min(retry)),
-            (one, None) | (None, one) => one,
-        }
+        [
+            self.video.next_deadline(),
+            self.video.needs_keyframe().then_some(self.ask_again_at),
+            self.reports.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Gives up on frames whose wait has run out.
@@ -309,6 +316,30 @@ impl Session {
         self.video.expire(now);
         self.collect(now);
         self.request_key_if_needed(now);
+        self.report(now);
+    }
+
+    /// Queues whatever the host is owed about the path.
+    ///
+    /// Drained in a loop because a report carries at most 512 statuses and a
+    /// longer one is split into parts sent back to back. The counters are the
+    /// reassembler's own: they are cumulative, so a report delayed on the way
+    /// out is still exactly right about the interval it covers.
+    fn report(&mut self, now: Instant) {
+        let stats = self.video.stats();
+        // The formula libwebrtc uses returns something under 50 ms on any link
+        // above 218 kbit/s, so the clamp decides everywhere except on a
+        // collapsing link, and this is the one comparison that reproduces it.
+        let interval = match self.stream {
+            Some(stream) if stream.bitrate.get() < FEEDBACK_SLOW_BELOW => FEEDBACK_SLOW_INTERVAL,
+            _ => FEEDBACK_INTERVAL,
+        };
+        while let Some(report) =
+            self.reports
+                .poll(now, interval, stats.packets_lost, stats.packets_received)
+        {
+            self.outgoing.push_back(ClientMessage::Feedback(report));
+        }
     }
 
     /// Records what the user did, to be sent with the next batch.
@@ -409,9 +440,13 @@ impl Session {
 mod tests {
     use std::num::NonZeroUsize;
 
-    use tachyx_proto::control::{Aspect, Codec, CodedSize};
+    use tachyx_proto::control::{
+        Aspect, Codec, CodedSize, FEEDBACK_INTERVAL, FEEDBACK_SLOW_BELOW, FEEDBACK_SLOW_INTERVAL,
+        Feedback, PacketArrival,
+    };
     use tachyx_proto::input::{PointerButton, Press};
     use tachyx_proto::media::FrameKind;
+    use tachyx_proto::media::Seq;
     use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
 
     use super::*;
@@ -452,8 +487,24 @@ mod tests {
         packetiser
     }
 
+    /// Everything the session wants to send, less the receiver reports.
+    ///
+    /// A datagram that arrives is a datagram whose arrival has to be reported,
+    /// so every test below that feeds a picture would otherwise have to step
+    /// around one. What the reports themselves say is asserted in its own test.
     fn queued(session: &mut Session) -> Vec<ClientMessage> {
-        std::iter::from_fn(|| session.poll_control()).collect()
+        std::iter::from_fn(|| session.poll_control())
+            .filter(|message| !matches!(message, ClientMessage::Feedback(_)))
+            .collect()
+    }
+
+    fn reports(session: &mut Session) -> Vec<Feedback> {
+        std::iter::from_fn(|| session.poll_control())
+            .filter_map(|message| match message {
+                ClientMessage::Feedback(report) => Some(report),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The datagrams of one picture, as the host would put them on the wire.
@@ -629,9 +680,8 @@ mod tests {
         assert_eq!(frame.kind, FrameKind::Key);
         assert_eq!(frame.data, payload);
         assert_eq!(session.video_stats().frames_delivered, 1);
-        assert_eq!(
-            session.poll_control(),
-            None,
+        assert!(
+            queued(&mut session).is_empty(),
             "nothing was lost, so nothing is asked for"
         );
     }
@@ -648,7 +698,7 @@ mod tests {
         for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload) {
             session.datagram(&datagram, opened).expect("a video packet");
         }
-        assert_eq!(session.poll_control(), None, "nothing to ask about yet");
+        assert!(queued(&mut session).is_empty(), "nothing to ask about yet");
         let now = opened + KEYFRAME_REQUEST_GAP;
 
         // Lose the last fragment of the next picture, then deliver the one after
@@ -672,7 +722,7 @@ mod tests {
 
         // More loss inside the gap asks for nothing more.
         session.expire(now + Duration::from_millis(1));
-        assert_eq!(session.poll_control(), None);
+        assert!(queued(&mut session).is_empty());
 
         // Past it, the request is repeated: the host may have refused the first
         // one, and it holds no record of having done so.
@@ -693,7 +743,7 @@ mod tests {
             session.pop_frame().is_some(),
             "the key frame ends the outage"
         );
-        assert_eq!(session.poll_control(), None, "recovery is not a request");
+        assert!(queued(&mut session).is_empty(), "recovery is not a request");
     }
 
     #[test]
@@ -763,17 +813,17 @@ mod tests {
         assert_eq!(queued(&mut session).len(), 1, "the first request");
 
         // Nothing else arrives, ever. The reassembler holds no open frame, so
-        // its own deadline is gone and only the retry is left to wake the loop.
-        let deadline = session
-            .next_deadline()
-            .expect("a stuck session must give the loop something to wait on");
-        assert!(deadline <= start + KEYFRAME_REQUEST_GAP);
-        session.expire(deadline);
-        assert_eq!(
-            queued(&mut session).len(),
-            1,
-            "the retry the deadline was for"
-        );
+        // its own deadline is gone, and what is left to wake the loop is the
+        // report the arrivals owe the host and then the retry.
+        let mut requests = 0;
+        while let Some(deadline) = session.next_deadline() {
+            if deadline > start + KEYFRAME_REQUEST_GAP {
+                break;
+            }
+            session.expire(deadline);
+            requests += queued(&mut session).len();
+        }
+        assert_eq!(requests, 1, "the retry the deadlines were for");
     }
 
     #[test]
@@ -790,7 +840,7 @@ mod tests {
         for datagram in picture(&mut packetiser, id, FrameKind::Key, &payload) {
             session.datagram(&datagram, opened).expect("a video packet");
         }
-        assert_eq!(session.poll_control(), None, "nothing to ask about yet");
+        assert!(queued(&mut session).is_empty(), "nothing to ask about yet");
         id += 1;
 
         // Ten breaks and ten repairs, every one a fresh edge, packed into one
@@ -816,6 +866,70 @@ mod tests {
     }
 
     #[test]
+    fn every_datagram_that_arrives_is_reported_to_the_host() {
+        let start = Instant::now();
+        let mut session = Session::new(caps(), start);
+        let mut packetiser = bare_packetiser();
+        let payload = payload();
+
+        let datagrams = picture(&mut packetiser, 0, FrameKind::Key, &payload);
+        for (index, datagram) in datagrams.iter().enumerate() {
+            session
+                .datagram(datagram, start + Duration::from_micros(index as u64 * 250))
+                .expect("a video packet");
+        }
+        // The first datagram is reported on its own, because the cadence has
+        // nothing to hold it back yet; the rest wait for the interval.
+        session.expire(start + FEEDBACK_INTERVAL);
+        let reports = reports(&mut session);
+        let described: usize = reports.iter().map(|report| report.packets.len()).sum();
+        assert_eq!(
+            described,
+            datagrams.len(),
+            "every datagram that arrived must be accounted for"
+        );
+        assert_eq!(reports[0].base, Seq(0));
+        assert_eq!(reports[0].packets[0], PacketArrival::Received(0));
+        assert_eq!(
+            reports.last().expect("at least one").received,
+            datagrams.len() as u64,
+            "the cumulative counters are the reassembler's own"
+        );
+    }
+
+    #[test]
+    fn a_collapsing_link_is_reported_five_times_less_often() {
+        let start = Instant::now();
+        let mut session = Session::new(caps(), start);
+        let mut packetiser = bare_packetiser();
+        let payload = payload();
+        session.host(
+            HostMessage::Stream(StreamConfig {
+                bitrate: NonZeroU32::new(FEEDBACK_SLOW_BELOW - 1).expect("nonzero"),
+                ..stream()
+            }),
+            start,
+            RTT,
+        );
+
+        let mut sent = 0;
+        let mut id = 0;
+        let mut now = start;
+        while now < start + FEEDBACK_SLOW_INTERVAL {
+            now += Duration::from_millis(10);
+            for datagram in picture(&mut packetiser, id, FrameKind::Delta, &payload) {
+                session.datagram(&datagram, now).expect("a video packet");
+            }
+            id += 1;
+            sent += reports(&mut session).len();
+        }
+        assert_eq!(
+            sent, 1,
+            "under 250 kbit/s the report interval is 250 ms, not 50"
+        );
+    }
+
+    #[test]
     fn a_still_screen_is_idle_and_not_a_lost_host() {
         let start = Instant::now();
         let mut session = Session::new(caps(), start);
@@ -836,7 +950,10 @@ mod tests {
             last_frame: Some(FrameId(0)),
             frames_sent: 1,
             frames_gated: 0,
+            frames_refused: 0,
             pacing_rate: None,
+            estimate: None,
+            padding_sent: 0,
             pipeline_micros: 4_200,
         };
         let mut at = start;
