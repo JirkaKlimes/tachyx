@@ -1,0 +1,354 @@
+//! Serving one client.
+//!
+//! Capture, encode, transport and injection each know their own job. This is
+//! where they meet, and where the policy that decides what the encoder is asked
+//! for actually runs.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Rate};
+use tachyx_proto::control::{
+    Aspect, ClientMessage, Codec, CodedSize, Heartbeat, HostMessage, Size as WireSize, StreamConfig,
+};
+use tachyx_proto::media::Timestamp;
+use tachyx_proto::packet::AccessUnit as WireUnit;
+use tachyx_transport::endpoint::HostSession;
+
+use crate::config::Config;
+use crate::idr::{Budget, Reason, Verdict};
+use crate::ladder::{Ladder, Settings, Size as RungSize};
+
+/// How often the rate controller looks at what the link is carrying.
+const RATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often the host says it is alive while the screen is still.
+///
+/// Capture blocks until something changes, and a still desktop was measured
+/// producing one frame a second. Without this the client cannot tell a still
+/// desktop from a host that has gone away.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Why a session ended.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    /// Capture or encode failed.
+    #[error(transparent)]
+    Media(#[from] tachyx_media::Error),
+    /// The encode size the client asked for is not one the encoder can code.
+    #[error(transparent)]
+    Size(#[from] tachyx_media::BadEncodeSize),
+    /// The transport failed.
+    #[error(transparent)]
+    Transport(#[from] tachyx_transport::TransportError),
+    /// The control stream failed.
+    #[error(transparent)]
+    Control(#[from] tachyx_transport::control::ControlError),
+    /// Input could not be injected.
+    #[error(transparent)]
+    Input(#[from] tachyx_input::Error),
+    /// The screen could not be kept awake.
+    #[error(transparent)]
+    Idle(#[from] crate::idle::Error),
+    /// The encoder produced a picture the wire format will not carry.
+    #[error("the encoder produced a picture that cannot be sent")]
+    Unsendable,
+}
+
+/// Runs a session until the client goes away.
+///
+/// # Errors
+/// If the pipeline cannot be started, or the connection fails for a reason
+/// other than the client disconnecting.
+pub async fn serve(
+    config: &Config,
+    mut session: HostSession,
+    injector: &mut tachyx_input::Injector,
+) -> Result<(), SessionError> {
+    // Held for the whole session. A blanked screen stops producing frames, and
+    // the one person who wants the machine awake cannot reach it.
+    let _awake = crate::idle::Inhibitor::new()?;
+
+    let Pipeline {
+        capture,
+        encoder,
+        units,
+        bitrate,
+        framerate,
+        capture_size,
+    } = start(config, &session)?;
+    let admission = encoder.admission();
+
+    session
+        .to_client
+        .send(&HostMessage::Stream(stream_config(&encoder, bitrate)?))
+        .await?;
+
+    run(
+        config,
+        session,
+        injector,
+        capture,
+        encoder,
+        units,
+        admission,
+        bitrate,
+        framerate,
+        capture_size,
+    )
+    .await
+}
+
+/// What bringing the pipeline up produces.
+struct Pipeline {
+    capture: Capture,
+    encoder: Arc<Encoder>,
+    units: tachyx_media::AccessUnits,
+    bitrate: Bitrate,
+    framerate: tachyx_media::Framerate,
+    capture_size: tachyx_media::Size,
+}
+
+/// Starts capture and encode for what this client says it can decode.
+fn start(config: &Config, session: &HostSession) -> Result<Pipeline, SessionError> {
+    let (capture, frames) = Capture::start(config.output.as_deref().unwrap_or_default())?;
+    let format = capture.format().clone();
+    let capture_size = format.size;
+
+    let wanted = session.hello.capabilities.viewport.height.get();
+    let wanted = u32::from(wanted)
+        .min(u32::from(
+            session.hello.capabilities.max_decode.height.get(),
+        ))
+        .min(capture_size.height());
+    let size = EncodeSize::fit(capture_size, wanted)?;
+
+    // The encoder divides its bit budget by the rate declared here and ignores
+    // when frames actually arrive, so this follows the output's own refresh
+    // rather than a nominal figure.
+    let framerate = format.refresh;
+    let bitrate = Bitrate::from_kbps(
+        config
+            .max_bitrate
+            .min(session.hello.capabilities.bitrate_ceiling.get())
+            / 1000,
+    )
+    .ok_or(tachyx_media::BadEncodeSize::Odd)?;
+
+    let (encoder, units) = Encoder::start(
+        frames,
+        EncodeConfig {
+            size,
+            rate: Rate { bitrate, framerate },
+        },
+    )?;
+    Ok(Pipeline {
+        capture,
+        encoder: Arc::new(encoder),
+        units,
+        bitrate,
+        framerate,
+        capture_size,
+    })
+}
+
+/// Runs the session until the client goes away.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pipeline's parts, threaded through one call rather than bundled into a struct that exists only to be unpacked"
+)]
+async fn run(
+    _config: &Config,
+    mut session: HostSession,
+    injector: &mut tachyx_input::Injector,
+    capture: Capture,
+    encoder: Arc<Encoder>,
+    units: tachyx_media::AccessUnits,
+    admission: Arc<std::sync::atomic::AtomicBool>,
+    bitrate: Bitrate,
+    framerate: tachyx_media::Framerate,
+    capture_size: tachyx_media::Size,
+) -> Result<(), SessionError> {
+    let mut ladder = Ladder::new(rung(capture_size), fps(framerate), bitrate.kbps() * 1000);
+    let mut budget = Budget::new(bitrate.kbps() * 1000);
+    let started = Instant::now();
+    let sent_frames = Arc::new(AtomicU64::new(0));
+
+    let pump = {
+        let sent_frames = Arc::clone(&sent_frames);
+        let admission = Arc::clone(&admission);
+        let mut video = session.video;
+        tokio::task::spawn_blocking(move || {
+            while let Some(unit) = units.recv() {
+                let slices = unit.slices();
+                let Ok(wire) = WireUnit::new(unit.frame, unit.captured, unit.kind, &slices) else {
+                    continue;
+                };
+                if video.send(&wire).is_err() {
+                    break;
+                }
+                sent_frames.store(video.frames_sent(), Ordering::Relaxed);
+                // Gate the NEXT frame before it is encoded. A frame never
+                // submitted leaves the encoder's reference chain intact; a
+                // frame encoded and then dropped breaks it, and with one
+                // reference frame and a long key frame interval the picture
+                // stays wrong for many seconds.
+                admission.store(
+                    video.can_send_bytes(video.key_frame_estimate()),
+                    Ordering::Relaxed,
+                );
+            }
+            video
+        })
+    };
+
+    let mut rate_tick = tokio::time::interval(RATE_INTERVAL);
+    let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let connection = session.connection.clone();
+
+    let outcome = loop {
+        tokio::select! {
+            message = session.from_client.recv::<ClientMessage>() => match message {
+                Ok(ClientMessage::Input(batch)) => {
+                    let events: Vec<_> =
+                        batch.events.into_iter().map(|timed| timed.event).collect();
+                    injector.apply(&events)?;
+                }
+                Ok(ClientMessage::KeyframeRequest { .. }) => {
+                    if budget.request(Reason::ClientRequest, Instant::now()) == Verdict::Allow {
+                        encoder.force_keyframe();
+                    }
+                }
+                Ok(ClientMessage::ViewportChanged(changed)) => {
+                    let wanted = u32::from(changed.viewport.height.get())
+                        .min(u32::from(changed.max_decode.height.get()))
+                        .min(capture_size.height());
+                    if let Ok(size) = EncodeSize::fit(capture_size, wanted)
+                        && budget.request(Reason::Resolution, Instant::now()) == Verdict::Allow
+                    {
+                        encoder.set_resolution(size)?;
+                        let config = stream_config(&encoder, bitrate)?;
+                        session.to_client.send(&HostMessage::Stream(config)).await?;
+                    }
+                }
+                Err(_) => break Ok(()),
+            },
+            _ = rate_tick.tick() => {
+                if let Some(target) = connection_target(&connection)
+                    && let Some(Settings { size, bitrate: bits, .. }) =
+                        ladder.observe(target, Instant::now())
+                {
+                    apply(&encoder, &mut budget, size, bits, &mut session.to_client).await?;
+                }
+            }
+            _ = heartbeat_tick.tick() => {
+                let stats = capture.stats();
+                let beat = Heartbeat {
+                    sent: Timestamp::from_session_micros(
+                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    ),
+                    last_frame: None,
+                    frames_sent: sent_frames.load(Ordering::Relaxed),
+                    frames_gated: stats.dropped,
+                    pacing_rate: connection.congestion_state().metrics().pacing_rate,
+                    pipeline_micros: 0,
+                };
+                if session.to_client.send(&HostMessage::Heartbeat(beat)).await.is_err() {
+                    break Ok(());
+                }
+            }
+        }
+    };
+
+    drop(encoder);
+    drop(pump);
+    capture.stop()?;
+    outcome
+}
+
+/// The bandwidth the link will carry, in bits per second.
+fn connection_target(connection: &quinn::Connection) -> Option<u32> {
+    let rate = connection.congestion_state().metrics().pacing_rate?;
+    u32::try_from(rate * 85 / 100).ok()
+}
+
+/// Applies a rung, spending the key frame it costs from the shared budget.
+async fn apply(
+    encoder: &Encoder,
+    budget: &mut Budget,
+    size: RungSize,
+    bits: u32,
+    to_client: &mut tachyx_transport::control::ControlWriter,
+) -> Result<(), SessionError> {
+    let now = Instant::now();
+    budget.retarget(bits);
+    let Some(bitrate) = Bitrate::from_kbps(bits / 1000) else {
+        return Ok(());
+    };
+    let encode = EncodeSize::new(u32::from(size.width), u32::from(size.height))?;
+    let current = encoder.geometry().visible;
+    if encode.visible() != current {
+        if budget.request(Reason::Resolution, now) == Verdict::Refuse {
+            return Ok(());
+        }
+        encoder.set_resolution(encode)?;
+    } else if budget.request(Reason::Bitrate, now) == Verdict::Refuse {
+        return Ok(());
+    }
+    encoder.set_rate(Rate {
+        bitrate,
+        framerate: encoder.rate().framerate,
+    })?;
+    to_client
+        .send(&HostMessage::Stream(stream_config(encoder, bitrate)?))
+        .await?;
+    Ok(())
+}
+
+fn stream_config(encoder: &Encoder, bitrate: Bitrate) -> Result<StreamConfig, SessionError> {
+    let geometry = encoder.geometry();
+    let rate = encoder.rate();
+    Ok(StreamConfig {
+        codec: Codec::H264,
+        coded: CodedSize::new(
+            narrow(geometry.coded.width()),
+            narrow(geometry.coded.height()),
+        )
+        .ok_or(SessionError::Unsendable)?,
+        visible: WireSize::new(
+            narrow(geometry.visible.width()),
+            narrow(geometry.visible.height()),
+        )
+        .ok_or(SessionError::Unsendable)?,
+        display_aspect: Aspect::new(
+            narrow(geometry.display_aspect.0),
+            narrow(geometry.display_aspect.1),
+        )
+        .ok_or(SessionError::Unsendable)?,
+        framerate: std::num::NonZeroU16::new(fps(rate.framerate))
+            .ok_or(SessionError::Unsendable)?,
+        bitrate: std::num::NonZeroU32::new(bitrate.kbps() * 1000)
+            .ok_or(SessionError::Unsendable)?,
+    })
+}
+
+fn rung(size: tachyx_media::Size) -> RungSize {
+    RungSize {
+        width: u16::try_from(size.width()).unwrap_or(u16::MAX),
+        height: u16::try_from(size.height()).unwrap_or(u16::MAX),
+    }
+}
+
+fn fps(rate: tachyx_media::Framerate) -> u16 {
+    u16::try_from(rate.millihertz() / 1000).unwrap_or(u16::MAX)
+}
+
+/// Narrows a dimension to what the wire carries.
+///
+/// Saturating rather than wrapping: a picture wider than sixty-five thousand
+/// pixels is not something this protocol carries, and reporting the ceiling is
+/// a refusal the caller can act on rather than a small number that looks valid.
+fn narrow(value: u32) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}

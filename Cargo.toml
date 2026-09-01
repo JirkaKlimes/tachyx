@@ -14,6 +14,7 @@ repository = "https://github.com/JirkaKlimes/tachyx"
 [workspace.dependencies]
 tachyx-client = { path = "crates/tachyx-client" }
 tachyx-dmabuf = { path = "crates/tachyx-dmabuf" }
+tachyx-driver = { path = "crates/tachyx-driver" }
 tachyx-glctx = { path = "crates/tachyx-glctx" }
 tachyx-hostd = { path = "crates/tachyx-hostd" }
 tachyx-input = { path = "crates/tachyx-input" }

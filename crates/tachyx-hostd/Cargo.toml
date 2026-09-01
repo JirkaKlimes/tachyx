@@ -17,6 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 tachyx-proto.workspace = true
+tachyx-input.workspace = true
+tachyx-media.workspace = true
+tachyx-transport.workspace = true
+quinn.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
