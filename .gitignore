@@ -18,3 +18,7 @@ apps/flutter/pubspec.lock
 
 # Generated FFI bindings are checked in; their intermediates are not.
 apps/flutter/rust_builder/
+
+# Tooling caches
+.ruff_cache/
+__pycache__/

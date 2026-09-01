@@ -106,6 +106,48 @@ Text is carried separately as UTF-8. An on-screen keyboard on a phone produces
 characters, not key presses, and no HID usage code corresponds to most of what it
 can produce. The host synthesises whatever key press is needed to enter that text.
 
+### Touch input is a trackpad, not a touch screen
+
+The pointer does not follow the finger. The finger moves it, the way a laptop
+trackpad does, so the whole screen is reachable without the hand covering it and
+without the pointer jumping to wherever the user happened to touch.
+
+Gestures are distinguished by how many fingers touch, not by how many times:
+
+| Gesture | Effect |
+|---|---|
+| One-finger tap | Left click |
+| Two-finger tap | Right click |
+| Three-finger tap | Show or hide the on-screen keyboard |
+| One-finger drag | Move the pointer |
+| Two-finger drag | Scroll |
+| Long press, then drag | Move the pointer with the left button held |
+
+Counting fingers rather than taps is what makes every one of these resolve the
+moment the fingers lift. Distinguishing a single tap from a double tap cannot: a
+tap that has already been sent cannot be taken back, so either the click waits to
+find out whether another one follows, which measured 310 milliseconds on this
+framework, or a right click is always preceded by a real left click that the remote
+desktop acts on. Neither is acceptable in a system built to defend a budget of ten
+to twenty milliseconds.
+
+## Constraints the client places on the encoder
+
+Encoded width and height are multiples of sixteen. H.264 expresses a size like 1080
+by coding 1088 and attaching a crop rectangle, and the Android presentation path
+does not apply that rectangle. Choosing every rung of the resolution ladder from
+multiples of sixteen avoids the problem rather than detecting it.
+
+Parameter sets are repeated in the stream immediately before every key frame,
+rather than sent once when the session starts. The client then needs no separate
+decoder configuration step, survives a reconnection or a resolution change without
+one, and recovers on its own if a parameter set is lost, which matters on a path
+that never retransmits.
+
+The sequence parameter set declares that the stream reorders no frames. A decoder
+that is not told this holds frames back before emitting them, adding latency that
+no client-side setting can remove.
+
 ## Video path
 
 Video packets carry a fixed 16-byte header written by hand, byte by byte. At
