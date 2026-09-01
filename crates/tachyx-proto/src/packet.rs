@@ -593,6 +593,13 @@ pub struct Frame {
 /// already known to be damaged: an undamaged frame is delivered the instant its
 /// last datagram arrives and never looks at it. Its ceiling is a frame period,
 /// past which a later frame has already moved the receiver's floor.
+///
+/// This is the floor. The window in force is one frame period, which a receiver
+/// sets from the stream configuration through
+/// [`Reassembler::set_reorder_window`]: 15 ms is one period at 60 Hz and is far
+/// too short at 20, where a phone radio in power save delivers packets in
+/// clumps a whole period apart and a fixed 15 ms window throws away frames
+/// whose repair is still in flight.
 pub const REORDER_WINDOW: Duration = Duration::from_millis(15);
 
 /// What a reassembler has seen.
@@ -677,6 +684,10 @@ impl fmt::Debug for Repairer {
 #[derive(Debug)]
 pub struct Reassembler {
     deadline: Duration,
+    /// How long a damaged frame waits for a reordered packet or its repair.
+    /// [`REORDER_WINDOW`] until the frame rate is known; one frame period once
+    /// it is. See [`Reassembler::set_reorder_window`].
+    reorder: Duration,
     open: BTreeMap<u32, Partial>,
     ready: VecDeque<Frame>,
     previous: Option<Marker>,
@@ -720,14 +731,14 @@ impl Partial {
     /// its first datagram it is abandoned while its own packets are still in
     /// flight, every time, so the client never regains a reference frame and
     /// only the macroblocks a delta frame carries ever refresh.
-    fn refresh(&mut self, now: Instant, stall: Duration) {
-        self.deadline = now + if self.armed { REORDER_WINDOW } else { stall };
+    fn refresh(&mut self, now: Instant, stall: Duration, reorder: Duration) {
+        self.deadline = now + if self.armed { reorder } else { stall };
     }
 
     /// Marks a hole known and restarts the shorter wait for its repair.
-    fn arm(&mut self, now: Instant) {
+    fn arm(&mut self, now: Instant, reorder: Duration) {
         self.armed = true;
-        self.deadline = now + REORDER_WINDOW;
+        self.deadline = now + reorder;
     }
 }
 
@@ -805,6 +816,7 @@ impl Reassembler {
     pub fn new(deadline: Duration) -> Self {
         Self {
             deadline,
+            reorder: REORDER_WINDOW,
             open: BTreeMap::new(),
             ready: VecDeque::new(),
             previous: None,
@@ -814,6 +826,22 @@ impl Reassembler {
             coder: Repairer::default(),
             stats: ReassemblyStats::default(),
         }
+    }
+
+    /// Widens the wait for a reordered packet or a repair to `window`, never
+    /// below [`REORDER_WINDOW`].
+    ///
+    /// One frame period is the principled figure, and the frame rate travels in
+    /// the stream configuration, so the caller that hears it is the one that
+    /// sets this. The ceiling on what a wider window can cost is that same
+    /// period: a datagram arriving after the next frame completed is unusable
+    /// anyway, because delivery has moved the floor past it. Measured on the
+    /// phone this was built against: at 20 frames a second, a fixed 15 ms
+    /// window read a radio in power save as loss, 429 datagrams counted late
+    /// against 211 counted lost, and every one of those late datagrams belonged
+    /// to a frame thrown away while its repair was in flight.
+    pub fn set_reorder_window(&mut self, window: Duration) {
+        self.reorder = window.max(REORDER_WINDOW);
     }
 
     /// Whether the decoder cannot continue until a key frame arrives.
@@ -891,8 +919,9 @@ impl Reassembler {
             return Ok(header.seq);
         }
         if header.frame.0 > self.floor {
+            let reorder = self.reorder;
             for partial in self.open.range_mut(..header.frame.0).map(|(_, v)| v) {
-                partial.deadline = partial.deadline.min(now + REORDER_WINDOW);
+                partial.deadline = partial.deadline.min(now + reorder);
             }
         }
         match header.role {
@@ -914,7 +943,7 @@ impl Reassembler {
             // frame: a large frame is still sending when the hole appears, and
             // an absolute cap set here would expire it mid-transmission.
             if let Some(partial) = self.open.get_mut(&header.frame.0) {
-                partial.arm(now);
+                partial.arm(now, self.reorder);
             }
         }
         Ok(header.seq)
@@ -939,7 +968,7 @@ impl Reassembler {
         // key frame carries its parity in scores of shards, 54 of them at
         // 3440x1440, and they take longer to arrive than the reorder window: a
         // cap fixed by the first shard would discard the rest of the repair.
-        partial.arm(now);
+        partial.arm(now, self.reorder);
         let block = partial.parity.get_or_insert_with(|| ParityBlock {
             data_shards: shard.data_shards,
             parity_shards: shard.shard.count(),
@@ -970,10 +999,11 @@ impl Reassembler {
         now: Instant,
     ) {
         let stall = self.deadline;
+        let reorder = self.reorder;
         let partial = match self.open.entry(frame.0) {
             Entry::Occupied(open) => {
                 let partial = open.into_mut();
-                partial.refresh(now, stall);
+                partial.refresh(now, stall, reorder);
                 partial
             }
             Entry::Vacant(slot) => slot.insert(Partial {
@@ -1742,6 +1772,57 @@ mod tests {
             subsets(of, take, chosen, each);
             chosen.pop();
         }
+    }
+
+    /// The failure measured on the phone this was built against. A radio in
+    /// power save delivers packets in clumps tens of milliseconds apart, and at
+    /// 20 frames a second the fixed 15 ms reorder window decided a damaged
+    /// frame while its own repair was still in the air: 429 datagrams counted
+    /// late against 211 counted lost in one 40 second run. The window has to be
+    /// one frame period, which the stream configuration names.
+    #[test]
+    fn a_repair_that_arrives_a_power_save_clump_later_still_rebuilds_the_frame() {
+        let picture = picture(1000, 21);
+        let mut packetiser = Packetiser::new(PAYLOAD);
+        packetiser.set_parity(Parity::fixed(20));
+        let mut out = Vec::new();
+        packetiser.packetise(&unit(0, FrameKind::Key, &[&picture]), &mut out);
+        // One picture datagram is really lost; the parity can replace it.
+        out.remove(3);
+
+        let start = Instant::now();
+        let mut reassembler = Reassembler::new(Duration::from_millis(50));
+        // The stream configuration said 20 frames a second.
+        reassembler.set_reorder_window(Duration::from_millis(50));
+
+        // The first clump: the head of the picture, with the hole visible in
+        // its sequence numbers.
+        for datagram in &out[..8] {
+            reassembler.push(datagram, start).expect("well formed");
+        }
+        // The receive loop's timer fires between the clumps. At the fixed
+        // 15 ms window this is where the frame died.
+        reassembler.expire(start + Duration::from_millis(25));
+
+        // The second clump, one frame period behind the first: the rest of the
+        // picture and every parity shard.
+        let later = start + Duration::from_millis(40);
+        for datagram in &out[8..] {
+            reassembler.push(datagram, later).expect("well formed");
+        }
+        reassembler.expire(later + Duration::from_millis(51));
+
+        let frames = drain(&mut reassembler);
+        assert_eq!(frames.len(), 1, "the repair was in flight, not lost");
+        assert_eq!(frames[0].data, picture);
+        assert_eq!(reassembler.stats().frames_recovered, 1);
+        assert_eq!(reassembler.stats().frames_dropped, 0);
+        assert_eq!(
+            reassembler.stats().packets_late,
+            0,
+            "nothing here was late; it was the window that was early"
+        );
+        assert!(!reassembler.needs_keyframe());
     }
 
     #[test]

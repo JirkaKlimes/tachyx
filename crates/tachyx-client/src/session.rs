@@ -144,6 +144,9 @@ pub struct Session {
     ask_again_at: Instant,
     heard: Instant,
     saw: Option<Instant>,
+    /// Frames the reassembler had decided, decodable or not, when `saw` was
+    /// last moved. See [`Session::collect`].
+    arrived: u64,
     beat: Option<Heartbeat>,
     reports: Reporter,
     cursor: CursorTracker,
@@ -173,6 +176,7 @@ impl Session {
             ask_again_at: now + KEYFRAME_REQUEST_GAP,
             heard: now,
             saw: None,
+            arrived: 0,
             beat: None,
             reports: Reporter::new(now),
             cursor: CursorTracker::new(),
@@ -238,7 +242,17 @@ impl Session {
     pub fn host(&mut self, message: HostMessage, now: Instant, round_trip: Duration) {
         self.heard = now;
         match message {
-            HostMessage::Stream(stream) => self.stream = Some(stream),
+            HostMessage::Stream(stream) => {
+                self.stream = Some(stream);
+                // A damaged frame waits one frame period for a reordered
+                // packet or its repair. The shipped floor is one period at
+                // 60 Hz; at the 20 frames a second a narrow link is ladders
+                // down to, holding the floor instead was measured throwing
+                // away frames whose parity was still in flight, 429 datagrams
+                // counted late against 211 counted lost.
+                self.video
+                    .set_reorder_window(Duration::from_secs(1) / u32::from(stream.framerate.get()));
+            }
             HostMessage::Heartbeat(beat) => self.beat = Some(beat),
             HostMessage::Cursor(update) => self.cursor.reported(now, &update, round_trip),
         }
@@ -281,11 +295,25 @@ impl Session {
         self.pictures.pop_front()
     }
 
-    /// Takes everything reassembly has finished, and records that it arrived.
+    /// Takes everything reassembly has finished, and records what arrived.
+    ///
+    /// What moves `saw`, and with it [`Liveness::Streaming`], is every frame
+    /// the reassembler decided with data in hand: delivered, thrown away
+    /// undecodable, or dropped short of repair. Only the decodable ones reach
+    /// the decoder, but liveness answers "is the screen changing", and a frame
+    /// that arrived and could not be decoded is a changing screen. Counting
+    /// decodable frames alone is how a session waiting out a broken reference
+    /// chain reported an idle screen while hundreds of frames a minute were
+    /// arriving: 413 of 848 in one measured run.
     fn collect(&mut self, now: Instant) {
+        let stats = self.video.stats();
+        let arrived = stats.frames_delivered + stats.frames_undecodable + stats.frames_dropped;
+        if arrived > self.arrived {
+            self.arrived = arrived;
+            self.saw = Some(now);
+        }
         while let Some(frame) = self.video.pop() {
             self.decoded = Some(frame.id);
-            self.saw = Some(now);
             self.pictures.push_back(frame);
         }
     }
@@ -322,11 +350,12 @@ impl Session {
     /// Queues whatever the host is owed about the path.
     ///
     /// Drained in a loop because a report carries at most 512 statuses and a
-    /// longer one is split into parts sent back to back. The counters are the
-    /// reassembler's own: they are cumulative, so a report delayed on the way
-    /// out is still exactly right about the interval it covers.
+    /// longer one is split into parts sent back to back. The counters in it
+    /// are the reporter's own, which forgive a packet that was merely
+    /// reordered; the reassembler's counters do not, and feeding them here was
+    /// how a link that reorders a fifth of its packets was throttled for loss
+    /// it was not suffering.
     fn report(&mut self, now: Instant) {
-        let stats = self.video.stats();
         // The formula libwebrtc uses returns something under 50 ms on any link
         // above 218 kbit/s, so the clamp decides everywhere except on a
         // collapsing link, and this is the one comparison that reproduces it.
@@ -334,10 +363,7 @@ impl Session {
             Some(stream) if stream.bitrate.get() < FEEDBACK_SLOW_BELOW => FEEDBACK_SLOW_INTERVAL,
             _ => FEEDBACK_INTERVAL,
         };
-        while let Some(report) =
-            self.reports
-                .poll(now, interval, stats.packets_lost, stats.packets_received)
-        {
+        while let Some(report) = self.reports.poll(now, interval) {
             self.outgoing.push_back(ClientMessage::Feedback(report));
         }
     }
@@ -967,6 +993,118 @@ mod tests {
             "1.53 seconds without a frame is a still screen, not a dead host"
         );
         assert_eq!(session.heartbeat(), Some(beat));
+    }
+
+    /// The lie measured on the phone: 413 of 848 frames arrived whole and were
+    /// thrown away for want of a key frame, and for every second of that the
+    /// overlay said the screen was not changing. Liveness answers "is the
+    /// screen changing", and a frame that arrived undecodable is a changing
+    /// screen.
+    #[test]
+    fn a_stream_that_arrives_but_cannot_be_decoded_is_not_an_idle_screen() {
+        let start = Instant::now();
+        let mut session = Session::new(caps(), start);
+        let mut packetiser = bare_packetiser();
+        let payload = payload();
+
+        for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload) {
+            session.datagram(&datagram, start).expect("a video packet");
+        }
+        // Frame one is lost whole; every complete delta frame after it is
+        // undecodable until a key frame repairs the chain.
+        let _ = picture(&mut packetiser, 1, FrameKind::Delta, &payload);
+        let mut now = start;
+        for id in 2..12u32 {
+            now += Duration::from_millis(50);
+            for datagram in picture(&mut packetiser, id, FrameKind::Delta, &payload) {
+                session.datagram(&datagram, now).expect("a video packet");
+            }
+        }
+
+        assert!(
+            session.video_stats().frames_undecodable > 5,
+            "the break must be live for this test to say anything"
+        );
+        assert_eq!(
+            session.liveness(now),
+            Liveness::Streaming,
+            "ten frames in the last half second is not an idle screen"
+        );
+    }
+
+    #[test]
+    fn a_reordered_datagram_is_not_reported_as_loss() {
+        let start = Instant::now();
+        let mut session = Session::new(caps(), start);
+        let mut packetiser = bare_packetiser();
+
+        let mut out = picture(&mut packetiser, 0, FrameKind::Key, &payload());
+        out.swap(2, 3);
+        for (index, datagram) in out.iter().enumerate() {
+            session
+                .datagram(datagram, start + Duration::from_micros(index as u64 * 250))
+                .expect("a video packet");
+        }
+
+        session.expire(start + FEEDBACK_INTERVAL);
+        let last = reports(&mut session).pop().expect("arrivals owe a report");
+        assert_eq!(
+            last.lost, 0,
+            "a packet that arrived out of order is not a loss the host may throttle for"
+        );
+        assert_eq!(last.received, out.len() as u64);
+    }
+
+    /// The radio in power save delivers packets in clumps a frame period
+    /// apart. The wait for a damaged frame's repair must come from the
+    /// stream's own frame rate, not from a constant sized for 60 Hz.
+    #[test]
+    fn a_repair_delayed_by_the_radio_is_waited_for_at_the_streams_own_rate() {
+        let start = Instant::now();
+        let mut session = Session::new(caps(), start);
+        session.host(
+            HostMessage::Stream(StreamConfig {
+                framerate: NonZeroU16::new(20).expect("nonzero"),
+                ..stream()
+            }),
+            start,
+            RTT,
+        );
+        // The shipped parity level, because the delayed repair is the point.
+        let mut packetiser = Packetiser::new(NonZeroUsize::new(1418).expect("nonzero"));
+        let payload = payload();
+
+        for datagram in picture(&mut packetiser, 0, FrameKind::Key, &payload) {
+            session.datagram(&datagram, start).expect("a video packet");
+        }
+        assert!(session.pop_frame().is_some());
+
+        // One picture datagram of frame one is really lost. The head of the
+        // frame arrives, then the radio sleeps: the tail and the parity land
+        // one frame period later.
+        let mut damaged = picture(&mut packetiser, 1, FrameKind::Delta, &payload);
+        assert!(damaged.len() >= 5, "picture and parity both");
+        damaged.remove(1);
+        for datagram in &damaged[..2] {
+            session.datagram(datagram, start).expect("a video packet");
+        }
+        session.expire(start + Duration::from_millis(25));
+        let later = start + Duration::from_millis(40);
+        for datagram in &damaged[2..] {
+            session.datagram(datagram, later).expect("a video packet");
+        }
+        session.expire(later + Duration::from_millis(51));
+
+        let frame = session
+            .pop_frame()
+            .expect("the repair was in flight, not lost");
+        assert_eq!(frame.id, FrameId(1));
+        assert_eq!(session.video_stats().frames_recovered, 1);
+        assert_eq!(session.video_stats().frames_dropped, 0);
+        assert!(
+            queued(&mut session).is_empty(),
+            "nothing was lost, so nothing is asked for"
+        );
     }
 
     #[test]

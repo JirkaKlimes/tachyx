@@ -40,6 +40,20 @@ pub struct Reporter {
     /// The highest extended sequence number seen, for placing the next one.
     highest: Option<u64>,
     due: Option<Instant>,
+    /// Datagrams reported received, cumulative over the session.
+    received: u64,
+    /// Datagrams reported missing, cumulative over the session.
+    ///
+    /// Counted when a slot leaves the window still empty, not when the gap
+    /// first shows. The difference is every packet a wireless link merely
+    /// reorders: the reassembler counts a gap as loss the instant a later
+    /// sequence number arrives, so on the air hop this was measured against,
+    /// where 22.92% of packets arrive more than 2 ms behind the fastest, its
+    /// counter reads milliseconds of jitter as loss the host then throttles
+    /// the whole session for. A slot here has until the report drains it, which
+    /// is a report interval, to be filled late and counted as the arrival it
+    /// was.
+    lost: u64,
 }
 
 impl Reporter {
@@ -52,6 +66,8 @@ impl Reporter {
             base: 0,
             highest: None,
             due: None,
+            received: 0,
+            lost: 0,
         }
     }
 
@@ -76,25 +92,41 @@ impl Reporter {
         if let Some(slot @ None) = self.window.get_mut(index) {
             *slot = Some(tick);
         }
+        // A client that cannot send reports must not grow a buffer, and the
+        // slots it gives up on are still part of the cumulative count.
         while self.window.len() > WINDOW {
-            self.window.pop_front();
+            let slot = self.window.pop_front().flatten();
+            self.settle(slot);
             self.base += 1;
+        }
+    }
+
+    /// Counts one slot leaving the window, filled or not.
+    const fn settle(&mut self, slot: Option<u32>) {
+        if slot.is_some() {
+            self.received += 1;
+        } else {
+            self.lost += 1;
         }
     }
 
     /// The report to send now, if one is due.
     ///
-    /// `lost` and `received` are the receiver's own cumulative counters, which
-    /// are what the host's loss controller reads. A caller drains this in a
-    /// loop: a report carries at most [`FEEDBACK_MAX_STATUSES`] statuses and a
-    /// longer one is split into parts sent back to back.
-    pub fn poll(
-        &mut self,
-        now: Instant,
-        interval: Duration,
-        lost: u64,
-        received: u64,
-    ) -> Option<Feedback> {
+    /// The cumulative `lost` and `received` counters the report carries are
+    /// this reporter's own, counted as slots leave the window, because they
+    /// feed the host's loss controller and that controller throttles the
+    /// session. The reassembler's counters are the wrong source for them: they
+    /// call a packet lost the instant a later one arrives and never take it
+    /// back, so on a wireless link they read reordering as loss. Measured on
+    /// the phone this was built against: 211 counted lost while 429 arrived
+    /// late, the loss controller held the session at its 2 Mbit/s opening
+    /// target for the whole run, and the parity level was sized for loss that
+    /// was not happening.
+    ///
+    /// A caller drains this in a loop: a report carries at most
+    /// [`FEEDBACK_MAX_STATUSES`] statuses and a longer one is split into parts
+    /// sent back to back.
+    pub fn poll(&mut self, now: Instant, interval: Duration) -> Option<Feedback> {
         if self.due.is_some_and(|due| now < due) {
             return None;
         }
@@ -116,11 +148,15 @@ impl Reporter {
         let mut packets = Vec::with_capacity(take);
         let mut reference = None;
         let mut previous = None;
+        let mut lost = self.lost;
+        let mut received = self.received;
         for slot in self.window.drain(..take) {
             let Some(tick) = slot else {
+                lost += 1;
                 packets.push(PacketArrival::Missing);
                 continue;
             };
+            received += 1;
             let delta = previous.map_or_else(
                 || {
                     reference = Some(tick);
@@ -136,6 +172,8 @@ impl Reporter {
 
         let base = wire(self.base);
         self.base += take as u64;
+        self.lost = lost;
+        self.received = received;
         // A report that filled to the cap leaves a backlog, and the parts go
         // out back to back rather than one every interval.
         self.due = Some(if self.window.iter().any(Option::is_some) {
@@ -208,7 +246,7 @@ mod tests {
         arrive(&mut reporter, start, 100, 6, TICK * 4);
 
         let report = reporter
-            .poll(start + INTERVAL, INTERVAL, 0, 6)
+            .poll(start + INTERVAL, INTERVAL)
             .expect("six datagrams arrived");
         assert_eq!(report.base, Seq(100));
         assert_eq!(report.packets.len(), 6);
@@ -217,7 +255,7 @@ mod tests {
         assert_eq!(report.packets[1], PacketArrival::Received(4));
         assert_eq!(report.received, 6);
         assert!(
-            reporter.poll(start + INTERVAL, INTERVAL, 0, 6).is_none(),
+            reporter.poll(start + INTERVAL, INTERVAL).is_none(),
             "nothing arrived since, so there is nothing to say"
         );
     }
@@ -230,7 +268,7 @@ mod tests {
         reporter.record(Seq(2), start + TICK * 9);
 
         let report = reporter
-            .poll(start + INTERVAL, INTERVAL, 1, 2)
+            .poll(start + INTERVAL, INTERVAL)
             .expect("two datagrams arrived");
         assert_eq!(
             report.packets,
@@ -253,7 +291,7 @@ mod tests {
         reporter.record(Seq(1), start + TICK * 20);
 
         let report = reporter
-            .poll(start + INTERVAL, INTERVAL, 0, 3)
+            .poll(start + INTERVAL, INTERVAL)
             .expect("three datagrams arrived");
         assert_eq!(
             report.packets,
@@ -266,6 +304,25 @@ mod tests {
         );
     }
 
+    /// A link-layer retry delivers a packet milliseconds late, which is not a
+    /// loss and must not be reported as one: the host's loss controller
+    /// throttles the session on these counters. The slot has until a report
+    /// drains it to be filled.
+    #[test]
+    fn a_packet_that_arrives_late_is_an_arrival_and_not_a_loss() {
+        let start = Instant::now();
+        let mut reporter = Reporter::new(start);
+        reporter.record(Seq(0), start);
+        reporter.record(Seq(2), start + TICK * 4);
+        reporter.record(Seq(1), start + TICK * 30);
+
+        let report = reporter
+            .poll(start + INTERVAL, INTERVAL)
+            .expect("three datagrams arrived");
+        assert_eq!(report.lost, 0, "a reordered packet is not a lost one");
+        assert_eq!(report.received, 3);
+    }
+
     #[test]
     fn a_report_is_split_rather_than_truncated() {
         let start = Instant::now();
@@ -274,18 +331,18 @@ mod tests {
         arrive(&mut reporter, start, 0, described, TICK);
 
         let now = start + INTERVAL;
-        let first = reporter.poll(now, INTERVAL, 0, 0).expect("a full report");
+        let first = reporter.poll(now, INTERVAL).expect("a full report");
         assert_eq!(first.packets.len(), FEEDBACK_MAX_STATUSES);
         assert_eq!(first.base, Seq(0));
         let second = reporter
-            .poll(now, INTERVAL, 0, 0)
+            .poll(now, INTERVAL)
             .expect("the parts go out back to back");
         assert_eq!(second.packets.len(), 200);
         assert_eq!(
             second.base,
             Seq(u16::try_from(FEEDBACK_MAX_STATUSES).unwrap())
         );
-        assert!(reporter.poll(now, INTERVAL, 0, 0).is_none());
+        assert!(reporter.poll(now, INTERVAL).is_none());
     }
 
     #[test]
@@ -296,7 +353,7 @@ mod tests {
         for slot in 0..1_000u32 {
             let now = start + Duration::from_micros(u64::from(slot) * 600);
             reporter.record(Seq(u16::try_from(slot).unwrap()), now);
-            if reporter.poll(now, INTERVAL, 0, 0).is_some() {
+            if reporter.poll(now, INTERVAL).is_some() {
                 reports += 1;
             }
         }
@@ -313,7 +370,7 @@ mod tests {
         let mut reporter = Reporter::new(start);
         arrive(&mut reporter, start, 65_530, 12, TICK);
         let report = reporter
-            .poll(start + INTERVAL, INTERVAL, 0, 12)
+            .poll(start + INTERVAL, INTERVAL)
             .expect("twelve datagrams arrived");
         assert_eq!(report.base, Seq(65_530));
         assert_eq!(report.packets.len(), 12);
