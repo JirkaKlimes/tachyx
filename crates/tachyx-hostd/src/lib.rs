@@ -5,3 +5,4 @@
 //! that decides what the encoder is asked for.
 
 pub mod idr;
+pub mod ladder;
