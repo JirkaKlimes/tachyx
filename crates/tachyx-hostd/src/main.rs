@@ -39,12 +39,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let identity = HostIdentity::load_or_create(&state)?;
 
-    // Sized before any client says what it wants, so it is sized for the largest
-    // picture this host could ever be asked for. Over-sizing costs nothing: the
-    // send gate bounds what is actually queued, while a buffer too small to hold
-    // one key frame would shred every key frame rather than merely slow the
-    // stream down.
-    let ceiling = CodedSize::new(3840, 2160).ok_or("3840x2160 is not a valid coded size")?;
+    // Sized before any client says what it wants, and deliberately not for the
+    // largest picture imaginable. The send gate's bound IS this buffer, so a
+    // generous one does not go unused: it is filled, and standing queue is
+    // latency. At 3840x2160 it came to 809 kB, which is two thirds of a second
+    // of video waiting to be sent, read by the congestion controller as
+    // bandwidth and paid for by every heartbeat queued behind it.
+    //
+    // 1080p is the largest a phone asks for, and a client that wants more is
+    // better served by a buffer that keeps its picture recent.
+    let ceiling = CodedSize::new(1920, 1088).ok_or("1920x1088 is not a valid coded size")?;
 
     // Injection owns a Wayland connection of its own, so that a stall in it
     // cannot hold up capture.

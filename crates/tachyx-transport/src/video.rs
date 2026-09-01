@@ -298,8 +298,23 @@ impl VideoSender {
         self.packetiser.packetise(unit, &mut self.datagrams);
         for datagram in self.datagrams.drain(..) {
             let queued = datagram.len();
-            self.connection.send_datagram(Bytes::from(datagram))?;
-            self.outstanding.push_back(queued);
+            match self.connection.send_datagram(Bytes::from(datagram)) {
+                Ok(()) => self.outstanding.push_back(queued),
+                // The path's measured size can shrink underneath a frame: the
+                // transport lowers it from its own task when it decides a larger
+                // packet is being black-holed, and that lands mid-frame during
+                // the first seconds of a session. Refusing the rest of this
+                // picture is right, and the fragments already queued are
+                // harmless because a receiver abandons a frame it cannot
+                // complete. Treating it as fatal would end video for the life of
+                // the session over a transient the transport is in the middle of
+                // correcting.
+                Err(quinn::SendDatagramError::TooLarge) => {
+                    self.frames_refused += 1;
+                    return Ok(Sent::Refused);
+                }
+                Err(other) => return Err(other.into()),
+            }
         }
         self.frames_sent += 1;
         Ok(Sent::Queued { datagrams })

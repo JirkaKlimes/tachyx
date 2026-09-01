@@ -122,12 +122,23 @@ fn start(config: &Config, session: &HostSession) -> Result<Pipeline, SessionErro
             session.hello.capabilities.max_decode.height.get(),
         ))
         .min(capture_size.height());
-    let size = EncodeSize::fit(capture_size, wanted)?;
+    let size = EncodeSize::fit(capture_size, halving_for(capture_size.height(), wanted))?;
 
     // The encoder divides its bit budget by the rate declared here and ignores
-    // when frames actually arrive, so this follows the output's own refresh
-    // rather than a nominal figure.
-    let framerate = format.refresh;
+    // when frames actually arrive, so it has to be a rate frames really arrive
+    // at. That is the output's refresh, lowered by whatever the client asked for
+    // and whatever the configuration allows: sending a phone 75 frames a second
+    // when it asked for 60 spends a fifth of the link on frames it will not show.
+    let asked = u32::from(session.hello.capabilities.requested_fps.get());
+    let allowed = config.max_framerate.unwrap_or(u32::MAX);
+    let framerate = tachyx_media::Framerate::from_millihertz(
+        format
+            .refresh
+            .millihertz()
+            .min(asked * 1000)
+            .min(allowed * 1000),
+    )
+    .unwrap_or(format.refresh);
     let bitrate = Bitrate::from_kbps(
         config
             .max_bitrate
@@ -172,6 +183,10 @@ async fn run(
 ) -> Result<(), SessionError> {
     let mut ladder = Ladder::new(rung(capture_size), fps(framerate), bitrate.kbps() * 1000);
     let mut budget = Budget::new(bitrate.kbps() * 1000);
+    // The picture the session opens on. Spent here so that a later request
+    // cannot be refused on the grounds that this one was free: the budget is
+    // shared precisely so every cause is counted.
+    budget.request(Reason::Startup, Instant::now());
     let started = Instant::now();
     let sent_frames = Arc::new(AtomicU64::new(0));
 
@@ -188,7 +203,12 @@ async fn run(
                         else {
                             continue;
                         };
-                        if video.send(&wire).is_err() {
+                        // Only a lost connection ends the pump. A refusal is
+                        // this frame's problem and the next one may well fit;
+                        // treating it as fatal would end video for the life of
+                        // the session over a transient.
+                        if let Err(error) = video.send(&wire) {
+                            tracing::warn!(%error, "video path ended");
                             break;
                         }
                         sent_frames.store(video.frames_sent(), Ordering::Relaxed);
@@ -359,6 +379,22 @@ fn rung(size: tachyx_media::Size) -> RungSize {
         width: u16::try_from(size.width()).unwrap_or(u16::MAX),
         height: u16::try_from(size.height()).unwrap_or(u16::MAX),
     }
+}
+
+/// The height of the largest halving of the capture that a viewport this tall
+/// can show.
+///
+/// Scaling by a fraction that is not a power of two puts the scaler on an
+/// expensive filter path: three quarters was measured costing more than not
+/// scaling at all, and more than twice what a halving costs. Choosing the
+/// nearest arbitrary fit is how a phone ended up being served the slowest size
+/// of the three.
+fn halving_for(capture_height: u32, wanted: u32) -> u32 {
+    let mut height = capture_height;
+    while height / 2 >= wanted.max(1) {
+        height /= 2;
+    }
+    height
 }
 
 fn fps(rate: tachyx_media::Framerate) -> u16 {
