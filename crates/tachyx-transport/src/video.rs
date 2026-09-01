@@ -21,13 +21,12 @@
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::Connection;
 use tachyx_proto::control::CodedSize;
 use tachyx_proto::media::{FrameKind, HEADER_LEN};
-use tachyx_proto::packet::{AccessUnit, Frame, Packetiser, Reassembler, ReassemblyStats};
+use tachyx_proto::packet::{AccessUnit, Packetiser};
 
 /// Bytes of accounting quinn charges for each queued datagram, on top of its
 /// payload.
@@ -304,68 +303,6 @@ impl VideoSender {
         }
         self.frames_sent += 1;
         Ok(Sent::Queued { datagrams })
-    }
-}
-
-/// Rebuilds pictures from the datagrams that arrive.
-#[derive(Debug)]
-pub struct VideoReceiver {
-    connection: Connection,
-    reassembler: Reassembler,
-}
-
-impl VideoReceiver {
-    /// Starts receiving on `connection`, waiting at most `deadline` for a frame
-    /// that nothing follows.
-    #[must_use]
-    pub fn new(connection: Connection, deadline: Duration) -> Self {
-        Self {
-            connection,
-            reassembler: Reassembler::new(deadline),
-        }
-    }
-
-    /// Whether the decoder cannot continue until a key frame arrives.
-    #[must_use]
-    pub const fn needs_keyframe(&self) -> bool {
-        self.reassembler.needs_keyframe()
-    }
-
-    /// What this receiver has seen.
-    #[must_use]
-    pub const fn stats(&self) -> ReassemblyStats {
-        self.reassembler.stats()
-    }
-
-    /// Waits for the next complete picture.
-    ///
-    /// Wakes on the earliest open frame's deadline rather than on a fixed tick,
-    /// so a session watching a static screen costs no wakeups at all.
-    ///
-    /// # Errors
-    /// If the connection ends.
-    pub async fn next_frame(&mut self) -> Result<Frame, VideoError> {
-        loop {
-            let datagram = match self.reassembler.next_deadline() {
-                Some(at) => {
-                    let read = self.connection.read_datagram();
-                    let at = tokio::time::Instant::from_std(at);
-                    let Ok(datagram) = tokio::time::timeout_at(at, read).await else {
-                        self.reassembler.expire(Instant::now());
-                        continue;
-                    };
-                    datagram?
-                }
-                None => self.connection.read_datagram().await?,
-            };
-            match self.reassembler.push(&datagram, Instant::now()) {
-                Ok(Some(frame)) => return Ok(frame),
-                Ok(None) => {}
-                Err(malformed) => {
-                    tracing::debug!(%malformed, "discarded a datagram that is not a video packet");
-                }
-            }
-        }
     }
 }
 

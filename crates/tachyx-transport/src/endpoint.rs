@@ -12,7 +12,7 @@ use tachyx_proto::control::{ClientHello, HostHello};
 
 use crate::control::{ControlError, ControlReader, ControlWriter};
 use crate::identity::{HostIdentity, IdentityError, PinStore, PinnedServer};
-use crate::video::{VideoReceiver, VideoSender};
+use crate::video::VideoSender;
 
 /// The application protocol both ends announce.
 ///
@@ -27,26 +27,21 @@ const REFUSED: VarInt = VarInt::from_u32(1);
 /// Settings the defaults get wrong for a local network, and by large factors.
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
-    /// Bytes of queued video the transport may hold. See
+    /// Bytes of queued video the transport may hold, at each end.
+    ///
+    /// Both ends evict the oldest queued datagram to make room, so a buffer
+    /// that cannot hold a whole key frame does not slow the stream down: it
+    /// shreds every key frame and the client never synchronises at all. See
     /// [`crate::video::video_send_buffer`].
     pub video_buffer: usize,
-    /// How long a receiver waits for a frame that nothing follows.
-    ///
-    /// Only the last frame before an idle screen needs it: every other
-    /// incomplete frame is finished by the arrival of the next one. Three frame
-    /// periods at sixty hertz, so a loss at the end of a burst costs one key
-    /// frame request rather than a wait as long as the 1.53 second idle gap the
-    /// host's capture was measured to take.
-    pub frame_deadline: Duration,
 }
 
 impl Tuning {
-    /// Sizes the video buffer for a stream at `coded`, with the deadline above.
+    /// Sizes the video buffer for a stream at `coded`.
     #[must_use]
     pub fn for_stream(coded: tachyx_proto::control::CodedSize) -> Self {
         Self {
             video_buffer: crate::video::video_send_buffer(coded),
-            frame_deadline: Duration::from_millis(50),
         }
     }
 }
@@ -169,6 +164,15 @@ impl Host {
         })
     }
 
+    /// The endpoint this host listens on, for its statistics and for a
+    /// connection that is not a session: a peer that answers something no
+    /// [`HostSession`] would answer, which is what proves a client reads a
+    /// refusal.
+    #[must_use]
+    pub const fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     /// Waits for every connection to close, so a shutdown is not a reset.
     pub async fn shutdown(&self) {
         self.endpoint.close(VarInt::from_u32(0), b"host closing");
@@ -267,13 +271,29 @@ impl Client {
         // the client speaks first and the host answers.
         to_host.send(hello).await?;
         let mut from_host = ControlReader::new(recv);
-        let greeting = from_host.recv_hello::<HostHello>().await?;
+        // A host that will not have this client closes the connection with the
+        // reason attached, and closing discards stream data the peer has not
+        // acknowledged. So the greeting usually loses the race and the close
+        // reason is what a refused client actually reads. Both paths end in a
+        // sentence naming the fault; neither ends in silence or a parse error.
+        let greeting = match from_host.recv_hello::<HostHello>().await {
+            Ok(greeting) => greeting,
+            Err(unread) => {
+                return Err(match connection.close_reason() {
+                    Some(quinn::ConnectionError::ApplicationClosed(refusal)) => {
+                        TransportError::Refused {
+                            reason: String::from_utf8_lossy(&refusal.reason).into_owned(),
+                        }
+                    }
+                    _ => unread.into(),
+                });
+            }
+        };
         Ok(ClientSession {
-            video: VideoReceiver::new(connection.clone(), self.tuning.frame_deadline),
+            connection,
+            greeting,
             to_host,
             from_host,
-            greeting,
-            connection,
         })
     }
 }
@@ -286,8 +306,6 @@ pub struct ClientSession {
     /// What the host said before it read the hello. Its version has already
     /// been checked against this build's.
     pub greeting: HostHello,
-    /// Encoded pictures in.
-    pub video: VideoReceiver,
     /// Input and key frame requests out.
     pub to_host: ControlWriter,
     /// Stream configuration and heartbeats in.
@@ -315,6 +333,14 @@ pub enum TransportError {
     /// The connection ended.
     #[error("the connection ended")]
     Connection(#[from] quinn::ConnectionError),
+    /// The host closed the connection rather than opening a session, and said
+    /// why. Its words, not ours: a version mismatch reads as a version
+    /// mismatch and not as a failed read.
+    #[error("the host refused the connection: {reason}")]
+    Refused {
+        /// What the host attached to the close.
+        reason: String,
+    },
     /// The control stream stopped carrying messages.
     #[error(transparent)]
     Control(#[from] ControlError),

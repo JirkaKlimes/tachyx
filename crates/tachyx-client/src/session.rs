@@ -189,6 +189,23 @@ impl Session {
         Liveness::at(now, self.heard, self.saw)
     }
 
+    /// When the host was last heard from.
+    ///
+    /// Published for a reader outside the session that has to work out
+    /// [`Liveness`] for itself. The answer moves with the clock rather than with
+    /// any event, so a liveness value recorded when something last happened
+    /// would be stale in exactly the case that matters: nothing happening.
+    #[must_use]
+    pub const fn heard_at(&self) -> Instant {
+        self.heard
+    }
+
+    /// When a picture last arrived, if one has. See [`Session::heard_at`].
+    #[must_use]
+    pub const fn saw_at(&self) -> Option<Instant> {
+        self.saw
+    }
+
     /// The next message to send to the host.
     pub fn poll_control(&mut self) -> Option<ClientMessage> {
         self.outgoing.pop_front()

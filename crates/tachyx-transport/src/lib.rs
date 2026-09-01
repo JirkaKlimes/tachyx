@@ -7,7 +7,9 @@
 //!
 //! The packetiser and the reassembler are not here. They are pure functions
 //! over the sixteen-byte header and they live in [`tachyx_proto::packet`], so
-//! that a client can rebuild video without linking a QUIC server to do it.
+//! that a client can rebuild video without linking a QUIC server to do it, and
+//! so that there is one implementation of turning datagrams into pictures
+//! rather than one on each side of the wire.
 //!
 //! Two things in here are not obvious and are the reason it exists.
 //!
@@ -27,4 +29,4 @@ pub mod video;
 pub use control::{ControlError, ControlReader, ControlWriter};
 pub use endpoint::{Client, ClientSession, Host, HostSession, TransportError, Tuning};
 pub use identity::{Fingerprint, HostIdentity, IdentityError, PinStore};
-pub use video::{Sent, VideoError, VideoReceiver, VideoSender, video_send_buffer};
+pub use video::{Sent, VideoError, VideoSender, video_send_buffer};

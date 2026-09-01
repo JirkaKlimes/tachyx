@@ -14,7 +14,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tachyx_proto::VERSION;
 use tachyx_proto::control::{
@@ -23,11 +23,67 @@ use tachyx_proto::control::{
 };
 use tachyx_proto::input::{InputEvent, PointerButton, Press};
 use tachyx_proto::media::{FrameId, FrameKind, HEADER_LEN, Timestamp};
-use tachyx_proto::packet::{AccessUnit, ReassemblyStats};
+use tachyx_proto::packet::{AccessUnit, Frame, Reassembler, ReassemblyStats};
 use tachyx_transport::{
     Client, ClientSession, ControlError, ControlReader, ControlWriter, Host, HostIdentity,
     HostSession, PinStore, Sent, TransportError, Tuning, video_send_buffer,
 };
+
+/// How long the receiver waits for a frame that nothing follows.
+///
+/// Only the last frame before an idle screen needs it: every other incomplete
+/// frame is decided by the arrival of the next one.
+const FRAME_DEADLINE: Duration = Duration::from_millis(50);
+
+/// The client side of the video path.
+///
+/// The transport carries datagrams and nothing more. Rebuilding pictures from
+/// them is `tachyx_proto::packet`'s job, and the client's, so it is written out
+/// here rather than offered by the transport: two implementations of it, one on
+/// each side of the wire, is one too many.
+struct Video {
+    connection: quinn::Connection,
+    reassembler: Reassembler,
+}
+
+impl Video {
+    fn new(session: &ClientSession) -> Self {
+        Self {
+            connection: session.connection.clone(),
+            reassembler: Reassembler::new(FRAME_DEADLINE),
+        }
+    }
+
+    /// Waits for the next complete picture, giving up on an incomplete one when
+    /// its deadline passes rather than waiting behind it.
+    async fn next_frame(&mut self) -> Result<Frame, quinn::ConnectionError> {
+        loop {
+            let datagram = match self.reassembler.next_deadline() {
+                Some(at) => {
+                    let read = self.connection.read_datagram();
+                    let at = tokio::time::Instant::from_std(at);
+                    let Ok(datagram) = tokio::time::timeout_at(at, read).await else {
+                        self.reassembler.expire(Instant::now());
+                        continue;
+                    };
+                    datagram?
+                }
+                None => self.connection.read_datagram().await?,
+            };
+            if let Ok(Some(frame)) = self.reassembler.push(&datagram, Instant::now()) {
+                return Ok(frame);
+            }
+        }
+    }
+
+    fn stats(&self) -> ReassemblyStats {
+        self.reassembler.stats()
+    }
+
+    fn needs_keyframe(&self) -> bool {
+        self.reassembler.needs_keyframe()
+    }
+}
 
 /// The name the host is pinned under. Not resolved, and it need not resolve.
 const HOST_NAME: &str = "tachyx-host";
@@ -155,14 +211,15 @@ struct Report {
 }
 
 async fn receive(
-    mut session: ClientSession,
+    session: ClientSession,
     frames: u32,
     key_interval: u32,
     start: tokio::time::Instant,
 ) -> Report {
+    let mut video = Video::new(&session);
     let mut report = Report::default();
     for _ in 0..frames {
-        let next = tokio::time::timeout(Duration::from_secs(2), session.video.next_frame());
+        let next = tokio::time::timeout(Duration::from_secs(2), video.next_frame());
         let Ok(frame) = next.await else { break };
         let frame = frame.expect("the connection is live");
         assert_eq!(
@@ -176,7 +233,7 @@ async fn receive(
         report.frames += 1;
         report.bytes += frame.data.len();
     }
-    report.stats = session.video.stats();
+    report.stats = video.stats();
     report
 }
 
@@ -280,13 +337,14 @@ async fn a_saturated_link_reports_what_it_carried() {
     let coded = CodedSize::new(1920, 1088).expect("a codeable size");
     let tuning = Tuning::for_stream(coded);
     let link = Link::open("saturate", tuning, tuning);
-    let (mut host, mut client) = link.sessions().await;
+    let (mut host, client) = link.sessions().await;
 
     let receiving = tokio::spawn(async move {
+        let mut video = Video::new(&client);
         let mut frames = 0u64;
         let mut bytes = 0usize;
         while let Ok(Ok(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), client.video.next_frame()).await
+            tokio::time::timeout(Duration::from_millis(300), video.next_frame()).await
         {
             assert_eq!(
                 frame.data,
@@ -297,7 +355,7 @@ async fn a_saturated_link_reports_what_it_carried() {
             frames += 1;
             bytes += frame.data.len();
         }
-        (frames, bytes, client.video.stats())
+        (frames, bytes, video.stats())
     });
 
     let start = tokio::time::Instant::now();
@@ -346,7 +404,6 @@ async fn a_saturated_link_reports_what_it_carried() {
 fn cramped() -> Tuning {
     Tuning {
         video_buffer: video_send_buffer(CodedSize::new(640, 480).expect("a codeable size")),
-        frame_deadline: Duration::from_millis(50),
     }
 }
 
@@ -452,7 +509,8 @@ async fn a_receive_buffer_smaller_than_a_key_frame_shreds_it() {
 async fn the_configured_buffers_hold_a_key_frame_the_client_is_slow_to_read() {
     let tuning = Tuning::for_stream(hd());
     let link = Link::open("slow-reader", tuning, tuning);
-    let (mut host, mut client) = link.sessions().await;
+    let (mut host, client) = link.sessions().await;
+    let mut video = Video::new(&client);
 
     let Sent::Queued { datagrams } = send_frame(&mut host, 0, 1) else {
         panic!("the queue holds a key frame")
@@ -461,15 +519,15 @@ async fn the_configured_buffers_hold_a_key_frame_the_client_is_slow_to_read() {
     // whole key frame arrives and queues up on the client.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let frame = tokio::time::timeout(Duration::from_secs(2), client.video.next_frame())
+    let frame = tokio::time::timeout(Duration::from_secs(2), video.next_frame())
         .await
         .expect("the frame arrives")
         .expect("the connection is live");
     assert_eq!(frame.data, picture(0, KEY_FRAME));
     assert_eq!(frame.kind, FrameKind::Key);
-    assert_eq!(client.video.stats().packets_received, datagrams as u64);
-    assert_eq!(client.video.stats().packets_lost, 0);
-    assert!(!client.video.needs_keyframe());
+    assert_eq!(video.stats().packets_received, datagrams as u64);
+    assert_eq!(video.stats().packets_lost, 0);
+    assert!(!video.needs_keyframe());
     println!(
         "\n  buffers            {} bytes each end\n  \
            key frame          {datagrams} datagrams held for 100 ms, none discarded\n",
