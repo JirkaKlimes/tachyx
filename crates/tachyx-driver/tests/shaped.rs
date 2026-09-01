@@ -76,10 +76,10 @@ fn surface() -> Size {
 /// A path whose capacity changes under the sender.
 #[derive(Debug, Clone, Copy)]
 struct Shape {
-    /// Bits a second the bottleneck carries.
+    /// Bits a second the bottleneck carries to begin with.
     rate: u64,
-    /// A rate it changes to, and how long after the relay started.
-    change: Option<(Duration, u64)>,
+    /// Rates it changes to, and how long after the relay started.
+    changes: &'static [(Duration, u64)],
 }
 
 /// One direction of the shaped path.
@@ -101,10 +101,14 @@ impl Lane {
     }
 
     fn rate(&self, now: Instant) -> u64 {
-        match self.shape.change {
-            Some((after, rate)) if now.duration_since(self.started) >= after => rate,
-            _ => self.shape.rate,
-        }
+        let elapsed = now.duration_since(self.started);
+        self.shape
+            .changes
+            .iter()
+            .filter(|(after, _)| *after <= elapsed)
+            .map(|(_, rate)| *rate)
+            .next_back()
+            .unwrap_or(self.shape.rate)
     }
 
     fn offer(&mut self, packet: &[u8], now: Instant) {
@@ -142,7 +146,7 @@ async fn relay(host: SocketAddr, down: Shape) -> std::io::Result<SocketAddr> {
         let mut up = Lane::new(
             Shape {
                 rate: 1_000_000_000,
-                change: None,
+                changes: &[],
             },
             now,
         );
@@ -436,50 +440,53 @@ fn run(name: &str, shape: Shape, seconds: u64) -> (Samples, u64) {
     (samples, frames)
 }
 
+/// Twelve megabits, cut to three at six seconds, restored at fourteen.
+const CLIFF: [(Duration, u64); 2] = [
+    (Duration::from_secs(6), 3_000_000),
+    (Duration::from_secs(14), 12_000_000),
+];
+
+/// One session, one shaped path, and the three things the whole design is for.
+///
+/// It is one test rather than three because two shaped sessions running at once
+/// compete for the processor, and a delay-based estimator reads the scheduler's
+/// jitter as a queue. The controller's behaviour on each leg is asserted
+/// separately below; what is shared is the twenty-two seconds of real socket.
 #[test]
-fn the_host_finds_a_link_nobody_told_it_about() {
-    // Twelve megabits, and a session that opens at two. Without the receiver
-    // report there is nothing to find it with: quinn's own estimate was
-    // measured reporting 0.00 Mbit/s on a healthy hundred-megabit path for
-    // every sample of a twenty-second run.
+fn the_host_finds_a_link_gives_it_up_and_takes_it_back() {
     let (samples, frames) = run(
-        "climb",
+        "cliff",
         Shape {
             rate: 12_000_000,
-            change: None,
+            changes: &CLIFF,
         },
-        8,
+        22,
     );
-    let found = at(&samples, 6.0);
+
+    // Found. Without the receiver report there is nothing to find it with:
+    // quinn's own estimate was measured reporting 0.00 Mbit/s on a healthy
+    // hundred-megabit path for every sample of a twenty-second run.
+    let found = at(&samples, 5.5);
     assert!(
         found > 5_000_000,
         "a twelve megabit link left the host asking for {found}: {samples:?}"
     );
-    assert!(frames > 60, "only {frames} pictures reached the decoder");
-}
 
-#[test]
-fn a_link_that_collapses_under_the_session_is_given_up() {
-    // Twelve megabits for six seconds, then three. The client keeps reporting
-    // throughout, and the arrival spacing in those reports is the only thing
-    // that says the path changed.
-    let (samples, frames) = run(
-        "collapse",
-        Shape {
-            rate: 12_000_000,
-            change: Some((Duration::from_secs(6), 3_000_000)),
-        },
-        14,
-    );
-    let before = at(&samples, 5.5);
-    let after = at(&samples, 13.0);
+    // Given up. The arrival spacing in the reports is the only thing that says
+    // the path changed; nothing else on the host can see it.
+    let cut = at(&samples, 13.0);
     assert!(
-        before > 5_000_000,
-        "the host never found the link it started on: {samples:?}"
+        cut < 4_500_000,
+        "the host was still asking for {cut} on a three megabit link: {samples:?}"
     );
+
+    // Taken back. Multiplicative increase alone would take ln(4)/ln(1.08), or
+    // eighteen seconds, to climb from three megabits to twelve; this has eight.
+    let back = at(&samples, 21.0);
     assert!(
-        after < 4_500_000,
-        "the host was still asking for {after} on a three megabit link: {samples:?}"
+        back > 5_000_000,
+        "the host never took the recovered link back, and sat at {back}: {samples:?}"
     );
-    assert!(frames > 60, "only {frames} pictures reached the decoder");
+
+    assert!(frames > 200, "only {frames} pictures reached the decoder");
 }
