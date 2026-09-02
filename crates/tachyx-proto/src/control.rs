@@ -5,7 +5,7 @@
 //! carries [`VERSION`] ahead of everything else, and [`Hello::decode`] reads
 //! that field before it reads anything a later version might have reshaped.
 
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -582,50 +582,100 @@ pub enum CursorUpdate {
     Untracked,
 }
 
-/// One report of the pointer, in pixels of the captured screen.
+/// One report of the pointer, in logical pixels of the captured output.
 ///
-/// The captured screen, not the encoded picture: the resolution ladder changes
+/// Logical pixels are what the compositor measures the pointer in, and they are
+/// not what it captures in. This output is 2880x1800 at a scale of 1.2: it is
+/// laid out as 2400x1500, it reports the pointer inside that, and the pointer
+/// picture it hands over is 48 rows square while covering 24 logical pixels.
+/// One space had to be chosen for the whole report, and logical is the only one
+/// every figure lands in exactly: that picture is a whole number of logical
+/// pixels and 28.8 captured ones.
+///
+/// So [`CursorReport::screen`] is the laid-out size of the output rather than
+/// the size of the frames, and every other figure here is measured in it. The
+/// rows of a picture keep their own finer resolution, which a client draws into
+/// a logical-sized box: free detail on a screen with pixels to spare.
+///
+/// The captured output, not the encoded picture: the resolution ladder changes
 /// the second at any moment and would otherwise change the meaning of every
 /// figure here in the middle of a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorReport {
-    /// The captured screen, which every other figure here is measured in.
+    /// The captured output as the compositor lays it out, which every other
+    /// figure here is measured in.
     pub screen: Size,
     /// Where the pointer is, or `None` while it is not over the captured
-    /// screen.
+    /// output.
     pub at: Option<CursorPoint>,
-    /// The picture, carried by the update that changes it and by no other.
+    /// The picture, named by the update that changes it and by no other.
     ///
-    /// It is thousands of times the size of a position and changes thousands of
-    /// times less often, and this stream is the same reliable stream input
-    /// travels on, so resending it with every position would put the pointer's
-    /// own picture in front of the user's next click.
-    pub image: Option<CursorImage>,
+    /// `None` leaves the last one standing. The rows are thousands of times the
+    /// size of a position and change thousands of times less often, and this is
+    /// the same reliable stream input travels on, so anything more would put
+    /// the pointer's own picture in front of the user's next click.
+    pub image: Option<CursorPicture>,
 }
 
 /// Where the pointer's hotspot is, and where that sits inside the picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorPoint {
-    /// Distance from the left edge of the captured screen, in its pixels.
+    /// Distance from the left edge of the captured output, in its logical
+    /// pixels.
     ///
-    /// May fall outside the screen: a cursor overlapping an edge has entered
+    /// May fall outside the output: a cursor overlapping an edge has entered
     /// the captured area while its hotspot has not.
     pub x: i32,
     /// Distance from the top edge.
     pub y: i32,
-    /// Where the hotspot sits inside the picture, from its left edge.
+    /// Where the hotspot sits inside the picture, from its left edge, in the
+    /// same logical pixels.
+    ///
+    /// Not in the rows of the picture, which are finer. A pointer 48 rows wide
+    /// on an output of scale 2 covers 24 logical pixels and its hotspot is
+    /// reported inside those 24.
     pub hotspot_x: i32,
     /// The same, from its top edge.
     pub hotspot_y: i32,
 }
 
+/// The pointer's picture, or the name of one the client already holds.
+///
+/// A picture travels once. The pointer crossing back over a widget it has
+/// crossed before returns to a shape the client still has, and naming that costs
+/// a couple of bytes where repeating it costs tens of kilobytes in front of the
+/// user's next click.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorPicture {
+    /// A picture the client has not been sent, with its rows.
+    Whole(CursorImage),
+    /// A picture the client has been sent, by name.
+    ///
+    /// Only for one still inside [`CursorImage::REMEMBERED`] of the pictures
+    /// sent, because that is all the client is asked to keep.
+    Known(CursorImageId),
+}
+
+/// Which pointer picture this is.
+///
+/// It names a shape rather than counting updates: a pointer that turns into a
+/// text beam and back comes back to the identifier it had, which is what lets
+/// the second arrow travel as a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CursorImageId(pub u32);
+
 /// A pointer picture, as premultiplied BGRA rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorImage {
-    /// Width in pixels of the captured screen.
+    /// Which picture this is.
+    pub id: CursorImageId,
+    /// Width of the rows, in the picture's own pixels.
     pub width: NonZeroU16,
-    /// Height.
+    /// Height of the rows.
     pub height: NonZeroU16,
+    /// Rows to the logical pixel, which is how much finer the picture is than
+    /// the place it goes. See [`CursorImage::logical`].
+    pub scale: NonZeroU8,
     /// `width * height` pixels, row by row, four bytes each: blue, green, red,
     /// then alpha, with the colour already multiplied by the alpha.
     ///
@@ -643,15 +693,48 @@ impl CursorImage {
     /// smaller: 48 square is what this host was measured serving.
     pub const MAX_BYTES: usize = 120 * 120 * 4;
 
+    /// How many pictures each end keeps.
+    ///
+    /// Both ends have to agree, and both have to drop the oldest first: the
+    /// host names a picture rather than sending it only while the client is
+    /// still holding it, and the two lists are the same list because they are
+    /// built from the same ordered stream. A desktop turns the pointer into a
+    /// handful of shapes, so this is deep enough that a session settles into
+    /// naming them and shallow enough to bound at under two megabytes.
+    pub const REMEMBERED: usize = 32;
+
     /// Describes a picture, rejecting one whose rows do not add up.
     #[must_use]
-    pub fn new(width: NonZeroU16, height: NonZeroU16, pixels: Vec<u8>) -> Option<Self> {
+    pub fn new(
+        id: CursorImageId,
+        width: NonZeroU16,
+        height: NonZeroU16,
+        scale: NonZeroU8,
+        pixels: Vec<u8>,
+    ) -> Option<Self> {
         let image = Self {
+            id,
             width,
             height,
+            scale,
             pixels,
         };
         image.is_whole().then_some(image)
+    }
+
+    /// What the picture covers on the host's own screen, in logical pixels.
+    ///
+    /// Divided rather than sent already divided, so that a pointer whose rows
+    /// do not divide evenly keeps its exact size. That is a client-drawn
+    /// pointer rather than a themed one, and rounding it would put its hotspot
+    /// half a pixel from where the host has it.
+    #[must_use]
+    pub fn logical(&self) -> (f32, f32) {
+        let scale = f32::from(self.scale.get());
+        (
+            f32::from(self.width.get()) / scale,
+            f32::from(self.height.get()) / scale,
+        )
     }
 
     /// The rows, once they are known to be the rows this picture claims.
@@ -901,7 +984,14 @@ mod tests {
     }
 
     fn arrow() -> CursorImage {
-        CursorImage::new(edge(48), edge(48), vec![0x7f; 48 * 48 * 4]).unwrap()
+        CursorImage::new(
+            CursorImageId(7),
+            edge(48),
+            edge(48),
+            NonZeroU8::new(2).unwrap(),
+            vec![0x7f; 48 * 48 * 4],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -916,7 +1006,12 @@ mod tests {
                     hotspot_x: 5,
                     hotspot_y: 1,
                 }),
-                image: Some(arrow()),
+                image: Some(CursorPicture::Whole(arrow())),
+            })),
+            HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
+                screen: Size::new(3440, 1440).unwrap(),
+                at: None,
+                image: Some(CursorPicture::Known(CursorImageId(7))),
             })),
             HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
                 screen: Size::new(3440, 1440).unwrap(),
@@ -953,7 +1048,14 @@ mod tests {
             postcard::to_stdvec(&HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
                 screen,
                 at,
-                image: Some(arrow()),
+                image: Some(CursorPicture::Whole(arrow())),
+            })))
+            .unwrap();
+        let named =
+            postcard::to_stdvec(&HostMessage::Cursor(CursorUpdate::Tracked(CursorReport {
+                screen,
+                at,
+                image: Some(CursorPicture::Known(CursorImageId(7))),
             })))
             .unwrap();
         assert!(
@@ -966,18 +1068,46 @@ mod tests {
             "the picture is what this message avoids resending, and it is {} bytes",
             redrawn.len()
         );
+        assert!(
+            named.len() < moved.len() + 4,
+            "naming a picture the client holds must cost about nothing, was {} bytes",
+            named.len()
+        );
     }
 
     #[test]
     fn a_picture_whose_rows_do_not_add_up_is_refused() {
+        let scale = NonZeroU8::new(2).unwrap();
         assert!(
-            CursorImage::new(edge(48), edge(48), vec![0; 48 * 48 * 4 - 1]).is_none(),
+            CursorImage::new(
+                CursorImageId(0),
+                edge(48),
+                edge(48),
+                scale,
+                vec![0; 48 * 48 * 4 - 1]
+            )
+            .is_none(),
             "a short buffer would be read past its end by whatever draws it"
         );
         assert!(
-            CursorImage::new(edge(512), edge(512), vec![0; 512 * 512 * 4]).is_none(),
+            CursorImage::new(
+                CursorImageId(0),
+                edge(512),
+                edge(512),
+                scale,
+                vec![0; 512 * 512 * 4]
+            )
+            .is_none(),
             "a picture larger than a control message cannot be sent"
         );
+    }
+
+    #[test]
+    fn a_picture_covers_what_its_rows_divided_by_its_scale_cover() {
+        // 48 rows at scale 2 is the 24 logical pixels the host draws, which on
+        // this output is 28.8 captured ones. Reporting the rows themselves is
+        // how the pointer came out two thirds too large on the client.
+        assert_eq!(arrow().logical(), (24.0, 24.0));
     }
 
     #[test]
@@ -986,16 +1116,20 @@ mod tests {
         // the encoding rules it out, so the reader has to.
         #[derive(Serialize)]
         struct Claimed {
+            id: u32,
             width: u16,
             height: u16,
+            scale: u8,
             pixels: Vec<u8>,
         }
 
         let whole = arrow();
         assert_eq!(whole.pixels().map(<[u8]>::len), Some(48 * 48 * 4));
         let bytes = postcard::to_stdvec(&Claimed {
+            id: 7,
             width: 48,
             height: 48,
+            scale: 2,
             pixels: vec![0; 16],
         })
         .unwrap();

@@ -75,14 +75,11 @@ class CursorFit {
 @immutable
 class CursorArt {
   /// The picture [image], drawn to [fit].
-  const CursorArt({
-    required this.serial,
-    required this.image,
-    required this.fit,
-  });
+  const CursorArt({required this.id, required this.image, required this.fit});
 
-  /// Which picture this is. It changes only when the picture does.
-  final int serial;
+  /// Which picture this is. It changes only when the picture does, and a shape
+  /// the pointer returns to returns to the identifier it had.
+  final int id;
 
   /// The decoded rows.
   final ui.Image image;
@@ -131,14 +128,14 @@ class RemoteCursor {
       other.x == x &&
       other.y == y &&
       other.confirmed == confirmed &&
-      other.art?.serial == art?.serial;
+      other.art?.id == art?.id;
 
   @override
-  int get hashCode => Object.hash(x, y, confirmed, art?.serial);
+  int get hashCode => Object.hash(x, y, confirmed, art?.id);
 
   @override
   String toString() =>
-      'RemoteCursor($x, $y, confirmed: $confirmed, art: ${art?.serial})';
+      'RemoteCursor($x, $y, confirmed: $confirmed, art: ${art?.id})';
 }
 
 /// Reads the pointer out of the session once a frame.
@@ -165,7 +162,7 @@ class CursorFeed {
   /// The picture last decoded, kept until one replaces it.
   CursorArt? _art;
 
-  /// The serial being decoded, so that a slow decode is not started twice.
+  /// The picture being decoded, so that a slow decode is not started twice.
   int? _decoding;
 
   void _tick(Duration _) {
@@ -175,7 +172,7 @@ class CursorFeed {
       return;
     }
     final rust.CursorShape? shape = reading.image;
-    if (shape != null && shape.serial.toInt() != (_art?.serial ?? -1)) {
+    if (shape != null && shape.id != (_art?.id ?? -1)) {
       unawaited(_decode(shape));
     }
     if (_drawn(reading)) return;
@@ -205,14 +202,14 @@ class CursorFeed {
 
   /// Decodes the picture behind [shape], if the session still has it.
   ///
-  /// The rows cross the boundary here and nowhere else. A picture whose serial
-  /// has already moved on is not worth decoding, and the session says so by
+  /// The rows cross the boundary here and nowhere else. A picture the pointer
+  /// has already moved off is not worth decoding, and the session says so by
   /// answering nothing.
   Future<void> _decode(rust.CursorShape shape) async {
-    final int serial = shape.serial.toInt();
-    if (_decoding == serial) return;
-    _decoding = serial;
-    final rust.CursorImage? rows = _session?.cursorImage(serial: shape.serial);
+    final int id = shape.id;
+    if (_decoding == id) return;
+    _decoding = id;
+    final rust.CursorImage? rows = _session?.cursorImage(id: id);
     if (rows == null) return;
     final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
       rows.pixels,
@@ -231,7 +228,7 @@ class CursorFeed {
     descriptor.dispose();
     _art?.image.dispose();
     _art = CursorArt(
-      serial: serial,
+      id: id,
       image: frame.image,
       fit: CursorFit(
         width: shape.width,

@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let format = capture.format();
     println!("output      {}", format.output);
     println!("size        {}", format.size);
+    println!("logical     {}", format.logical);
     println!("refresh     {}", format.refresh);
     println!(
         "layout      {} modifier {:#018x}",
@@ -98,16 +99,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("at          {:?}", shown.at);
             println!("hotspot     {:?}", shown.hotspot);
             match &shown.image {
-                Some(image) => println!("image       {}x{}", image.width, image.height),
+                Some(image) => {
+                    let scale = u32::from(image.scale.get());
+                    println!(
+                        "image       {}x{} rows at scale {scale}, so {}x{} logical, id {}",
+                        image.width,
+                        image.height,
+                        image.width / scale,
+                        image.height / scale,
+                        image.id.0
+                    );
+                }
                 None => println!("image       (none yet)"),
             }
         }
         None => println!("at          (this compositor reports no pointer)"),
     }
-    println!(
-        "serial      {} image {}",
-        pointer.serial, pointer.image_serial
-    );
+    println!("serial      {}", pointer.serial);
 
     capture.stop()?;
     let seen = drain.join().map_err(|_| "the drain thread panicked")?;

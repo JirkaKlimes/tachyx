@@ -87,7 +87,7 @@ abstract class RustLibApi extends BaseApi {
 
   CursorImage? crateApiSessionSessionCursorImage({
     required Session that,
-    required BigInt serial,
+    required int id,
   });
 
   void crateApiSessionSessionInput({
@@ -166,7 +166,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @override
   CursorImage? crateApiSessionSessionCursorImage({
     required Session that,
-    required BigInt serial,
+    required int id,
   }) {
     return handler.executeSync(
       SyncTask(
@@ -176,7 +176,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             that,
             serializer,
           );
-          sse_encode_u_64(serial, serializer);
+          sse_encode_u_32(id, serializer);
           return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 2)!;
         },
         codec: SseCodec(
@@ -184,7 +184,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: null,
         ),
         constMeta: kCrateApiSessionSessionCursorImageConstMeta,
-        argValues: [that, serial],
+        argValues: [that, id],
         apiImpl: this,
       ),
     );
@@ -193,7 +193,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiSessionSessionCursorImageConstMeta =>
       const TaskConstMeta(
         debugName: "Session_cursor_image",
-        argNames: ["that", "serial"],
+        argNames: ["that", "id"],
       );
 
   @override
@@ -557,7 +557,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     if (arr.length != 4)
       throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
     return CursorImage(
-      serial: dco_decode_u_64(arr[0]),
+      id: dco_decode_u_32(arr[0]),
       width: dco_decode_u_16(arr[1]),
       height: dco_decode_u_16(arr[2]),
       pixels: dco_decode_list_prim_u_8_strict(arr[3]),
@@ -571,7 +571,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     if (arr.length != 5)
       throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
     return CursorShape(
-      serial: dco_decode_u_64(arr[0]),
+      id: dco_decode_u_32(arr[0]),
       width: dco_decode_f_32(arr[1]),
       height: dco_decode_f_32(arr[2]),
       hotspotX: dco_decode_f_32(arr[3]),
@@ -989,12 +989,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   CursorImage sse_decode_cursor_image(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    var var_serial = sse_decode_u_64(deserializer);
+    var var_id = sse_decode_u_32(deserializer);
     var var_width = sse_decode_u_16(deserializer);
     var var_height = sse_decode_u_16(deserializer);
     var var_pixels = sse_decode_list_prim_u_8_strict(deserializer);
     return CursorImage(
-      serial: var_serial,
+      id: var_id,
       width: var_width,
       height: var_height,
       pixels: var_pixels,
@@ -1004,13 +1004,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   CursorShape sse_decode_cursor_shape(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    var var_serial = sse_decode_u_64(deserializer);
+    var var_id = sse_decode_u_32(deserializer);
     var var_width = sse_decode_f_32(deserializer);
     var var_height = sse_decode_f_32(deserializer);
     var var_hotspotX = sse_decode_f_32(deserializer);
     var var_hotspotY = sse_decode_f_32(deserializer);
     return CursorShape(
-      serial: var_serial,
+      id: var_id,
       width: var_width,
       height: var_height,
       hotspotX: var_hotspotX,
@@ -1508,7 +1508,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_cursor_image(CursorImage self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_u_64(self.serial, serializer);
+    sse_encode_u_32(self.id, serializer);
     sse_encode_u_16(self.width, serializer);
     sse_encode_u_16(self.height, serializer);
     sse_encode_list_prim_u_8_strict(self.pixels, serializer);
@@ -1517,7 +1517,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_cursor_shape(CursorShape self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-    sse_encode_u_64(self.serial, serializer);
+    sse_encode_u_32(self.id, serializer);
     sse_encode_f_32(self.width, serializer);
     sse_encode_f_32(self.height, serializer);
     sse_encode_f_32(self.hotspotX, serializer);
@@ -1846,11 +1846,11 @@ class SessionImpl extends RustOpaque implements Session {
 
   /// The rows of the pointer's current picture, if it is the one asked for.
   ///
-  /// `serial` is what [`CursorShape::serial`] last reported. Passing it keeps
-  /// the picture off this boundary except on the frame it changes, which is
-  /// once every few seconds against sixty reads of the position a second.
-  CursorImage? cursorImage({required BigInt serial}) => RustLib.instance.api
-      .crateApiSessionSessionCursorImage(that: this, serial: serial);
+  /// `id` is what [`CursorShape::id`] last reported. Passing it keeps the
+  /// picture off this boundary except on the frame it changes, which is once
+  /// every few seconds against sixty reads of the position a second.
+  CursorImage? cursorImage({required int id}) => RustLib.instance.api
+      .crateApiSessionSessionCursorImage(that: this, id: id);
 
   /// Records what the user did.
   ///
@@ -1875,8 +1875,10 @@ class SessionImpl extends RustOpaque implements Session {
   /// only one that can reach the engine's texture registry.
   ///
   /// # Errors
-  /// If GStreamer will not start, a decoder element is missing, the engine
-  /// refuses the texture, or this target presents some other way.
+  /// If GStreamer will not start, the engine refuses the texture, or this
+  /// target presents some other way. What the codec the host chose costs is
+  /// reported through [`SessionStats::video_fault`] instead, because the
+  /// pipeline for it is built on the first picture rather than here.
   PlatformInt64 presentOn({required PlatformInt64 engineHandle}) => RustLib
       .instance
       .api

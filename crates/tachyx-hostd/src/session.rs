@@ -504,7 +504,10 @@ async fn run(
     // liveness from a beat that did not arrive, so it has to expect the same
     // one the host keeps.
     let mut heartbeat_tick = ticker(HEARTBEAT_INTERVAL);
-    let mut cursor = CursorFeed::new(capture_size);
+    // The laid-out size, not the captured one: the compositor places the
+    // pointer in logical pixels, and on a scaled output those are not the
+    // pixels the frames are in. See [`tachyx_proto::control::CursorReport`].
+    let mut cursor = CursorFeed::new(capture.format().logical);
     let mut cursor_tick = ticker(cursor::INTERVAL);
     let mut key_frame_tick = ticker(KEY_FRAME_MAX_AGE / 4);
 

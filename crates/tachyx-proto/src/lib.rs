@@ -38,4 +38,9 @@ pub mod report;
 /// codecs the client decodes, and `postcard` writes no field names: a version 1
 /// hello read as a version 2 one ends a field short, and a version 2 hello read
 /// as a version 1 one leaves a byte over. Neither fails to parse on its own.
-pub const VERSION: u16 = 2;
+///
+/// Raised to 3 by the pointer's units. [`control::CursorReport`] moved to the
+/// logical pixels the compositor measures the pointer in and its picture gained
+/// an identifier, so a report from either side read by the other places the
+/// pointer by a fifth of the screen and draws it at the wrong size.
+pub const VERSION: u16 = 3;

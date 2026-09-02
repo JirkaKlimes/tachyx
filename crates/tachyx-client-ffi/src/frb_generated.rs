@@ -119,7 +119,7 @@ fn wire__crate__api__session__Session_cursor_image_impl(
             let api_that = <RustOpaqueMoi<
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Session>,
             >>::sse_decode(&mut deserializer);
-            let api_serial = <u64>::sse_decode(&mut deserializer);
+            let api_id = <u32>::sse_decode(&mut deserializer);
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let mut api_that_guard = None;
@@ -138,7 +138,7 @@ fn wire__crate__api__session__Session_cursor_image_impl(
                 let api_that_guard = api_that_guard.unwrap();
                 let output_ok = Ok::<_, ()>(crate::api::session::Session::cursor_image(
                     &*api_that_guard,
-                    api_serial,
+                    api_id,
                 ))?;
                 std::result::Result::Ok(output_ok)
             })())
@@ -567,12 +567,12 @@ impl SseDecode for crate::api::session::Cursor {
 impl SseDecode for crate::api::session::CursorImage {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_serial = <u64>::sse_decode(deserializer);
+        let mut var_id = <u32>::sse_decode(deserializer);
         let mut var_width = <u16>::sse_decode(deserializer);
         let mut var_height = <u16>::sse_decode(deserializer);
         let mut var_pixels = <Vec<u8>>::sse_decode(deserializer);
         return crate::api::session::CursorImage {
-            serial: var_serial,
+            id: var_id,
             width: var_width,
             height: var_height,
             pixels: var_pixels,
@@ -583,13 +583,13 @@ impl SseDecode for crate::api::session::CursorImage {
 impl SseDecode for crate::api::session::CursorShape {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_serial = <u64>::sse_decode(deserializer);
+        let mut var_id = <u32>::sse_decode(deserializer);
         let mut var_width = <f32>::sse_decode(deserializer);
         let mut var_height = <f32>::sse_decode(deserializer);
         let mut var_hotspotX = <f32>::sse_decode(deserializer);
         let mut var_hotspotY = <f32>::sse_decode(deserializer);
         return crate::api::session::CursorShape {
-            serial: var_serial,
+            id: var_id,
             width: var_width,
             height: var_height,
             hotspot_x: var_hotspotX,
@@ -1074,7 +1074,7 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::session::Cursor>
 impl flutter_rust_bridge::IntoDart for crate::api::session::CursorImage {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
-            self.serial.into_into_dart().into_dart(),
+            self.id.into_into_dart().into_dart(),
             self.width.into_into_dart().into_dart(),
             self.height.into_into_dart().into_dart(),
             self.pixels.into_into_dart().into_dart(),
@@ -1097,7 +1097,7 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::session::CursorImage>
 impl flutter_rust_bridge::IntoDart for crate::api::session::CursorShape {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
-            self.serial.into_into_dart().into_dart(),
+            self.id.into_into_dart().into_dart(),
             self.width.into_into_dart().into_dart(),
             self.height.into_into_dart().into_dart(),
             self.hotspot_x.into_into_dart().into_dart(),
@@ -1458,7 +1458,7 @@ impl SseEncode for crate::api::session::Cursor {
 impl SseEncode for crate::api::session::CursorImage {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <u64>::sse_encode(self.serial, serializer);
+        <u32>::sse_encode(self.id, serializer);
         <u16>::sse_encode(self.width, serializer);
         <u16>::sse_encode(self.height, serializer);
         <Vec<u8>>::sse_encode(self.pixels, serializer);
@@ -1468,7 +1468,7 @@ impl SseEncode for crate::api::session::CursorImage {
 impl SseEncode for crate::api::session::CursorShape {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <u64>::sse_encode(self.serial, serializer);
+        <u32>::sse_encode(self.id, serializer);
         <f32>::sse_encode(self.width, serializer);
         <f32>::sse_encode(self.height, serializer);
         <f32>::sse_encode(self.hotspot_x, serializer);

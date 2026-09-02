@@ -11,17 +11,19 @@
 //! be replayed on top of it before the two positions describe the same instant.
 //! Without that replay a steady drag rubber-bands, one report per frame.
 //!
-//! Everything here is a fraction of the captured screen, `0.0` at the left or
-//! top edge and `1.0` at the right or bottom. The host reports in the pixels of
-//! its screen and the client moves in pixels of the streamed picture; those two
-//! change independently, and every step of the resolution ladder would
+//! Everything here is a fraction of the host's screen, `0.0` at the left or top
+//! edge and `1.0` at the right or bottom. The host reports in the logical pixels
+//! of its screen and the client moves in pixels of the streamed picture; those
+//! two change independently, and every step of the resolution ladder would
 //! otherwise change what a number here means in the middle of a session.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tachyx_proto::control::{CursorImage, CursorPoint, CursorReport, CursorUpdate};
+use tachyx_proto::control::{
+    CursorImage, CursorImageId, CursorPicture, CursorPoint, CursorReport, CursorUpdate,
+};
 
 /// How far the client's position may disagree with the host's before the
 /// disagreement is treated as a fact rather than as drift.
@@ -130,9 +132,12 @@ pub enum Tracking {
 /// The picture to draw and where its hotspot sits, in fractions of the screen.
 #[derive(Debug, Clone)]
 pub struct CursorShape {
-    /// Bumped whenever [`CursorShape::image`] changes, so that whatever decodes
-    /// the picture decodes each one once.
-    pub serial: u64,
+    /// Which picture this is. It changes when the picture does and not
+    /// otherwise, so whatever decodes it decodes each one once.
+    ///
+    /// A shape the pointer returns to comes back to the identifier it had, so
+    /// this counts nothing and is only ever compared.
+    pub id: CursorImageId,
     /// The rows, as the host sent them.
     pub image: Arc<CursorImage>,
     /// The picture's width, as a fraction of the screen's width.
@@ -167,6 +172,13 @@ pub struct CursorTracker {
     /// moment it was applied.
     applied: VecDeque<(Instant, Spot)>,
     shape: Option<CursorShape>,
+    /// The pictures the host has sent, oldest first.
+    ///
+    /// The host names a picture rather than repeating it once this client has
+    /// been sent it, so this is what makes the name mean anything. Bounded at
+    /// [`CursorImage::REMEMBERED`] and dropped oldest first, which is the rule
+    /// the host names them under.
+    pictures: VecDeque<(CursorImageId, Arc<CursorImage>)>,
     tracking: Tracking,
     /// Whether the host says the pointer is over the captured screen. True
     /// until it says otherwise, so a pointer nobody has reported is drawn.
@@ -194,6 +206,7 @@ impl Default for CursorTracker {
             predicted: Spot::CENTRE,
             applied: VecDeque::new(),
             shape: None,
+            pictures: VecDeque::with_capacity(CursorImage::REMEMBERED),
             tracking: Tracking::default(),
             on_screen: true,
             gain: 1.0,
@@ -369,34 +382,64 @@ impl CursorTracker {
         )
     }
 
-    /// Keeps the picture the host sent, in the units whatever draws it needs.
+    /// Keeps the picture the host named, in the units whatever draws it needs.
     ///
-    /// A report with no picture leaves the last one standing: the host sends it
-    /// in the update that changes it and in no other.
+    /// A report that names no picture leaves the last one standing: the host
+    /// names one in the update that changes it and in no other.
     fn take_shape(&mut self, report: &CursorReport) {
-        let Some(image) = report.image.as_ref() else {
+        let Some(image) = report
+            .image
+            .as_ref()
+            .and_then(|named| self.picture_of(named))
+        else {
             return;
         };
-        if image.pixels().is_none() {
-            // A picture whose rows do not add up cannot be drawn, and it is the
-            // one thing the encoding cannot rule out. The previous one stands.
-            return;
-        }
         let across = f32::from(report.screen.width.get());
         let down = f32::from(report.screen.height.get());
+        // The picture's own rows are finer than the place it goes on a scaled
+        // output: 48 of them cover 24 logical pixels there. Measuring the rows
+        // against the screen instead is what drew the pointer two thirds too
+        // large.
+        let (width, height) = image.logical();
         #[expect(
             clippy::cast_precision_loss,
             reason = "a cursor is at most a few hundred pixels across"
         )]
         let shape = CursorShape {
-            serial: self.shape.as_ref().map_or(0, |had| had.serial) + 1,
-            width: f32::from(image.width.get()) / across,
-            height: f32::from(image.height.get()) / down,
+            id: image.id,
+            width: width / across,
+            height: height / down,
             hotspot_x: report.at.map_or(0.0, |at| at.hotspot_x as f32) / across,
             hotspot_y: report.at.map_or(0.0, |at| at.hotspot_y as f32) / down,
-            image: Arc::new(image.clone()),
+            image,
         };
         self.shape = Some(shape);
+    }
+
+    /// The rows behind what the host named, keeping a picture it sent whole.
+    ///
+    /// `None` when there is nothing to draw: rows that do not add up, which is
+    /// the one thing the encoding cannot rule out, or a name this client no
+    /// longer holds, which a host that keeps its half of the bargain never
+    /// sends. The picture in hand stands in both cases, because a pointer that
+    /// stops being drawn is worse than one drawn as its last shape.
+    fn picture_of(&mut self, named: &CursorPicture) -> Option<Arc<CursorImage>> {
+        match named {
+            CursorPicture::Whole(image) if image.pixels().is_some() => {
+                let held = Arc::new(image.clone());
+                self.pictures.push_back((held.id, Arc::clone(&held)));
+                while self.pictures.len() > CursorImage::REMEMBERED {
+                    self.pictures.pop_front();
+                }
+                Some(held)
+            }
+            CursorPicture::Whole(_) => None,
+            CursorPicture::Known(id) => self
+                .pictures
+                .iter()
+                .find(|(held, _)| held == id)
+                .map(|(_, image)| Arc::clone(image)),
+        }
     }
 
     fn forget_before(&mut self, now: Instant) {
@@ -413,7 +456,7 @@ impl CursorTracker {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
+    use std::num::{NonZeroU8, NonZeroU16};
 
     use tachyx_proto::control::Size;
 
@@ -425,11 +468,19 @@ mod tests {
         Size::new(1000, 1000).expect("a size")
     }
 
-    fn arrow() -> CursorImage {
+    /// A pointer 50 rows square at a scale of 2, so 25 logical pixels of the
+    /// 1000 the screen is wide.
+    fn arrow(id: u32) -> CursorImage {
+        picture(id, 50, 50, 0x7f)
+    }
+
+    fn picture(id: u32, width: u16, height: u16, fill: u8) -> CursorImage {
         CursorImage::new(
-            NonZeroU16::new(50).expect("nonzero"),
-            NonZeroU16::new(50).expect("nonzero"),
-            vec![0x7f; 50 * 50 * 4],
+            CursorImageId(id),
+            NonZeroU16::new(width).expect("nonzero"),
+            NonZeroU16::new(height).expect("nonzero"),
+            NonZeroU8::new(2).expect("nonzero"),
+            vec![fill; usize::from(width) * usize::from(height) * 4],
         )
         .expect("rows that add up")
     }
@@ -444,6 +495,10 @@ mod tests {
     }
 
     fn tracked(at: Option<CursorPoint>, image: Option<CursorImage>) -> CursorUpdate {
+        named(at, image.map(CursorPicture::Whole))
+    }
+
+    fn named(at: Option<CursorPoint>, image: Option<CursorPicture>) -> CursorUpdate {
         CursorUpdate::Tracked(CursorReport {
             screen: screen(),
             at,
@@ -468,7 +523,7 @@ mod tests {
     fn the_finger_moves_the_pointer_without_waiting_for_the_host() {
         let now = Instant::now();
         let mut tracker = CursorTracker::new();
-        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow())), RTT);
+        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow(0))), RTT);
         tracker.moved(now + Duration::from_millis(1), 0.1, -0.2);
 
         let view = tracker.view().expect("the host reported the pointer");
@@ -713,7 +768,7 @@ mod tests {
     fn a_pointer_on_another_monitor_is_not_drawn() {
         let now = Instant::now();
         let mut tracker = CursorTracker::new();
-        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow())), RTT);
+        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow(0))), RTT);
         assert!(tracker.view().is_some());
         tracker.reported(now, &tracked(None, None), RTT);
         assert!(
@@ -726,28 +781,94 @@ mod tests {
     fn the_picture_stands_until_one_that_replaces_it_arrives() {
         let now = Instant::now();
         let mut tracker = CursorTracker::new();
-        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow())), RTT);
+        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow(0))), RTT);
         let first = tracker.view().expect("reported").shape.expect("a picture");
-        assert!(close(first.width, 0.05) && close(first.height, 0.05));
+        assert!(
+            close(first.width, 0.025) && close(first.height, 0.025),
+            "50 rows at a scale of 2 covers 25 of the 1000 the screen is wide, not 50"
+        );
         assert!(close(first.hotspot_x, 0.005) && close(first.hotspot_y, 0.001));
 
         tracker.reported(now, &tracked(Some(at(510, 500)), None), RTT);
         let carried = tracker.view().expect("reported").shape.expect("a picture");
         assert_eq!(
-            carried.serial, first.serial,
+            carried.id, first.id,
             "an update that carries no picture must not look like a new one"
         );
 
-        let beam = CursorImage::new(
-            NonZeroU16::new(20).expect("nonzero"),
-            NonZeroU16::new(40).expect("nonzero"),
-            vec![0x11; 20 * 40 * 4],
-        )
-        .expect("rows that add up");
+        let beam = picture(1, 20, 40, 0x11);
         tracker.reported(now, &tracked(Some(at(520, 500)), Some(beam)), RTT);
         let changed = tracker.view().expect("reported").shape.expect("a picture");
-        assert_eq!(changed.serial, first.serial + 1);
-        assert!(close(changed.width, 0.02) && close(changed.height, 0.04));
+        assert_eq!(changed.id, CursorImageId(1));
+        assert!(close(changed.width, 0.01) && close(changed.height, 0.02));
+    }
+
+    #[test]
+    fn a_picture_the_host_only_names_is_drawn_from_the_one_it_sent() {
+        let now = Instant::now();
+        let mut tracker = CursorTracker::new();
+        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow(0))), RTT);
+        tracker.reported(
+            now,
+            &tracked(Some(at(500, 500)), Some(picture(1, 20, 40, 0x11))),
+            RTT,
+        );
+
+        // Back over the arrow. The host holds this client to a picture it was
+        // sent rather than sending it again, which is the whole of what keeps
+        // the pointer's own rows off the stream the next click waits on.
+        tracker.reported(
+            now,
+            &named(
+                Some(at(500, 500)),
+                Some(CursorPicture::Known(CursorImageId(0))),
+            ),
+            RTT,
+        );
+        let shape = tracker.view().expect("reported").shape.expect("a picture");
+        assert_eq!(shape.id, CursorImageId(0));
+        assert_eq!(shape.image.pixels(), Some(&vec![0x7fu8; 50 * 50 * 4][..]));
+        assert!(close(shape.width, 0.025));
+    }
+
+    #[test]
+    fn a_picture_named_that_this_client_never_had_leaves_the_last_one_drawn() {
+        let now = Instant::now();
+        let mut tracker = CursorTracker::new();
+        tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow(0))), RTT);
+        tracker.reported(
+            now,
+            &named(
+                Some(at(500, 500)),
+                Some(CursorPicture::Known(CursorImageId(77))),
+            ),
+            RTT,
+        );
+        let shape = tracker.view().expect("reported").shape.expect("a picture");
+        assert_eq!(
+            shape.id,
+            CursorImageId(0),
+            "drawing nothing at all would be worse than drawing the shape before it"
+        );
+    }
+
+    #[test]
+    fn only_the_pictures_the_host_still_counts_on_are_kept() {
+        let now = Instant::now();
+        let mut tracker = CursorTracker::new();
+        // One picture more than either end keeps, so the first is gone from
+        // both and the host will send it whole again rather than name it.
+        for id in 0..=u32::try_from(CursorImage::REMEMBERED).expect("a small bound") {
+            tracker.reported(now, &tracked(Some(at(500, 500)), Some(arrow(id))), RTT);
+        }
+        assert_eq!(tracker.pictures.len(), CursorImage::REMEMBERED);
+        assert!(
+            tracker
+                .pictures
+                .iter()
+                .all(|(id, _)| *id != CursorImageId(0)),
+            "a client that kept every picture it was ever sent would grow without bound"
+        );
     }
 
     #[test]
@@ -783,16 +904,20 @@ mod tests {
     fn a_picture_whose_rows_do_not_add_up_never_reaches_the_screen() {
         #[derive(serde::Serialize)]
         struct Claimed {
+            id: u32,
             width: u16,
             height: u16,
+            scale: u8,
             pixels: Vec<u8>,
         }
 
         let now = Instant::now();
         let mut tracker = CursorTracker::new();
         let bytes = postcard::to_stdvec(&Claimed {
+            id: 3,
             width: 50,
             height: 50,
+            scale: 2,
             pixels: vec![0; 8],
         })
         .expect("encodes");

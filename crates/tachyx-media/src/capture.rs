@@ -1,7 +1,9 @@
 //! Capturing one output through `ext-image-copy-capture-v1`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::ErrorKind;
+use std::num::NonZeroU8;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use std::time::Duration;
 
 use gbm::{BufferObject, BufferObjectFlags, Format, Modifier};
 use rustix::event::{PollFd, PollFlags, poll};
+use tachyx_proto::control::CursorImageId;
 use tachyx_proto::media::Timestamp;
 use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm};
@@ -31,6 +34,10 @@ use wayland_protocols::ext::image_copy_capture::v1::client::{
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+};
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1,
+    zxdg_output_v1::{self, ZxdgOutputV1},
 };
 
 use crate::slot::Slot;
@@ -65,6 +72,17 @@ pub struct CaptureFormat {
     pub output: String,
     /// Size of every frame, in pixels.
     pub size: Size,
+    /// The size the compositor lays the output out at, which is [`Self::size`]
+    /// divided by the output's scale factor.
+    ///
+    /// The two differ on a scaled output: this one is 2880x1800 at a scale of
+    /// 1.2 and is laid out as 2400x1500. The frames are in the first and the
+    /// pointer is reported in the second, because that is the space the
+    /// compositor places it in, so [`Capture::cursor`] is measured in these.
+    ///
+    /// The capture size itself on a compositor that does not implement
+    /// `xdg-output`, which is the whole of what says how an output is laid out.
+    pub logical: Size,
     /// The output's refresh rate, which is also the rate the encoder's bit
     /// budget must be divided by.
     pub refresh: Framerate,
@@ -200,6 +218,10 @@ struct Counters {
 ///
 /// The frame itself is captured without the cursor painted into it, so the
 /// client draws it locally and pointer movement is not gated on a round trip.
+///
+/// Every position here is in the logical pixels of
+/// [`CaptureFormat::logical`], which is what the compositor measures the
+/// pointer in and is not what it captures in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cursor {
     /// What the compositor reports, or `None` when it offers no cursor session
@@ -207,25 +229,24 @@ pub struct Cursor {
     pub pointer: Option<Pointer>,
     /// Bumped whenever anything here changes.
     pub serial: u64,
-    /// Bumped whenever [`Pointer::image`] changes, and by nothing else.
-    ///
-    /// The picture is thousands of times the size of a position and it changes
-    /// thousands of times less often, so whatever carries the cursor onward
-    /// reads this to decide whether to carry the picture with it.
-    pub image_serial: u64,
 }
 
 /// Where the pointer is and what it looks like.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pointer {
-    /// The hotspot's place on the captured output, in that output's pixels, or
-    /// `None` while the pointer is not over it.
+    /// The hotspot's place on the captured output, in that output's logical
+    /// pixels, or `None` while the pointer is not over it.
     ///
     /// The compositor may report a position outside the picture: a cursor
     /// overlapping the edge has entered the captured area while its hotspot has
     /// not.
     pub at: Option<(i32, i32)>,
-    /// Where the hotspot sits inside the image, from its top left corner.
+    /// Where the hotspot sits inside the image, from its top left corner, in
+    /// those same logical pixels.
+    ///
+    /// Not in the rows of the image, which are finer by
+    /// [`CursorImage::scale`]: the compositor reports a hotspot of 5 for a
+    /// picture 48 rows wide that covers 24 logical pixels.
     pub hotspot: (i32, i32),
     /// The pointer's picture, once one has been captured.
     ///
@@ -238,10 +259,21 @@ pub struct Pointer {
 /// A pointer image, as premultiplied ARGB rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorImage {
-    /// Width in pixels.
+    /// Which shape this is.
+    ///
+    /// A shape the pointer returns to keeps the identifier it had, so that
+    /// whatever forwards the picture can name it rather than send it again.
+    pub id: CursorImageId,
+    /// Width in rows.
     pub width: u32,
-    /// Height in pixels.
+    /// Height in rows.
     pub height: u32,
+    /// Rows to the logical pixel.
+    ///
+    /// The compositor draws the pointer from a picture as many times finer than
+    /// the screen as the screen is scaled, and the cursor session says so
+    /// nowhere, so it is taken from the scale the outputs announce.
+    pub scale: NonZeroU8,
     /// `width * height` little-endian ARGB pixels, row by row.
     pub pixels: Vec<u8>,
 }
@@ -432,6 +464,13 @@ struct State {
     outputs: Vec<wl_output::WlOutput>,
     names: HashMap<u32, String>,
     refresh: HashMap<u32, u32>,
+    /// Whole scale factors, by output. A fractionally scaled output reports the
+    /// next whole number up, which is the one the cursor is drawn at.
+    scales: HashMap<u32, u32>,
+    /// Laid-out sizes, by output, from `xdg-output`. The only place the
+    /// fractional part of a scale is observable.
+    logical: HashMap<u32, (u32, u32)>,
+    layout: Option<ZxdgOutputManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     shm: Option<wl_shm::WlShm>,
     sources: Option<ExtOutputImageCaptureSourceManagerV1>,
@@ -480,6 +519,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "zwp_linux_dmabuf_v1" => {
                 state.dmabuf = Some(registry.bind(name, version.min(4), handle, ()));
             }
+            "zxdg_output_manager_v1" => {
+                state.layout = Some(registry.bind(name, version.min(3), handle, ()));
+            }
             _ => {}
         }
     }
@@ -510,7 +552,35 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
                 )]
                 state.refresh.insert(id, refresh.max(0) as u32);
             }
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "the protocol forbids a scale below one"
+            )]
+            wl_output::Event::Scale { factor } => {
+                state.scales.insert(id, factor.max(1) as u32);
+            }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, u32> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: zxdg_output_v1::Event,
+        output: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "an output is never laid out at a negative size"
+        )]
+        if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
+            state
+                .logical
+                .insert(*output, (width.max(0) as u32, height.max(0) as u32));
         }
     }
 }
@@ -630,6 +700,7 @@ delegate_noop!(State: ignore ZwpLinuxDmabufV1);
 delegate_noop!(State: ignore ExtImageCaptureSourceV1);
 delegate_noop!(State: ignore ExtOutputImageCaptureSourceManagerV1);
 delegate_noop!(State: ignore ExtImageCopyCaptureManagerV1);
+delegate_noop!(State: ignore ZxdgOutputManagerV1);
 
 fn read_u64(bytes: &[u8]) -> Option<u64> {
     bytes
@@ -670,6 +741,10 @@ struct Pump {
     /// The last picture read out of the cursor buffer, kept here so that
     /// deciding whether a new one differs costs no lock.
     image: Option<Arc<CursorImage>>,
+    shapes: Shapes,
+    /// Whether the last cursor frame was refused, so that a session the
+    /// compositor will not fill is said once rather than once a turn.
+    refused: bool,
     size: Size,
     epoch: u64,
     next_id: u64,
@@ -714,6 +789,90 @@ struct CursorBuffer {
     buffer: wl_buffer::WlBuffer,
     storage: std::fs::File,
     size: (u32, u32),
+}
+
+/// A picture as it came out of that buffer, before it is known which shape it
+/// is.
+struct Picture {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+/// The pointer pictures lately seen, so that a shape the pointer returns to
+/// keeps the identity it had.
+///
+/// The pointer flips between a handful of shapes as it crosses a window: an
+/// arrow, a text beam, a resize edge. Treating every flip as a picture nobody
+/// has seen is what put tens of kilobytes of arrow back on the reliable stream,
+/// in front of the user's next click, each time the pointer left a text field.
+/// A shape found here travels as its identifier instead.
+///
+/// Held to [`tachyx_proto::control::CursorImage::REMEMBERED`] and dropped
+/// oldest first, which is what the far end is asked to do with the same list.
+struct Shapes {
+    scale: NonZeroU8,
+    /// Each shape with the hash of its rows, oldest first.
+    seen: VecDeque<(u64, Arc<CursorImage>)>,
+    next: u32,
+}
+
+impl Shapes {
+    fn new(scale: NonZeroU8) -> Self {
+        Self {
+            scale,
+            seen: VecDeque::with_capacity(tachyx_proto::control::CursorImage::REMEMBERED),
+            next: 0,
+        }
+    }
+
+    /// The shape a freshly captured picture holds, which is one already seen
+    /// whenever the rows are the same.
+    ///
+    /// Hashed to find the candidate and then compared row for row. A hash that
+    /// collided would leave the wrong pointer on the client's screen for the
+    /// rest of the session, and the compare is one pass over a picture that has
+    /// just changed, which is thousands of times rarer than one that has not.
+    fn intern(&mut self, picture: Picture) -> Arc<CursorImage> {
+        let hash = Self::hash_of(&picture);
+        if let Some((_, known)) = self
+            .seen
+            .iter()
+            .find(|(seen, known)| *seen == hash && known.shows(&picture))
+        {
+            return Arc::clone(known);
+        }
+        let image = Arc::new(CursorImage {
+            id: CursorImageId(self.next),
+            width: picture.width,
+            height: picture.height,
+            scale: self.scale,
+            pixels: picture.pixels,
+        });
+        self.next = self.next.wrapping_add(1);
+        self.seen.push_back((hash, Arc::clone(&image)));
+        while self.seen.len() > tachyx_proto::control::CursorImage::REMEMBERED {
+            self.seen.pop_front();
+        }
+        image
+    }
+
+    fn hash_of(picture: &Picture) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        picture.width.hash(&mut hasher);
+        picture.height.hash(&mut hasher);
+        picture.pixels.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl CursorImage {
+    /// Whether this shape is the one a freshly captured picture holds.
+    fn shows(&self, picture: &Picture) -> bool {
+        self.width == picture.width
+            && self.height == picture.height
+            && self.pixels == picture.pixels
+    }
 }
 
 fn run(
@@ -766,6 +925,18 @@ impl Pump {
         connection.display().get_registry(&handle, ());
         queue.roundtrip(state)?;
         queue.roundtrip(state)?;
+        // How an output is laid out is the one thing `wl_output` cannot say: it
+        // rounds a scale of 1.2 up to 2, and the pointer is placed in the
+        // 2400x1500 that scale really produces rather than in the 1440x900 the
+        // rounded one would. Asked for after the registry has settled, so that
+        // the manager and the outputs are both known whatever order they
+        // arrived in.
+        if let Some(layout) = state.layout.clone() {
+            for output in &state.outputs {
+                layout.get_xdg_output(output, &handle, output.id().protocol_id());
+            }
+            queue.roundtrip(state)?;
+        }
 
         let (chosen, refresh) = state.find_output(output)?;
         let sources = state
@@ -824,9 +995,13 @@ impl Pump {
         queue.roundtrip(state)?;
         let (planes, length) = buffers[0].layout()?;
 
+        let logical = state.logical_size(&chosen).unwrap_or(size);
+        let scale = state.cursor_scale();
+        tracing::debug!(%size, %logical, scale, "the output the pointer is measured on");
         let format = CaptureFormat {
             output: output.to_owned(),
             size,
+            logical,
             refresh,
             fourcc: fourcc as u32,
             modifier: modifier.into(),
@@ -850,6 +1025,8 @@ impl Pump {
             cursor: Arc::clone(cursor),
             pointer,
             image: None,
+            shapes: Shapes::new(scale),
+            refused: false,
             size,
             epoch: monotonic_nanos(),
             next_id: 0,
@@ -992,8 +1169,13 @@ impl Pump {
         }
 
         let (ready, failed, _) = state.cursor.take_frame();
-        if let Some(reason) = &failed {
+        if let Some(reason) = &failed
+            && !std::mem::replace(&mut self.refused, true)
+        {
             tracing::debug!(%reason, "the compositor refused to fill the cursor buffer");
+        }
+        if ready {
+            self.refused = false;
         }
         let pointer = self.pointer.as_mut().expect("checked above");
         if (ready || failed.is_some())
@@ -1013,9 +1195,9 @@ impl Pump {
 
         let mut changed = std::mem::take(&mut state.pointer_changed);
         if let Some(picture) = captured
-            && self.image.as_deref() != Some(&picture)
+            && !self.image.as_deref().is_some_and(|had| had.shows(&picture))
         {
-            self.image = Some(Arc::new(picture));
+            self.image = Some(self.shapes.intern(picture));
             changed = true;
         }
         if changed {
@@ -1025,7 +1207,16 @@ impl Pump {
                 image: self.image.clone(),
             }));
         }
-        self.arm_pointer();
+        // Not re-armed on a turn that brought a refusal. The compositor refuses
+        // the next frame as fast as it refused this one, so asking again inside
+        // the same turn is not a retry, it is a spin on the connection:
+        // measured at 65000 refusals a second, on the thread that also drives
+        // the screen, against a cursor session Hyprland had stopped without
+        // sending the event that says so. The next thing the pointer or the
+        // screen does asks again.
+        if failed.is_none() {
+            self.arm_pointer();
+        }
     }
 
     /// Reports that this compositor will not say where the pointer is, and
@@ -1038,32 +1229,29 @@ impl Pump {
         self.publish_pointer(None);
     }
 
-    /// Writes the pointer through, bumping the serials that changed.
+    /// Writes the pointer through, bumping the serial if anything changed.
     ///
-    /// The picture is compared by identity rather than by content: it is
-    /// replaced only when a captured one differs, so two handles to one
-    /// allocation are the same picture, and comparing tens of kilobytes on
-    /// every step of the pointer would not be.
+    /// The picture is compared by its identifier rather than by its rows, which
+    /// is the whole point of having one: a shape the pointer returns to carries
+    /// the identifier it had, so it is the same picture here and it is the same
+    /// picture to the client, which already holds it.
     fn publish_pointer(&self, pointer: Option<Pointer>) {
         let mut cursor = self
             .cursor
             .lock()
             .expect("the cursor mutex is never held across a panic");
+        let shape = |pointer: &Option<Pointer>| {
+            pointer
+                .as_ref()
+                .and_then(|shown| shown.image.as_ref())
+                .map(|image| image.id)
+        };
         let same_place = cursor.pointer.as_ref().map(|had| (had.at, had.hotspot))
             == pointer.as_ref().map(|next| (next.at, next.hotspot));
-        let same_image = match (
-            cursor.pointer.as_ref().and_then(|had| had.image.as_ref()),
-            pointer.as_ref().and_then(|next| next.image.as_ref()),
-        ) {
-            (None, None) => true,
-            (Some(had), Some(next)) => Arc::ptr_eq(had, next),
-            _ => false,
-        };
-        if same_place && same_image {
+        if same_place && shape(&cursor.pointer) == shape(&pointer) {
             return;
         }
         cursor.serial += 1;
-        cursor.image_serial += u64::from(!same_image);
         cursor.pointer = pointer;
     }
 
@@ -1107,6 +1295,32 @@ impl State {
             .and_then(Framerate::from_millihertz)
             .ok_or_else(|| Error::NoSuchOutput(wanted.to_owned()))?;
         Ok((output.clone(), refresh))
+    }
+
+    /// The size the compositor lays an output out at, if it said.
+    fn logical_size(&self, output: &wl_output::WlOutput) -> Option<Size> {
+        self.logical
+            .get(&output.id().protocol_id())
+            .and_then(|(width, height)| Size::new(*width, *height))
+    }
+
+    /// Rows the compositor draws the pointer from, to the logical pixel.
+    ///
+    /// The largest scale announced, and not the captured output's own: a cursor
+    /// theme is loaded once for the whole session at a size that satisfies the
+    /// sharpest output, so a laptop panel beside a scaled one is served the
+    /// sharper picture too. The scale here is already whole, because that is
+    /// all `wl_output` can express and a theme comes in whole sizes anyway: an
+    /// output at 1.2 announces 2, and pointers 24 logical pixels across arrive
+    /// as 48 rows square.
+    fn cursor_scale(&self) -> NonZeroU8 {
+        self.scales
+            .values()
+            .copied()
+            .max()
+            .and_then(|scale| u8::try_from(scale).ok())
+            .and_then(NonZeroU8::new)
+            .unwrap_or(NonZeroU8::MIN)
     }
 }
 
@@ -1330,12 +1544,12 @@ impl PointerCapture {
     }
 
     /// Reads the picture the compositor just copied in, or reports why not.
-    fn read(&self) -> Option<CursorImage> {
+    fn read(&self) -> Option<Picture> {
         let buffer = self.buffer.as_ref()?;
         let (width, height) = buffer.size;
         let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
         match buffer.storage.read_exact_at(&mut pixels, 0) {
-            Ok(()) => Some(CursorImage {
+            Ok(()) => Some(Picture {
                 width,
                 height,
                 pixels,

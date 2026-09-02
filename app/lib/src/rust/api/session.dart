@@ -10,7 +10,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 import 'video.dart';
 
-// These functions are ignored because they are not marked as `pub`: `asked_for`, `init_logging`, `present`
+// These functions are ignored because they are not marked as `pub`: `asked_for`, `init_logging`, `present`, `start_decoding`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Present`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `push`
 
@@ -59,10 +59,10 @@ abstract class Session implements RustOpaqueInterface {
 
   /// The rows of the pointer's current picture, if it is the one asked for.
   ///
-  /// `serial` is what [`CursorShape::serial`] last reported. Passing it keeps
-  /// the picture off this boundary except on the frame it changes, which is
-  /// once every few seconds against sixty reads of the position a second.
-  CursorImage? cursorImage({required BigInt serial});
+  /// `id` is what [`CursorShape::id`] last reported. Passing it keeps the
+  /// picture off this boundary except on the frame it changes, which is once
+  /// every few seconds against sixty reads of the position a second.
+  CursorImage? cursorImage({required int id});
 
   /// Records what the user did.
   ///
@@ -82,8 +82,10 @@ abstract class Session implements RustOpaqueInterface {
   /// only one that can reach the engine's texture registry.
   ///
   /// # Errors
-  /// If GStreamer will not start, a decoder element is missing, the engine
-  /// refuses the texture, or this target presents some other way.
+  /// If GStreamer will not start, the engine refuses the texture, or this
+  /// target presents some other way. What the codec the host chose costs is
+  /// reported through [`SessionStats::video_fault`] instead, because the
+  /// pipeline for it is built on the first picture rather than here.
   PlatformInt64 presentOn({required PlatformInt64 engineHandle});
 
   /// What this session has done.
@@ -162,8 +164,8 @@ class Cursor {
 
 /// The pointer's picture, ready for the platform to turn into an image.
 class CursorImage {
-  /// Which picture this is, matching [`CursorShape::serial`].
-  final BigInt serial;
+  /// Which picture this is, matching [`CursorShape::id`].
+  final int id;
 
   /// Width in pixels.
   final int width;
@@ -176,7 +178,7 @@ class CursorImage {
   final Uint8List pixels;
 
   const CursorImage({
-    required this.serial,
+    required this.id,
     required this.width,
     required this.height,
     required this.pixels,
@@ -184,14 +186,14 @@ class CursorImage {
 
   @override
   int get hashCode =>
-      serial.hashCode ^ width.hashCode ^ height.hashCode ^ pixels.hashCode;
+      id.hashCode ^ width.hashCode ^ height.hashCode ^ pixels.hashCode;
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is CursorImage &&
           runtimeType == other.runtimeType &&
-          serial == other.serial &&
+          id == other.id &&
           width == other.width &&
           height == other.height &&
           pixels == other.pixels;
@@ -201,7 +203,10 @@ class CursorImage {
 class CursorShape {
   /// Which picture this is. It changes only when the picture does, so a
   /// drawing layer decodes each one once.
-  final BigInt serial;
+  ///
+  /// It names a shape rather than counting changes: the pointer coming back
+  /// to a shape it has held before comes back to the identifier it had.
+  final int id;
 
   /// The picture's width, as a fraction of the video's width.
   final double width;
@@ -216,7 +221,7 @@ class CursorShape {
   final double hotspotY;
 
   const CursorShape({
-    required this.serial,
+    required this.id,
     required this.width,
     required this.height,
     required this.hotspotX,
@@ -225,7 +230,7 @@ class CursorShape {
 
   @override
   int get hashCode =>
-      serial.hashCode ^
+      id.hashCode ^
       width.hashCode ^
       height.hashCode ^
       hotspotX.hashCode ^
@@ -236,7 +241,7 @@ class CursorShape {
       identical(this, other) ||
       other is CursorShape &&
           runtimeType == other.runtimeType &&
-          serial == other.serial &&
+          id == other.id &&
           width == other.width &&
           height == other.height &&
           hotspotX == other.hotspotX &&

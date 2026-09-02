@@ -274,7 +274,10 @@ pub struct Cursor {
 pub struct CursorShape {
     /// Which picture this is. It changes only when the picture does, so a
     /// drawing layer decodes each one once.
-    pub serial: u64,
+    ///
+    /// It names a shape rather than counting changes: the pointer coming back
+    /// to a shape it has held before comes back to the identifier it had.
+    pub id: u32,
     /// The picture's width, as a fraction of the video's width.
     pub width: f32,
     /// Its height, as a fraction of the video's height.
@@ -288,8 +291,8 @@ pub struct CursorShape {
 /// The pointer's picture, ready for the platform to turn into an image.
 #[derive(Debug, Clone)]
 pub struct CursorImage {
-    /// Which picture this is, matching [`CursorShape::serial`].
-    pub serial: u64,
+    /// Which picture this is, matching [`CursorShape::id`].
+    pub id: u32,
     /// Width in pixels.
     pub width: u16,
     /// Height in pixels.
@@ -408,7 +411,7 @@ impl Session {
             y: view.at.y,
             confirmed: view.tracking == tachyx_client::Tracking::Reported,
             image: view.shape.map(|shape| CursorShape {
-                serial: shape.serial,
+                id: shape.id.0,
                 width: shape.width,
                 height: shape.height,
                 hotspot_x: shape.hotspot_x,
@@ -419,18 +422,18 @@ impl Session {
 
     /// The rows of the pointer's current picture, if it is the one asked for.
     ///
-    /// `serial` is what [`CursorShape::serial`] last reported. Passing it keeps
-    /// the picture off this boundary except on the frame it changes, which is
-    /// once every few seconds against sixty reads of the position a second.
+    /// `id` is what [`CursorShape::id`] last reported. Passing it keeps the
+    /// picture off this boundary except on the frame it changes, which is once
+    /// every few seconds against sixty reads of the position a second.
     #[frb(sync)]
     #[must_use]
-    pub fn cursor_image(&self, serial: u64) -> Option<CursorImage> {
+    pub fn cursor_image(&self, id: u32) -> Option<CursorImage> {
         let shape = self.link.cursor()?.shape?;
-        if shape.serial != serial {
+        if shape.id.0 != id {
             return None;
         }
         Some(CursorImage {
-            serial: shape.serial,
+            id: shape.id.0,
             width: shape.image.width.get(),
             height: shape.image.height.get(),
             pixels: shape.image.pixels()?.to_vec(),
