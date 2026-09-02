@@ -3,6 +3,11 @@
          release build cannot open a socket at all and every connection fails
          before it is attempted. This client is a network client in every build. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- The low-latency Wi-Fi lock the stream holds needs both of these. See
+         MainActivity: without the lock, this hardware's Wi-Fi power policy
+         permanently stops delivering the video flow seconds into a session. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
     <application
         android:label="tachyx"

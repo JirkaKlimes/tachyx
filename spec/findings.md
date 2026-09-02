@@ -1318,3 +1318,271 @@ ping to the access point under no load at all measured a worst case of 234 ms
 and a mean deviation of 22 ms, which swamps anything an 8.5 Mbit/s stream does to
 it. The claim that pacing helps rests on the shaped-link measurements and on the
 buffer-depth mechanism, not on a measurement of this access point.
+
+## The phone was not the throttle. The laptop's radio was
+
+This section was opened to find what Android does to `tachyx`. The suspects were
+802.11 power save, Doze, App Standby, Samsung Freecess, and the Samsung game
+manager. All of them were measured. None of them is the cause.
+
+The cause is on this machine. The laptop's own Wi-Fi hop carries 45 times the
+latency of the phone's, to the same access point, at the same moment, under the
+same load.
+
+Everything below was run over `adb` on a Galaxy S25 (SM-S931B, Android 16,
+API 36) and over `ping` on the laptop. The phone was attached by USB, so no
+measurement here depended on the link it was measuring.
+
+### The two ends were not on the same radio
+
+Both ends associate to the same access point, but to different radios of it.
+
+|        | Radio               | Band              | Rate            | Signal  |
+|--------|---------------------|-------------------|-----------------|---------|
+| Phone  | radio A             | 5260 MHz, ch 52   | 433/866 Mbps ac | -45 dBm |
+| Laptop | radio B             | 2462 MHz, ch 11   | 13 to 72 Mb/s   | -35 dBm |
+
+The laptop is the near end by signal and the slow end by rate. 13 Mb/s at
+-35 dBm is not a link budget problem. It is a transmit problem: `iwconfig`
+reports `Tx-Power=3 dBm`, which is 1 mW, against the 20 dBm a station normally
+uses. The kernel is in the world regulatory domain,
+`/sys/module/cfg80211/parameters/ieee80211_regdom` reads `00`.
+
+That one fact explains both columns. The world domain caps transmit power, and
+it marks 5 GHz channels as no-initiate-radiation, so the laptop cannot start a
+connection on channel 52 even though it sees that BSSID at full signal. It falls
+back to 2.4 GHz and shouts at 1 mW. The access point then rate-controls the
+laptop down, because it barely hears it.
+
+The power cap and the band are measured. That the regulatory domain causes both
+is inferred, not measured: changing the domain needs root, and that change was
+denied in this environment. It was never applied, so the laptop's configuration
+is exactly as it was found.
+
+### Subtracting one hop isolates it
+
+`ping` to the gateway uses the phone's radio and the access point. `ping` to the
+laptop is the same path plus one hop, AP to laptop. The difference between the
+two is that hop and nothing else.
+
+At 5 Hz with 56-byte payloads:
+
+| Path            | p50    | p90    | p99    | max    | loss |
+|-----------------|--------|--------|--------|--------|------|
+| phone -> AP     | 4.12   | 12.50  | 51.60  | 51.70  | 0%   |
+| phone -> laptop | 52.20  | 329.00 | 416.00 | 437.00 | 12%  |
+| laptop -> AP    | 4.98   | 18.70  | 304.00 | 510.00 | 1%   |
+| laptop -> phone | 172.00 | 385.00 | 489.00 | 720.00 | 6%   |
+
+All figures in milliseconds. The reported symptom was 77 to 94 ms with 3% loss.
+The baseline here is worse than that and the shape is the same.
+
+Load makes the split unambiguous. At about 20 Hz with 1400-byte payloads, which
+is the packet size and rate the stream actually uses:
+
+| Path                    | p50    | p90    | p99    | max    | sd     | loss |
+|-------------------------|--------|--------|--------|--------|--------|------|
+| phone -> AP             | 3.33   | 5.68   | 16.40  | 17.20  | 2.50   | 0%   |
+| laptop -> AP            | 151.00 | 355.00 | 403.00 | 405.00 | 135.24 | 0%   |
+| laptop -> phone (video) | 11.70  | 139.00 | 270.00 | 373.00 | 60.22  | 0%   |
+
+The phone's hop to the access point is 3.33 ms at the median with a standard
+deviation of 2.50 ms and a worst case of 17 ms, over 240 packets. That result
+was reproduced three times, minutes apart, and never moved: 3.41, 3.32, 3.33 ms
+at the median with a deviation between 1.63 and 2.76 ms.
+
+The laptop's hop to the same access point, over one hop, at the same packet size
+and rate, is 151 ms at the median with a deviation of 135 ms. That is 45 times
+the phone's median on the same air, and it was also reproduced: five consecutive
+runs measured 148, 134, 134, 152 and 133 ms at the median.
+
+The laptop's hop is not slow, it is bimodal. Its minimum is 1.41 ms, better than
+the phone's 1.51 ms, so the radio can reach the access point in one attempt. Most
+frames do not. That is the signature of retrying at the link layer, not of a
+queue: over one 200-packet burst the interface counted 2346 transmitted packets,
+0 transmit errors, and 35 excessive retries, while the reported bit rate wandered
+between 13 and 72 Mb/s at a fixed -35 dBm of signal.
+
+The video flows laptop to phone, so the laptop's weak transmit is directly in
+the stream's path. That is the whole reported problem.
+
+### Background traffic is not the cause either
+
+The laptop runs Syncthing, which holds connections on port 22000 to the phone
+itself and to another host, and it transfers in bursts. On an already weak link
+that is a plausible second explanation, so it was controlled for rather than
+assumed away.
+
+Five identical runs were taken with the interface's own byte counters sampled
+across each one, which sorts them into quiet and busy without changing anything:
+
+| Background tx | p50    | p90    | sd     |
+|---------------|--------|--------|--------|
+| 5 kB/s        | 152.00 | 357.00 | 129.68 |
+| 22 kB/s       | 134.00 | 338.00 | 131.84 |
+| 261 kB/s      | 134.00 | 338.00 | 134.67 |
+| 269 kB/s      | 133.00 | 351.00 | 138.92 |
+| 325 kB/s      | 148.00 | 354.00 | 139.85 |
+
+Sixty times the background load changes the median by nothing. The quietest run
+is the worst one. Competing traffic is not what is delaying these packets, so
+stopping Syncthing would not repay the trouble.
+
+### This corrects an earlier conclusion
+
+The pacing section closes by saying the access point's own variance, a 234 ms
+worst case and 22 ms mean deviation, swamps anything the stream does to it, and
+treats that as a property of the medium. It is not. That measurement was taken
+from the laptop, and it is the laptop's radio. The phone on the same access
+point at the same offered load holds a standard deviation between 1.63 and
+2.76 ms across three runs. The medium is fine.
+
+It also explains the phone-as-hotspot number. At 2.9 ms the laptop is one hop
+from a radio in the same room, where 1 mW is enough, and there is no second air
+hop. The hotspot did not fix Android. It removed the laptop's bad hop.
+
+### Every Android suspect, measured and cleared
+
+**Doze and App Standby are not engaged.** `dumpsys deviceidle` reports
+`mState=ACTIVE mLightState=ACTIVE` with `mScreenOn=true` and `mCharging=true`.
+`am get-standby-bucket com.tachyx.tachyx` returns 10, which is ACTIVE, the least
+restricted bucket. Verified rather than assumed, as intended. The app is not in
+the battery optimisation allowlist, which is correct and costs nothing while it
+is foreground.
+
+**Freecess is not freezing the app. Its log line says so.** The line that raised
+the suspicion, `FreecessHandler: skipping freeze com.tachyx.tachyx(10558)`, is
+Freecess deciding *against* a freeze. A real freeze looks different, and the
+same log shows one for another package: `FreecessController: FZ :
+com.samsung.android.goodlock(10427) reason: Bg` followed by `FreecessHandler:
+freeze com.samsung.android.goodlock(10427)`. `tachyx` never appears on that
+path. Samsung-specific, and a false alarm.
+
+**The game manager is an absent boost, not a throttle.**
+`SGM:SemGameManager: isGamePackage(), ret=false` means Samsung will not apply a
+game performance profile. It does not remove anything the app would otherwise
+have. Samsung-specific.
+
+**Nothing is thermally throttled.** `dumpsys thermalservice` reports
+`Thermal Status: 0`, which is none, with the application processor at 54.2 C and
+the skin at 37.7 C after a session. Processor pressure from
+`/proc/pressure/cpu` is `some avg10=17.22` with `full avg10=0.00`, so no thread
+was fully stalled.
+
+**Power save is real, and it is not in this path.** With the screen off the
+phone's hop to the access point moves from p90 12.50 ms to p90 41.40 ms, with a
+60 ms worst case, at an unchanged 5.71 ms median and no loss. That is the
+expected shape of a station waking on beacon boundaries. It is tens of
+milliseconds of tail, exactly as the earlier research pass guessed. But it only
+appears with the screen off, and the app streams with the screen on, where the
+same measurement is 3.41 ms at the median with a 13 ms worst case. The leading
+hypothesis was correct about the mechanism and wrong about this case.
+
+### `WIFI_MODE_FULL_LOW_LATENCY` exists here, and the app never asks for it
+
+The device advertises `WIFI_FEATURE_LOW_LATENCY`. `dumpsys wifi` shows the
+framework counting `322 full low latency` locks acquired and released by other
+packages, so the mode works on this hardware. At the time of measurement no lock
+was held, `Current operation mode: 0`, and the active lock owner list
+`{10551, 10280, 1000, 10411}` does not contain `tachyx`, which is uid 10558.
+
+So the app requests nothing. That is a real gap and it should be closed. It is
+also not the bug: with the screen on, the phone's hop already runs at about
+3.3 ms median with a p99 between 12.5 and 17.4 ms. The most a low latency lock
+can recover is that p99, roughly 10 to 20 ms in the tail and nothing at the
+median. It is cheap insurance for the screen-off and background-scan cases, not
+a fix for a 355 ms p90 that is created one hop away.
+
+### What to change
+
+Fix the laptop first. Everything else is worth single-digit milliseconds.
+
+**In Settings, by hand, on the laptop.** Set a real regulatory country instead
+of the world domain `00`, so the radio may use its normal transmit power and may
+initiate on 5 GHz. Then prefer the access point's 5 GHz radio, which is visible at
+full signal and advertises 1170 Mbit/s. Expected effect is the difference
+between the two rows of the load table, and it was not measured here because
+applying it needs root and was denied.
+
+**In app code, on the client.** These are worth doing on their merits, and none
+of them is Samsung-specific:
+
+1. Hold `WifiManager.WIFI_MODE_FULL_LOW_LATENCY` for the life of a session.
+   `createWifiLock(WIFI_MODE_FULL_LOW_LATENCY, tag)` then `acquire()`, released
+   on session end. It needs `android.permission.WAKE_LOCK` and no other. It is
+   documented to take effect only while the screen is on and the app is
+   foreground, which is exactly the session's shape. Measured headroom on this
+   link: at most the 12 to 17 ms p99, nothing at the median.
+2. Set MediaCodec `KEY_PRIORITY` to 0, realtime, and `KEY_OPERATING_RATE` to the
+   stream's frame rate. Documented, present on API 36. Not measured here,
+   because the decoder was not the limiter on this link.
+3. Use `PerformanceHintManager`, API 31 and up, for the decode and render loop,
+   with a target work duration of the frame period. Documented. It is the
+   supported way to get the scheduler to favour these threads, and it is the
+   vendor-neutral replacement for the game profile Samsung declined to apply.
+
+Do not add `setSustainedPerformanceMode`. It trades peak clock for a stable
+clock and is aimed at long thermal sessions. Thermal status measured 0
+throughout, so it would cost performance and buy nothing here.
+
+Do not request a battery optimisation exemption. The app measured as ACTIVE
+bucket and non-idle while foreground, so there is nothing to exempt.
+
+### What was not measured
+
+The regulatory domain change on the laptop, and therefore the size of the fix.
+The environment denied the network reconfiguration, so the laptop was left
+exactly as found and the "after" number for the one lever that matters is
+missing. The prediction is that the laptop's hop comes to resemble the phone's,
+around 3 to 5 ms at the median with single-digit deviation, because that is what
+the same access point already delivers to a station that can hear it.
+
+The effect of an actual `WIFI_MODE_FULL_LOW_LATENCY` lock, because acquiring one
+needs app code and this pass changed none.
+
+Nothing was changed on the phone. The screen was slept and woken to take the
+power save measurement, and it was left awake, as found.
+
+## The video path stalls, and the cause is a link this system overdrives
+
+The stream runs well for a few seconds and then freezes dead. Instrumented on
+the host with per-tick counters read straight off the quinn connection, the
+freeze has one unmistakable signature: the count of UDP datagrams received from
+the phone stops advancing and never resumes. Everything downstream follows from
+that. With no acknowledgements coming back, the datagrams already sent are never
+confirmed, the unacknowledged bytes climb until they reach the congestion
+window, and once there is no room under that window the transport can send no
+more. The application's own send buffer then fills, the pre-encode gate refuses
+for want of room, and the pump stops. The gate, the budget and the watchdog are
+all reacting correctly to a peer that has gone silent; none of them is the
+cause.
+
+Two runs place the cause. On a good access point, round trip nine milliseconds
+and two packets lost, the return path went silent at about two hundred and forty
+packets a second on the downlink. On a poor one, round trip forty-eight
+milliseconds and seventeen percent loss, it went silent much sooner and the
+transport's own window was two hundred and twenty packets into loss by then.
+
+Halving the frame rate did not cure it. It delayed the freeze roughly fourfold,
+which is the shape of a queue overflowing rather than a rate crossing a fixed
+ceiling: the senders fills a buffer somewhere on the path faster than the air
+drains it, and when that buffer gives way the flow collapses. The buffer is most
+likely in the phone's own wireless driver, since a plain flood reproduces the
+cut with no transport involved, and a foreground low-latency wireless lock, which
+this build now holds and which the phone confirms is active, does not prevent it.
+
+So the picture is not a single misbehaving component. It is a link that cannot
+carry what is offered, an offer that does not back down because the feedback it
+would back down from stops arriving the instant the return path dies, and a
+transport that, once its window fills with bytes that will never be
+acknowledged, has no way back. The delay-based controller is blind exactly when
+it is needed, because its reports travel the path that just failed.
+
+Two changes follow, and neither is small enough to make at the end of a long
+session. The controller must begin lower and treat the packet rate as a limit in
+its own right, not only the bitrate, because the packets are already the largest
+the path's maximum transmission unit allows and cannot be made bigger. And the
+host must recover from a dead path rather than sit in it: a return path that has
+said nothing while the buffer stayed full for more than a second is a path to
+reset, dropping the stale backlog and starting a fresh key frame, so that a
+transient stall becomes a hiccup instead of the end of the session.
