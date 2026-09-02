@@ -165,9 +165,6 @@ class Touchpad {
   /// Mouse buttons currently held, as a [PointerEvent.buttons] mask.
   int _held = 0;
 
-  /// Whether a long press is currently holding the left button down.
-  bool get isDragLocked => _dragLocked;
-
   /// A finger or a mouse button went down.
   void down(PointerDownEvent event) {
     if (event.kind == PointerDeviceKind.mouse) {
