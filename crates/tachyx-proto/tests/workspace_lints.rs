@@ -8,28 +8,17 @@ use std::path::Path;
 
 /// The crates allowed to contain unsafe, and why each one is.
 ///
-/// `tachyx-dmabuf` hands a buffer descriptor to GStreamer: no type can prove a
-/// file descriptor names a live buffer.
+/// `tachyx-unsafe` holds every raw handle a platform hands across: a buffer
+/// descriptor GStreamer takes, the OpenGL context Flutter's Linux embedder has
+/// made current, and the Java surface its Android producer offers. No type can
+/// prove any of the three names a live thing.
 ///
 /// `tachyx-client-ffi` holds the code `flutter_rust_bridge` generates, where
 /// every call across the Dart boundary reads a pointer Dart wrote.
 ///
-/// `tachyx-glctx` reads the OpenGL context Flutter's Linux embedder has made
-/// current and describes it to GStreamer: no type can prove a raw EGL handle
-/// names a live display or context.
-///
-/// `tachyx-surface` turns the Java surface Flutter's Android producer offers
-/// into the window the platform decoder writes into: no type can prove a Java
-/// object reference names a live `android.view.Surface`.
-///
-/// All four keep the rest of the workspace lint set, which the first test below
-/// checks, and none holds any decision of its own.
-const UNSAFE_EXCEPTIONS: [&str; 4] = [
-    "tachyx-dmabuf",
-    "tachyx-client-ffi",
-    "tachyx-glctx",
-    "tachyx-surface",
-];
+/// Both keep the rest of the workspace lint set, which the first test below
+/// checks, and neither holds any decision of its own.
+const UNSAFE_EXCEPTIONS: [&str; 2] = ["tachyx-unsafe", "tachyx-client-ffi"];
 
 #[test]
 fn every_crate_opts_in_to_the_workspace_lints() {

@@ -782,7 +782,7 @@ impl Control {
         fd: OwnedFd,
         captured: Timestamp,
     ) -> Result<gst::Buffer, Error> {
-        let memory = tachyx_dmabuf::wrap_plane(allocator, fd, self.length)?;
+        let memory = tachyx_unsafe::dmabuf::wrap_plane(allocator, fd, self.length)?;
         let mut buffer = gst::Buffer::new();
         let raw = buffer
             .get_mut()

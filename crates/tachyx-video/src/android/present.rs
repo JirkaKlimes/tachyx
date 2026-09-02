@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use ndk::media_error::MediaError;
 use tachyx_proto::control::{Codec, Codecs};
-use tachyx_surface::Producer;
+use tachyx_unsafe::surface::Producer;
 
 use super::bitstream::{AccessUnit, Coded};
 use super::decoder::{Decoder, Fed};
@@ -116,8 +116,8 @@ impl VideoTexture {
     /// and is reported through [`VideoTexture::failure`], because none of it can
     /// be known before the first parameter set arrives.
     pub fn new(producer_id: i64) -> Result<Self, Error> {
-        let producer =
-            tachyx_surface::producer(producer_id).ok_or(Error::NoProducer { id: producer_id })?;
+        let producer = tachyx_unsafe::surface::producer(producer_id)
+            .ok_or(Error::NoProducer { id: producer_id })?;
         if producer.surface().is_none() {
             return Err(Error::NoSurface { id: producer_id });
         }

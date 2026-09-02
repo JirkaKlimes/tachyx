@@ -2,8 +2,8 @@ use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
 use gstreamer_gl::GL_DISPLAY_CONTEXT_TYPE;
 use gstreamer_gl::prelude::ContextGLExt;
-use tachyx_glctx::AdoptedContext;
 use tachyx_proto::control::{Codec, Codecs};
+use tachyx_unsafe::glctx::AdoptedContext;
 
 use super::Error;
 

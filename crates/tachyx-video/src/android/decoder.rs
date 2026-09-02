@@ -4,7 +4,7 @@ use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
 };
 use ndk::media::media_format::MediaFormat;
-use tachyx_surface::Surface;
+use tachyx_unsafe::surface::Surface;
 
 use super::Error;
 use super::bitstream::Coded;

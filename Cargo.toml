@@ -14,15 +14,13 @@ repository = "https://github.com/JirkaKlimes/tachyx"
 [workspace.dependencies]
 tachyx-client = { path = "crates/tachyx-client" }
 tachyx-congestion = { path = "crates/tachyx-congestion" }
-tachyx-dmabuf = { path = "crates/tachyx-dmabuf" }
 tachyx-driver = { path = "crates/tachyx-driver" }
-tachyx-glctx = { path = "crates/tachyx-glctx" }
 tachyx-hostd = { path = "crates/tachyx-hostd" }
 tachyx-input = { path = "crates/tachyx-input" }
 tachyx-media = { path = "crates/tachyx-media" }
 tachyx-proto = { path = "crates/tachyx-proto" }
-tachyx-surface = { path = "crates/tachyx-surface" }
 tachyx-transport = { path = "crates/tachyx-transport" }
+tachyx-unsafe = { path = "crates/tachyx-unsafe" }
 tachyx-video = { path = "crates/tachyx-video" }
 
 anyhow = "1.0"

@@ -12,8 +12,8 @@ use gstreamer_video::VideoInfo;
 use irondash_texture::{
     BoxedGLTexture, GLTexture, GLTextureProvider, PayloadProvider, SendableTexture, Texture,
 };
-use tachyx_glctx::AdoptedContext;
 use tachyx_proto::control::Codec;
+use tachyx_unsafe::glctx::AdoptedContext;
 
 use crate::stats::{Stats, Window};
 use decoder::Decoder;

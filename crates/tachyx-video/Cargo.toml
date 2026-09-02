@@ -12,12 +12,12 @@ tachyx-proto.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
-tachyx-surface.workspace = true
+tachyx-unsafe.workspace = true
 ndk.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tachyx-glctx.workspace = true
+tachyx-unsafe.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true
 gstreamer-gl.workspace = true

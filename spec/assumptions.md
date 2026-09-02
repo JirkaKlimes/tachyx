@@ -443,10 +443,10 @@ half of `present.rs` out is an afternoon. Both get harder as the module grows,
 and both are the difference between an iOS client that writes a decoder and one
 that writes a decode subsystem.
 
-`tachyx-surface` has the right shape and the wrong types. `Producer`, `Surface`
-and the generation counter are exactly the abstraction a second platform wants,
-and they are concrete types behind `#[cfg(target_os = "android")]` with no trait
-to implement.
+The `surface` module of `tachyx-unsafe` has the right shape and the wrong types.
+`Producer`, `Surface` and the generation counter are exactly the abstraction a
+second platform wants, and they are concrete types behind
+`#[cfg(target_os = "android")]` with no trait to implement.
 
 ### The bits per pixel figure is one measurement divided by one resolution
 
@@ -717,9 +717,9 @@ in `unsupported.rs:12-13` with a good message and no compile-time signal.
 
 Unavoidable: the runner scaffolding, a Media Foundation or D3D11VA decoder, and
 a `FlutterDesktopGpuSurfaceDescriptor` texture over a shared `ID3D11Texture2D`.
-`tachyx-glctx` produces nothing off Linux and `TEXTURE_2D` at
-`linux/mod.rs:23` is dead there, so the Linux path transfers no better than the
-Android one. A second build environment is required because the flake cannot
+The `glctx` module of `tachyx-unsafe` produces nothing off Linux and
+`TEXTURE_2D` at `linux/mod.rs:23` is dead there, so the Linux path transfers no
+better than the Android one. A second build environment is required because the flake cannot
 produce one.
 
 Avoidable: the same five items as iOS.

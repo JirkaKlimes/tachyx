@@ -2292,14 +2292,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tachyx-dmabuf"
-version = "0.1.0"
-dependencies = [
- "gstreamer",
- "gstreamer-allocators",
-]
-
-[[package]]
 name = "tachyx-driver"
 version = "0.1.0"
 dependencies = [
@@ -2313,15 +2305,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "tachyx-glctx"
-version = "0.1.0"
-dependencies = [
- "gstreamer-gl",
- "gstreamer-gl-egl",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2370,8 +2353,8 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "rustix",
- "tachyx-dmabuf",
  "tachyx-proto",
+ "tachyx-unsafe",
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
@@ -2387,14 +2370,6 @@ dependencies = [
  "reed-solomon-simd",
  "serde",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "tachyx-surface"
-version = "0.1.0"
-dependencies = [
- "jni",
- "ndk",
 ]
 
 [[package]]
@@ -2418,6 +2393,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachyx-unsafe"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "gstreamer-allocators",
+ "gstreamer-gl",
+ "gstreamer-gl-egl",
+ "jni",
+ "ndk",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "tachyx-video"
 version = "0.1.0"
 dependencies = [
@@ -2427,9 +2415,8 @@ dependencies = [
  "gstreamer-video",
  "irondash_texture",
  "ndk",
- "tachyx-glctx",
  "tachyx-proto",
- "tachyx-surface",
+ "tachyx-unsafe",
  "thiserror 2.0.20",
  "tracing",
 ]

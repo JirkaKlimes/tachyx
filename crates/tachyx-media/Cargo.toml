@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tachyx-dmabuf.workspace = true
 tachyx-proto.workspace = true
+tachyx-unsafe.workspace = true
 
 gbm.workspace = true
 gstreamer.workspace = true
