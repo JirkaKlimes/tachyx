@@ -495,14 +495,14 @@ async fn run(
         )?))
         .await?;
 
-    let mut rate_tick = tokio::time::interval(RATE_INTERVAL);
+    let mut rate_tick = ticker(RATE_INTERVAL);
     // The interval is the protocol's, not this daemon's: the client reads
     // liveness from a beat that did not arrive, so it has to expect the same
     // one the host keeps.
-    let mut heartbeat_tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat_tick = ticker(HEARTBEAT_INTERVAL);
     let mut cursor = CursorFeed::new(capture_size);
-    let mut cursor_tick = tokio::time::interval(cursor::INTERVAL);
-    let mut key_frame_tick = tokio::time::interval(KEY_FRAME_MAX_AGE / 4);
+    let mut cursor_tick = ticker(cursor::INTERVAL);
+    let mut key_frame_tick = ticker(KEY_FRAME_MAX_AGE / 4);
 
     let outcome = loop {
         tokio::select! {
@@ -558,6 +558,19 @@ async fn run(
     drop(pump);
     capture.stop()?;
     outcome
+}
+
+/// A periodic tick that does not try to catch up.
+///
+/// Every tick in this loop carries a control message, and tokio's default is to
+/// fire once for each tick a stall went past. That answers a stall with a burst
+/// of cursor updates and heartbeats queued in front of the video the stall
+/// already delayed. Each of these reports the state at the moment it runs, so a
+/// tick that was missed has nothing left to say and the phase is what matters.
+fn ticker(period: std::time::Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
 }
 
 /// Puts encoded pictures on the wire, on a thread of its own.
