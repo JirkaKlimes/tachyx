@@ -84,7 +84,22 @@ class _SessionScreenState extends State<SessionScreen>
   Timer? _linger;
   bool _showStats = true;
   bool _showBar = true;
-  SessionStats? _stats;
+
+  /// The counters, held apart from the element tree.
+  ///
+  /// They are read ten times a second and the panel is the only thing that
+  /// wants them. Kept as state they would lay the picture, the touch surface
+  /// and the pointer out again on every sample, for text nobody may even be
+  /// looking at.
+  final ValueNotifier<SessionStats?> _stats = ValueNotifier<SessionStats?>(
+    null,
+  );
+
+  /// What the host says it is coding, which is the one part of a sample the
+  /// picture itself is built from. It moves when the host changes rung, not on
+  /// the sampling clock, so it stays state and rebuilds when it really changes.
+  Encoding? _encoding;
+
   Presentation? _presentation;
   bool _presenting = false;
   Encoding? _sized;
@@ -162,6 +177,7 @@ class _SessionScreenState extends State<SessionScreen>
     _keys.detach();
     _soft.hide();
     _cursor.dispose();
+    _stats.dispose();
     _pipe.detach();
     unawaited(_presentation?.close() ?? Future<void>.value());
     super.dispose();
@@ -201,7 +217,11 @@ class _SessionScreenState extends State<SessionScreen>
 
   void _sample() {
     if (!mounted) return;
-    setState(() => _stats = widget.session?.stats());
+    final SessionStats? stats = widget.session?.stats();
+    _stats.value = stats;
+    final Encoding? encoding = stats?.encoding;
+    if (encoding == _encoding) return;
+    setState(() => _encoding = encoding);
     _rescale();
     _resize();
   }
@@ -212,7 +232,7 @@ class _SessionScreenState extends State<SessionScreen>
   /// rung, and the surface the decoder draws into has to be built for the same
   /// size or the compositor reads a buffer that is not the shape it thinks.
   void _resize() {
-    final Encoding? encoding = _stats?.encoding;
+    final Encoding? encoding = _encoding;
     final Presentation? presentation = _presentation;
     if (encoding == null || presentation == null) return;
     if (_sized?.codedWidth == encoding.codedWidth &&
@@ -230,7 +250,7 @@ class _SessionScreenState extends State<SessionScreen>
   /// that it is the ratio of the visible picture to the box it is drawn in.
   void _rescale() {
     final MediaQueryData media = MediaQuery.of(context);
-    final Encoding? encoding = _stats?.encoding;
+    final Encoding? encoding = _encoding;
     final Size image = encoding == null
         ? media.size * media.devicePixelRatio
         : Size(
@@ -287,7 +307,7 @@ class _SessionScreenState extends State<SessionScreen>
     if (presentation == null) {
       return VideoSurface(reason: _videoFault ?? _noSessionReason());
     }
-    final Encoding? encoding = _stats?.encoding;
+    final Encoding? encoding = _encoding;
     return VideoTextureView(
       textureId: presentation.textureId,
       aspectRatio: encoding == null
@@ -327,13 +347,21 @@ class _SessionScreenState extends State<SessionScreen>
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
                   child: IgnorePointer(
-                    child: StatsOverlay(
-                      host: widget.address,
-                      protocolVersion: widget.protocolVersion,
-                      eventsSent: _pipe.sent,
-                      lastEvent: _pipe.last,
-                      keyboardUp: keyboardUp,
-                      stats: _stats,
+                    child: ValueListenableBuilder<SessionStats?>(
+                      valueListenable: _stats,
+                      builder:
+                          (
+                            BuildContext context,
+                            SessionStats? stats,
+                            Widget? _,
+                          ) => StatsOverlay(
+                            host: widget.address,
+                            protocolVersion: widget.protocolVersion,
+                            eventsSent: _pipe.sent,
+                            lastEvent: _pipe.last,
+                            keyboardUp: keyboardUp,
+                            stats: stats,
+                          ),
                     ),
                   ),
                 ),

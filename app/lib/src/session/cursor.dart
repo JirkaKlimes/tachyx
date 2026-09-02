@@ -175,9 +175,10 @@ class CursorFeed {
       return;
     }
     final rust.CursorShape? shape = reading.image;
-    if (shape != null && shape.serial != BigInt.from(_art?.serial ?? -1)) {
+    if (shape != null && shape.serial.toInt() != (_art?.serial ?? -1)) {
       unawaited(_decode(shape));
     }
+    if (_drawn(reading)) return;
     cursor.value = RemoteCursor(
       x: reading.x,
       y: reading.y,
@@ -186,6 +187,20 @@ class CursorFeed {
       // one meanwhile would blink the pointer on every widget it crosses.
       art: _art,
     );
+  }
+
+  /// Whether [reading] is already what the notifier holds.
+  ///
+  /// The notifier drops a value equal to the one it has, so this changes no
+  /// behaviour. It only keeps a pointer that is standing still from allocating
+  /// a reading a frame to be thrown away.
+  bool _drawn(rust.Cursor reading) {
+    final RemoteCursor? held = cursor.value;
+    return held != null &&
+        held.x == reading.x &&
+        held.y == reading.y &&
+        held.confirmed == reading.confirmed &&
+        identical(held.art, _art);
   }
 
   /// Decodes the picture behind [shape], if the session still has it.
