@@ -1,4 +1,4 @@
-//! Screen capture and hardware H.264 encode for the tachyx host.
+//! Screen capture and hardware video encode for the tachyx host.
 //!
 //! Two threads and one slot between them.
 //!
@@ -38,6 +38,7 @@ pub use capture::{
 };
 pub use encode::{
     AccessUnit, AccessUnits, EncodeConfig, EncodeStats, Encoder, Idle, Percentiles, StreamGeometry,
+    encoders,
 };
 
 /// Why capture or encode could not be set up or carried on.
@@ -81,6 +82,13 @@ pub enum Error {
     /// GStreamer does not have an element the pipeline needs.
     #[error("gstreamer has no {0} element")]
     MissingElement(&'static str),
+    /// This machine has no encoder for the codec the session settled on.
+    ///
+    /// A negotiation that got this far chose from what [`encoders`] reported,
+    /// so reaching here means the registry answered one thing and the element
+    /// factory another.
+    #[error("this machine has no {0} encoder")]
+    MissingEncoder(tachyx_proto::control::Codec),
     /// GStreamer reported a failure.
     #[error("gstreamer: {0}")]
     Gst(String),
@@ -158,7 +166,7 @@ impl core::fmt::Display for Size {
     }
 }
 
-/// A size the H.264 encoder will accept.
+/// A size every encoder this host may negotiate onto will accept.
 ///
 /// Odd dimensions cannot be coded in 4:2:0 at all, and the hardware refuses
 /// anything outside 128 to 4096. Both are checked once, here, so the pipeline
@@ -184,9 +192,15 @@ pub enum BadEncodeSize {
 }
 
 impl EncodeSize {
-    /// Smallest dimension `vah264enc` advertises on its sink pad.
+    /// Smallest dimension the VA encoders advertise on their sink pads.
     pub const MIN: u32 = 128;
-    /// Largest dimension `vah264enc` advertises on its sink pad.
+    /// Largest dimension every VA encoder advertises on its sink pad.
+    ///
+    /// The narrowest of them, because the codec is chosen per session and a
+    /// size accepted by one and refused by another would be a ladder that works
+    /// until the negotiation changes. Measured on this part: `vah264enc` takes
+    /// 128 to 4096 in both axes and `vaav1enc` takes 128 to 8192 by 128 to
+    /// 4352, so this is H.264's ceiling.
     pub const MAX: u32 = 4096;
 
     /// A size to encode at.

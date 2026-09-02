@@ -1,5 +1,5 @@
-//! Captures an output, encodes it through `vapostproc` and `vah264enc`, and
-//! writes the result as an Annex B stream.
+//! Captures an output, encodes it through `vapostproc` and one of the VA
+//! encoders, and writes the result as an elementary stream.
 //!
 //! The point of this example is the shared buffer. Everything else here is
 //! reporting: if the descriptor the compositor filled does not import into the
@@ -14,7 +14,7 @@
 //!
 //! ```zsh
 //! nix develop --command cargo run --release -p tachyx-media \
-//!   --example encode -- --output DP-2 --dir /tmp/enc --frames 400
+//!   --example encode -- --output DP-2 --dir /tmp/enc --frames 400 --codec av1
 //! ```
 
 use std::fs::File;
@@ -23,12 +23,53 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tachyx_media::{
     AccessUnits, Bitrate, Capture, CaptureStats, EncodeConfig, EncodeSize, EncodeStats, Encoder,
     Framerate, Rate,
 };
+use tachyx_proto::control::Codec;
 use tachyx_proto::media::FrameKind;
+
+/// The codec to ask the host's hardware for, as a command line word.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Wanted {
+    /// H.264.
+    H264,
+    /// AV1.
+    Av1,
+}
+
+impl Wanted {
+    /// What the bitstream files are named, so a player picks the right parser.
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Av1 => "obu",
+        }
+    }
+}
+
+impl From<Wanted> for Codec {
+    fn from(wanted: Wanted) -> Self {
+        match wanted {
+            Wanted::H264 => Self::H264,
+            Wanted::Av1 => Self::Av1,
+        }
+    }
+}
+
+/// The codec asked for, checked against what this machine really has.
+fn chosen(wanted: Wanted) -> Result<Codec, Box<dyn std::error::Error>> {
+    let codec = Codec::from(wanted);
+    let available = tachyx_media::encoders()?;
+    println!("encoders    {available:?}");
+    if available.contains(codec) {
+        Ok(codec)
+    } else {
+        Err(format!("this machine has no {codec} encoder").into())
+    }
+}
 
 /// What to capture and encode, and where to put it.
 #[derive(Debug, Parser)]
@@ -36,6 +77,9 @@ struct Args {
     /// Output to capture, as the compositor names it.
     #[arg(long, default_value = "DP-2")]
     output: String,
+    /// Codec to encode in. It must be one this machine really has.
+    #[arg(long, value_enum, default_value_t = Wanted::H264)]
+    codec: Wanted,
     /// Access units to collect in each phase.
     #[arg(long, default_value_t = 400)]
     frames: usize,
@@ -46,7 +90,7 @@ struct Args {
     /// Target bitrate in kilobits per second.
     #[arg(long, default_value_t = 20_000)]
     kbps: u32,
-    /// Directory to write the Annex B streams into.
+    /// Directory to write the elementary streams into.
     #[arg(long)]
     dir: PathBuf,
     /// Walk the ladder, the bitrate and the frame rate on one running pipeline.
@@ -60,6 +104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.dir)?;
+
+    let codec = chosen(args.codec)?;
 
     let (capture, frames) = Capture::start(&args.output)?;
     let format = capture.format().clone();
@@ -80,9 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format.modifier,
         format.render_node.display()
     );
-    println!("encode      {} at {}", size.visible(), rate.bitrate);
+    println!("encode      {codec} {} at {}", size.visible(), rate.bitrate);
 
-    let (encoder, units) = Encoder::start(frames, EncodeConfig { size, rate })?;
+    let (encoder, units) = Encoder::start(frames, EncodeConfig { codec, size, rate })?;
     let geometry = encoder.geometry();
     println!(
         "geometry    coded {} visible {} aspect {}:{}",
@@ -94,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         encoder,
         units,
         dir: args.dir.clone(),
+        suffix: args.codec.suffix(),
         frames: args.frames,
         seen: Marks::default(),
     };
@@ -105,11 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for height in [1080, 720] {
             let rung = EncodeSize::fit(format.size, height)?;
             run.phase(&format!("{}", rung.visible()), |run| {
-                Ok(run.encoder.set_resolution(rung)?)
+                run.encoder.set_resolution(rung);
+                Ok(())
             })?;
         }
         run.phase("back to native", |run| {
-            Ok(run.encoder.set_resolution(native)?)
+            run.encoder.set_resolution(native);
+            Ok(())
         })?;
         let doubled = Bitrate::from_kbps(args.kbps * 2).ok_or("a bitrate of zero")?;
         run.phase("bitrate doubled", |run| {
@@ -162,6 +211,8 @@ struct Run {
     encoder: Encoder,
     units: AccessUnits,
     dir: PathBuf,
+    /// See [`Wanted::suffix`].
+    suffix: &'static str,
     frames: usize,
     seen: Marks,
 }
@@ -198,12 +249,14 @@ impl Run {
         label: &str,
         change: impl FnOnce(&Self) -> Result<(), Box<dyn std::error::Error>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let path = self.dir.join(format!("{}.h264", label.replace(' ', "-")));
+        let path = self
+            .dir
+            .join(format!("{}.{}", label.replace(' ', "-"), self.suffix));
         let mut file = File::create(&path)?;
-        // The file has to open on a key frame to decode on its own. The key
-        // interval is 1024 pictures, so a phase that started wherever the last
-        // one left off would reference parameter sets a thousand frames behind
-        // it, which is exactly what a client joining late would see.
+        // The file has to open on a key frame to decode on its own. A phase
+        // that started wherever the last one left off would reference the
+        // parameter sets of a key frame far behind it, which is exactly what a
+        // client joining late would see.
         let prologue = self.until_key(&mut file)?;
 
         let applying = Instant::now();

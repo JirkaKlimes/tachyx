@@ -1,14 +1,19 @@
-//! The `vah264enc` pipeline: `appsrc ! vapostproc ! capsfilter ! vah264enc ! appsink`.
+//! The encode pipeline: `appsrc ! vapostproc ! capsfilter ! <encoder> ! appsink`.
 //!
 //! The source pushes the capture's own size and keeps that size for the life of
 //! the pipeline, because a fixed-size capture cannot renegotiate. The resolution
 //! ladder is a caps filter between the scaler and the encoder, which applies in
 //! 0.03 ms and takes effect on the very next frame.
+//!
+//! Which encoder is a runtime answer, not a build-time one. [`encoders`] asks
+//! the GStreamer registry what this machine has and the session negotiates from
+//! that against what the client says it can decode, so the same binary drives
+//! AV1 on a part that has an AV1 encoder and H.264 on one that does not.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -18,6 +23,7 @@ use gstreamer::prelude::*;
 use gstreamer_allocators::DmaBufAllocator;
 use gstreamer_app::{AppSink, AppSrc};
 use gstreamer_video as gst_video;
+use tachyx_proto::control::{Codec, Codecs};
 use tachyx_proto::media::{FrameId, FrameKind, Timestamp};
 
 use crate::capture::{CaptureFormat, Frames};
@@ -40,6 +46,22 @@ const MIN_KEYFRAME_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The NAL unit type that carries padding and nothing else.
 const NAL_FILLER: u8 = 12;
+
+/// The VA encoder elements each codec may be reached through, best name first.
+///
+/// A list rather than one name because the same codec is more than one element
+/// on some parts: Intel registers a low power encoder beside the ordinary one,
+/// and which of the two exists is a fact about the machine. Nothing here is
+/// assumed; [`encoders`] asks the registry.
+///
+/// VA and nothing else, which is the shape of the pipeline rather than a guess
+/// about the hardware: capture hands the scaler a shared buffer and the caps
+/// between the scaler and the encoder say `memory:VAMemory`, so an encoder that
+/// cannot take a VA surface has nothing to link to.
+const ENCODERS: [(Codec, &[&str]); 2] = [
+    (Codec::H264, &["vah264enc", "vah264lpenc"]),
+    (Codec::Av1, &["vaav1enc", "vaav1lpenc"]),
+];
 
 /// How long a still screen may bank credit for, as a fraction of a second.
 ///
@@ -65,6 +87,12 @@ const MAX_KEY_INTERVAL: u32 = 1024;
 /// What to encode, and at what rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeConfig {
+    /// The codec to encode in, which must be one [`encoders`] reported.
+    ///
+    /// Fixed for the life of the encoder. Changing it would mean a new
+    /// bitstream the client's decoder cannot be rebuilt for without losing the
+    /// picture, so it is negotiated once and never moved.
+    pub codec: Codec,
     /// Picture size to send. A lower rung costs the scaler work and saves the
     /// encoder more: measured on a 3440x1440 capture, the whole chain takes
     /// 7.56 ms at the capture's own size and 4.94 ms scaled to 2580x1080.
@@ -73,11 +101,31 @@ pub struct EncodeConfig {
     pub rate: Rate,
 }
 
+/// The codecs this machine can encode.
+///
+/// Read from the GStreamer registry, so a part with an AV1 encoder reports one
+/// and a part without reports only what it has. Nothing downstream may assume
+/// either: the answer is intersected with what the client says it decodes.
+///
+/// # Errors
+/// If GStreamer will not start.
+pub fn encoders() -> Result<Codecs, Error> {
+    gst::init()?;
+    Ok(ENCODERS
+        .iter()
+        .filter(|(_, names)| {
+            names
+                .iter()
+                .any(|name| gst::ElementFactory::find(name).is_some())
+        })
+        .fold(Codecs::NONE, |found, (codec, _)| found.with(*codec)))
+}
+
 /// The geometry a decoder needs, which the bitstream does not fully carry.
 ///
 /// H.264 expresses a size the macroblock grid cannot hold by coding a larger
 /// picture and attaching a crop, and the scaler's aspect correction never
-/// reaches the sequence parameter set at all, so all three travel in the stream
+/// reaches the sequence header at all, so all three travel in the stream
 /// configuration message instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamGeometry {
@@ -98,8 +146,15 @@ pub struct AccessUnit {
     pub captured: Timestamp,
     /// Whether the picture stands alone.
     pub kind: FrameKind,
-    /// The access unit in Annex B form, parameter sets included before every
-    /// key frame, filler removed.
+    /// The access unit in the codec's own elementary form, with everything a
+    /// decoder needs to start from a key frame in front of it and any padding
+    /// removed.
+    ///
+    /// H.264 is Annex B with the parameter sets before every key frame; AV1 is
+    /// one temporal unit of open bitstream units with the sequence header
+    /// before every key frame. Measured on this hardware, both encoders really
+    /// do repeat it: 4 key frames in a 200 picture AV1 run carried 4 sequence
+    /// headers.
     pub bytes: Vec<u8>,
 }
 
@@ -108,10 +163,11 @@ impl AccessUnit {
     /// hand to [`tachyx_proto::packet::AccessUnit::new`] without copying.
     ///
     /// There is exactly one, and the array type says so rather than implying a
-    /// choice that is not there. The encoder runs with `num-slices` at one
-    /// because more slices measured slower, so an access unit is one piece and
-    /// losing any datagram of it costs the whole picture. The protocol's slice
-    /// field is carrying nothing while that holds.
+    /// choice that is not there. Every encoder here is configured to code the
+    /// whole picture as one piece, H.264 with `num-slices` at one because more
+    /// slices measured slower and AV1 with one tile for the same reason, so
+    /// losing any datagram of an access unit costs the whole picture. The
+    /// protocol's slice field is carrying nothing while that holds.
     ///
     /// Bind the result before lending it, because the array is a temporary:
     /// `let slices = unit.slices();` then `AccessUnit::new(.., &slices)`.
@@ -428,6 +484,12 @@ impl Encoder {
         Arc::clone(&self.admission)
     }
 
+    /// The codec this encoder was negotiated onto.
+    #[must_use]
+    pub fn codec(&self) -> Codec {
+        self.control.codec
+    }
+
     /// The geometry the current settings produce.
     #[must_use]
     pub fn geometry(&self) -> StreamGeometry {
@@ -479,10 +541,7 @@ impl Encoder {
     /// Moves to another rung of the resolution ladder.
     ///
     /// Takes effect on the very next frame and drops nothing.
-    ///
-    /// # Errors
-    /// If the filter caps cannot be built.
-    pub fn set_resolution(&self, size: EncodeSize) -> Result<(), Error> {
+    pub fn set_resolution(&self, size: EncodeSize) {
         {
             let mut settings = self
                 .control
@@ -492,7 +551,6 @@ impl Encoder {
             settings.size = size;
         }
         self.control.apply_size(size);
-        Ok(())
     }
 
     /// Asks for a key frame on the next picture, parameter sets included.
@@ -552,6 +610,9 @@ struct Control {
     filter: gst::Element,
     encoder: gst::Element,
     sink: AppSink,
+    /// Which bitstream the encoder is producing, which decides how an access
+    /// unit is read back out of it.
+    codec: Codec,
     settings: Mutex<Settings>,
     /// Nanoseconds between the frames the source caps declare.
     ///
@@ -584,8 +645,8 @@ impl Control {
         scaler.set_property("qos", false);
         scaler.set_property("add-borders", true);
         let filter = make("capsfilter")?;
-        let encoder = make("vah264enc")?;
-        configure_encoder(&encoder);
+        let encoder = encoder_for(config.codec)?;
+        configure_encoder(config.codec, &encoder);
         let sink = AppSink::builder()
             .sync(false)
             .max_buffers(1u32)
@@ -609,6 +670,7 @@ impl Control {
             filter,
             encoder,
             sink,
+            codec: config.codec,
             settings: Mutex::new(Settings {
                 size: config.size,
                 rate: config.rate,
@@ -766,6 +828,16 @@ fn make(element: &'static str) -> Result<gst::Element, Error> {
         .map_err(|_| Error::MissingElement(element))
 }
 
+/// The first of [`ENCODERS`]' names for `codec` that this machine really has.
+fn encoder_for(codec: Codec) -> Result<gst::Element, Error> {
+    ENCODERS
+        .iter()
+        .filter(|(known, _)| *known == codec)
+        .flat_map(|(_, names)| names.iter())
+        .find_map(|name| gst::ElementFactory::make(name).build().ok())
+        .ok_or(Error::MissingEncoder(codec))
+}
+
 /// Pictures allowed between key frames at `declared`, in the element's units.
 ///
 /// Counted from the frame rate rather than fixed, because the property counts
@@ -784,7 +856,14 @@ fn key_interval(declared: crate::Framerate) -> u32 {
         .clamp(1, MAX_KEY_INTERVAL)
 }
 
-fn configure_encoder(encoder: &gst::Element) {
+/// Writes the settings that never move once the pipeline is up.
+///
+/// Everything outside the `match` belongs to `GstVaBaseEnc` and is on every
+/// element in [`ENCODERS`]. Everything inside it belongs to one codec's own
+/// class, and writing a property an element does not have **panics** rather
+/// than failing, which is why the two are kept apart rather than tried and
+/// forgiven.
+fn configure_encoder(codec: Codec, encoder: &gst::Element) {
     // Variable bitrate rather than constant: constant pads every picture to the
     // target with filler, which was 87% of a static desktop's bitstream, and a
     // stream that is mostly padding makes the transport's bandwidth estimator
@@ -799,17 +878,34 @@ fn configure_encoder(encoder: &gst::Element) {
     // Measured: at a hundred the requested buffer is honoured and no filler
     // returns.
     encoder.set_property("target-percentage", 100u32);
-    encoder.set_property("b-frames", 0u32);
     encoder.set_property("ref-frames", 1u32);
-    encoder.set_property("aud", true);
-    // One slice: the hardware encodes the whole picture either way, and four
-    // slices measured worse, 8.81 ms mean against 7.30.
-    encoder.set_property("num-slices", 1u32);
     encoder.set_property_from_str("mbbrc", "disabled");
     encoder.set_property(
         "min-force-key-unit-interval",
         u64::try_from(MIN_KEYFRAME_INTERVAL.as_nanos()).unwrap_or(u64::MAX),
     );
+    match codec {
+        Codec::H264 => {
+            encoder.set_property("b-frames", 0u32);
+            encoder.set_property("aud", true);
+            // One slice: the hardware encodes the whole picture either way, and
+            // four slices measured worse, 8.81 ms mean against 7.30.
+            encoder.set_property("num-slices", 1u32);
+        }
+        Codec::Av1 => {
+            // AV1's shape of `b-frames=0`. The element's own words for this
+            // property are "setting to 1 disables all future reference", and a
+            // picture that refers forward is a picture the encoder cannot emit
+            // until the one after it has been coded, which is a whole frame of
+            // latency added to every frame.
+            encoder.set_property("hierarchical-level", 1u32);
+            // One tile, for the reason H.264 gets one slice: an access unit is
+            // one independently decodable piece, and the packetiser and the
+            // wire format are both built on that.
+            encoder.set_property("num-tile-cols", 1u32);
+            encoder.set_property("num-tile-rows", 1u32);
+        }
+    }
 }
 
 /// What the scaler will import, as modifiers per DRM format.
@@ -918,7 +1014,7 @@ fn pump(
         let elapsed = started.elapsed();
         drop(lease);
 
-        let Some(unit) = describe(&sample, next, counters) else {
+        let Some(unit) = describe(control.codec, &sample, next, counters) else {
             continue;
         };
         bucket.charge(unit.bytes.len());
@@ -944,13 +1040,18 @@ fn pump(
 }
 
 /// Turns one encoded sample into an access unit, dropping filler.
-fn describe(sample: &gst::Sample, id: u32, counters: &Counters) -> Option<AccessUnit> {
+fn describe(
+    codec: Codec,
+    sample: &gst::Sample,
+    id: u32,
+    counters: &Counters,
+) -> Option<AccessUnit> {
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;
     // Exactly the one allocation the access unit is handed on with. Filler has
     // measured at nought per cent, so this is also its final length.
     let mut bytes = Vec::with_capacity(map.size());
-    let filler = without_filler(&map, &mut bytes);
+    let filler = without_filler(codec, &map, &mut bytes);
     counters.filler.fetch_add(filler as u64, Ordering::Relaxed);
     counters
         .bytes
@@ -968,13 +1069,31 @@ fn describe(sample: &gst::Sample, id: u32, counters: &Counters) -> Option<Access
     })
 }
 
-/// Copies an Annex B access unit without its filler, returning the bytes left
-/// behind.
+/// Copies one access unit without the padding the encoder added, returning the
+/// bytes left behind.
 ///
-/// Filler is discardable by definition, so carrying it would spend the link on
-/// padding and, worse, make the transport's bandwidth estimate a measurement of
-/// that padding rather than of the path.
-fn without_filler(unit: &[u8], out: &mut Vec<u8>) -> usize {
+/// Padding is discardable by definition, so carrying it would spend the link on
+/// nothing and, worse, make the transport's bandwidth estimate a measurement of
+/// our own padding rather than of the path.
+///
+/// AV1 is copied whole. Its padding is an `OBU_PADDING` unit, and this encoder
+/// emits none: measured over 120 temporal units at 1920x1088 and 8 Mbit/s under
+/// variable bitrate, the stream held one sequence header, 120 temporal
+/// delimiters, 120 frame headers and 120 tile groups, and nothing else at all.
+/// Scanning every byte of every picture for a unit that is never there would be
+/// work spent on nothing.
+fn without_filler(codec: Codec, unit: &[u8], out: &mut Vec<u8>) -> usize {
+    match codec {
+        Codec::H264 => without_annex_b_filler(unit, out),
+        Codec::Av1 => {
+            out.extend_from_slice(unit);
+            0
+        }
+    }
+}
+
+/// Copies an Annex B access unit without its filler NAL units.
+fn without_annex_b_filler(unit: &[u8], out: &mut Vec<u8>) -> usize {
     let mut discarded = 0;
     let mut cursor = 0;
     while cursor < unit.len() {
@@ -1262,7 +1381,7 @@ mod tests {
         stream.extend(filler.clone());
         stream.extend(nal(5, 32));
         let mut out = Vec::new();
-        let discarded = without_filler(&stream, &mut out);
+        let discarded = without_filler(Codec::H264, &stream, &mut out);
         assert_eq!(discarded, filler.len());
         assert_eq!(out.len(), stream.len() - filler.len());
         let mut expected = nal(7, 8);
@@ -1276,7 +1395,7 @@ mod tests {
         let mut stream = nal(9, 1);
         stream.extend(nal(1, 64));
         let mut out = Vec::new();
-        assert_eq!(without_filler(&stream, &mut out), 0);
+        assert_eq!(without_filler(Codec::H264, &stream, &mut out), 0);
         assert_eq!(out, stream);
     }
 
@@ -1286,7 +1405,7 @@ mod tests {
         stream.extend([0, 0, 1, NAL_FILLER, 0xff, 0xff]);
         stream.extend([0, 0, 1, 1, 0x42]);
         let mut out = Vec::new();
-        assert_eq!(without_filler(&stream, &mut out), 6);
+        assert_eq!(without_filler(Codec::H264, &stream, &mut out), 6);
         assert_eq!(out, [0, 0, 1, 9, 0x10, 0, 0, 1, 1, 0x42]);
     }
 
