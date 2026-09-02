@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use tachyx_hostd::config::Config;
 use tachyx_hostd::session;
-use tachyx_proto::control::CodedSize;
+use tachyx_proto::control::{Codec, CodedSize};
 use tachyx_transport::TransportError;
 use tachyx_transport::endpoint::{Host, Tuning};
 use tachyx_transport::identity::HostIdentity;
@@ -38,6 +38,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&state)?;
 
     let identity = HostIdentity::load_or_create(&state)?;
+
+    // Probed here rather than when a client asks. The set comes from the
+    // GStreamer registry, so a daemon started outside the environment that
+    // holds the plugins finds nothing and can encode nothing, and every client
+    // that connects is then refused with "this host encodes nothing the client
+    // can decode": a sentence about the client, for a fault in the host, an
+    // hour of debugging away from the machine that has it.
+    let encoders = tachyx_media::encoders()?;
+    if encoders.best().is_none() {
+        return Err(
+            "no video encoder: the gstreamer registry offers none of vah264enc, vah264lpenc, \
+             vaav1enc or vaav1lpenc. the plugins are missing from this environment (run inside \
+             `nix develop`), or this machine has no va-api"
+                .into(),
+        );
+    }
+    tracing::info!(
+        encoders = Codec::PREFERENCE
+            .into_iter()
+            .filter(|codec| encoders.contains(*codec))
+            .map(|codec| codec.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        "video encoders probed from the gstreamer registry"
+    );
 
     // Sized before any client says what it wants, and deliberately not for the
     // largest picture imaginable. The send gate's bound IS this buffer, so a
