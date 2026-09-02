@@ -4,11 +4,35 @@ use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
 };
 use ndk::media::media_format::MediaFormat;
+use tachyx_proto::control::Codec;
 use tachyx_unsafe::surface::Surface;
 
 use super::Error;
 use super::bitstream::Coded;
-use super::hints::{LOW_LATENCY, MIME};
+use super::hints::{LOW_LATENCY, mime};
+
+/// Whether this device decodes `codec` in hardware.
+///
+/// `MediaCodec` names no direct question to ask before API 36, so the answer
+/// is read off the name of the decoder the platform would hand out, by the
+/// platform's own rule: `MediaCodecList` calls a component software when it is
+/// one of Android's own `c2.android.` or `OMX.google.` decoders, or when its
+/// name carries neither the `c2.` nor the `OMX.` prefix at all. Devices rank
+/// their hardware decoders above the software ones, so the default decoder
+/// being software means there is no hardware one to rank above it.
+pub(super) fn hardware(codec: Codec) -> bool {
+    fn prefixed(name: &str, prefix: &str) -> bool {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }
+    MediaCodec::from_decoder_type(mime(codec)).is_some_and(|decoder| {
+        decoder.name().is_ok_and(|name| {
+            (prefixed(&name, "c2.") || prefixed(&name, "OMX."))
+                && !prefixed(&name, "c2.android.")
+                && !prefixed(&name, "OMX.google.")
+        })
+    })
+}
 
 /// Whether the decoder took the access unit it was offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +58,8 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// Starts a decoder for a `coded` stream, drawing into `surface`.
+    /// Starts a decoder for a `coded` stream of `codec`, drawing into
+    /// `surface`.
     ///
     /// No codec configuration is supplied out of band. The host repeats the
     /// parameter sets before every key frame, so a decoder set up from the
@@ -42,16 +67,17 @@ impl Decoder {
     /// anything being said to it.
     ///
     /// # Errors
-    /// If the device has no H.264 decoder, or none would take the stream even
-    /// with every latency request dropped.
-    pub(super) fn open(surface: &Surface, coded: Coded) -> Result<Self, Error> {
-        let mut refused = Error::NoDecoder;
+    /// If the device has no decoder for the codec, or none would take the
+    /// stream even with every latency request dropped.
+    pub(super) fn open(codec: Codec, surface: &Surface, size: Coded) -> Result<Self, Error> {
+        let mime = mime(codec);
+        let mut refused = Error::NoDecoder(codec);
         for keys in LOW_LATENCY {
-            let decoder = MediaCodec::from_decoder_type(MIME).ok_or(Error::NoDecoder)?;
+            let decoder = MediaCodec::from_decoder_type(mime).ok_or(Error::NoDecoder(codec))?;
             let mut format = MediaFormat::new();
-            format.set_str("mime", MIME);
-            format.set_i32("width", i32::from(coded.width));
-            format.set_i32("height", i32::from(coded.height));
+            format.set_str("mime", mime);
+            format.set_i32("width", i32::from(size.width));
+            format.set_i32("height", i32::from(size.height));
             for key in keys {
                 format.set_i32(key, 1);
             }
@@ -66,15 +92,16 @@ impl Decoder {
                 Ok(()) => {
                     return Ok(Self {
                         codec: decoder,
-                        coded,
+                        coded: size,
                         generation: surface.generation(),
                         stamp: 0,
                     });
                 }
                 Err(source) => {
                     refused = Error::Configure {
-                        width: coded.width,
-                        height: coded.height,
+                        codec,
+                        width: size.width,
+                        height: size.height,
                         source,
                     };
                 }

@@ -2,21 +2,23 @@
 
 use tachyx_proto::control::{Codec, Codecs};
 
-/// The codecs this client advertises on Android.
+/// The codecs this client can read on Android.
 ///
-/// H.264 and nothing else, and that is this client's decision rather than the
-/// device's limit: many Android parts decode AV1 in hardware. What stops it is
-/// [`super::bitstream`]. `MediaCodec` cannot be configured without the coded
-/// picture size, and this path takes that size out of the bitstream rather than
-/// out of the control stream, so that a decoder survives a reconnection and a
-/// resolution change with nothing said to it. That parser reads an H.264
-/// sequence parameter set. AV1 would need its own reader for a sequence header,
-/// and until one is written this set is what makes the absence safe rather than
-/// silent: the host is told exactly this and encodes something in it.
-pub(super) const DECODES: Codecs = Codecs::of(Codec::H264);
+/// The ceiling rather than the advertisement: everything here has a reader in
+/// [`super::bitstream`], which is what configures `MediaCodec` from the stream
+/// alone so that a decoder survives a reconnection and a resolution change with
+/// nothing said to it. What the client actually advertises is this set cut down
+/// to what the device decodes in hardware, and that is probed where the
+/// platform is in reach; see [`super::present::decoders`].
+pub(super) const DECODES: Codecs = Codecs::of(Codec::H264).with(Codec::Av1);
 
-/// The codec [`DECODES`] names, as `MediaCodec` spells it.
-pub(super) const MIME: &str = "video/avc";
+/// A codec's name as `MediaCodec` spells it.
+pub(super) fn mime(codec: Codec) -> &'static str {
+    match codec {
+        Codec::H264 => "video/avc",
+        Codec::Av1 => "video/av01",
+    }
+}
 
 /// What the decoder is asked for in the way of latency, from everything down to
 /// nothing.
@@ -30,8 +32,8 @@ pub(super) const MIME: &str = "video/avc";
 /// The keys deliberately absent matter as much. The operating rate crashes
 /// several shipping devices outright. The output reorder depth and the maximum
 /// B frame count are encoder settings and do nothing to a decoder; what they
-/// would have asked for is already true, because the host's sequence parameter
-/// set declares that the stream reorders nothing.
+/// would have asked for is already true, because the host's stream declares
+/// that it reorders nothing.
 pub(super) const LOW_LATENCY: [&[&str]; 3] = [
     &[
         "low-latency",
@@ -47,7 +49,7 @@ pub(super) const LOW_LATENCY: [&[&str]; 3] = [
 mod tests {
     use tachyx_proto::control::Codec;
 
-    use super::{DECODES, LOW_LATENCY, MIME};
+    use super::{DECODES, LOW_LATENCY, mime};
 
     #[test]
     fn every_rung_asks_for_less_than_the_one_above_it() {
@@ -93,12 +95,10 @@ mod tests {
     }
 
     #[test]
-    fn the_mime_type_is_the_codec_this_client_advertises() {
-        assert_eq!(MIME, "video/avc");
+    fn every_codec_with_a_reader_has_a_name_mediacodec_knows() {
         assert!(DECODES.contains(Codec::H264));
-        assert!(
-            !DECODES.contains(Codec::Av1),
-            "nothing here reads an AV1 sequence header, so nothing may claim to"
-        );
+        assert!(DECODES.contains(Codec::Av1));
+        assert_eq!(mime(Codec::H264), "video/avc");
+        assert_eq!(mime(Codec::Av1), "video/av01");
     }
 }

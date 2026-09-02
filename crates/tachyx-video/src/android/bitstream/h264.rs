@@ -1,20 +1,6 @@
-//! What the client has to read out of the bytes it is handed.
-//!
-//! The host repeats the parameter sets in the stream before every key frame, so
-//! the decoder configures itself and needs no separate configuration step, no
-//! step to repeat after a reconnection, and none after a resolution change.
-//! Two things still have to be read here, and both are read from the stream
-//! rather than from the host's stream configuration message, because the stream
-//! is what the decoder is actually going to see:
-//!
-//! - the coded size, which `MediaCodec` demands before it will start, and which
-//!   changes mid-stream when the host changes resolution;
-//! - whether a unit can be decoded on its own, which is where a decoder that has
-//!   fallen behind is allowed to start again.
-//!
-//! Everything here is arithmetic over a byte slice, so all of it is exercised by
-//! the tests at the bottom against sequence parameter sets taken off this host's
-//! own encoder.
+//! The H.264 reader: an Annex B access unit in, [`Unit`] out.
+
+use super::{Coded, Unit};
 
 /// A coded slice of a picture that refers back to others.
 const NAL_SLICE: u8 = 1;
@@ -30,124 +16,93 @@ const NAL_SPS: u8 = 7;
 const PROFILES_WITH_CHROMA: [u32; 13] =
     [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
 
-/// The picture size a sequence parameter set declares, in whole macroblocks.
+/// Reads what an Annex B access unit contains.
 ///
-/// This is what the decoder writes and what the surface it writes into has to be
-/// sized for. It is not what the viewer should see: H.264 states a size the
-/// macroblock grid cannot hold, such as 1080 rows or 2580 columns, by coding the
-/// next multiple up and attaching a crop rectangle. Nothing on the Android
-/// present path applies that rectangle, so the visible size travels in the
-/// host's stream configuration message and the application applies it when it
-/// draws.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Coded {
-    /// Width in pixels, always a multiple of sixteen.
-    pub(super) width: u16,
-    /// Height in pixels, always a multiple of sixteen.
-    pub(super) height: u16,
-}
-
-impl Coded {
-    /// Reads the coded size out of a sequence parameter set.
-    ///
-    /// `sps` is the unit including its one-byte header and still carrying the
-    /// emulation prevention bytes the byte stream format inserts.
-    ///
-    /// Everything before the size has to be read to reach it. Everything after
-    /// it is the application's business rather than the decoder's, so parsing
-    /// stops at `frame_mbs_only_flag` and never touches the crop rectangle.
-    pub(super) fn of(sps: &[u8]) -> Option<Self> {
-        let mut bits = Bits::after_header(sps)?;
-        let profile = bits.bits(8)?;
-        bits.bits(8)?;
-        bits.bits(8)?;
-        bits.unsigned()?;
-
-        if PROFILES_WITH_CHROMA.contains(&profile) {
-            let chroma = bits.unsigned()?;
-            if chroma == 3 {
-                bits.bit()?;
+/// This walks the start codes and looks at one byte of each unit. It never
+/// copies and never allocates, and it stops at the first coded slice: the
+/// parameter sets come before the picture and the picture is the end of the
+/// unit, so nothing past there can change either answer. That is what keeps a
+/// scan for start codes off the two hundred kilobytes of a key frame.
+pub(super) fn unit(bytes: &[u8]) -> Unit {
+    let mut unit = Unit {
+        coded: None,
+        key: false,
+    };
+    for nal in Nals::of(bytes) {
+        match nal.first().map(|header| header & 0x1f) {
+            Some(NAL_SPS) => unit.coded = coded(nal),
+            Some(NAL_IDR_SLICE) => {
+                unit.key = true;
+                break;
             }
-            bits.unsigned()?;
-            bits.unsigned()?;
-            bits.bit()?;
-            if bits.bit()? == 1 {
-                bits.skip_scaling_lists(if chroma == 3 { 12 } else { 8 })?;
-            }
-        }
-
-        bits.unsigned()?;
-        match bits.unsigned()? {
-            0 => {
-                bits.unsigned()?;
-            }
-            1 => {
-                bits.bit()?;
-                bits.signed()?;
-                bits.signed()?;
-                let cycle = bits.unsigned()?;
-                // The specification caps this at 255. A larger one is a
-                // misparse or a corrupt unit, and reading it would be a loop
-                // over a number a hostile stream chose.
-                if cycle > 255 {
-                    return None;
-                }
-                for _ in 0..cycle {
-                    bits.signed()?;
-                }
-            }
+            Some(NAL_SLICE) => break,
             _ => {}
         }
+    }
+    unit
+}
+
+/// Reads the coded size out of a sequence parameter set, in whole macroblocks.
+///
+/// `sps` is the unit including its one-byte header and still carrying the
+/// emulation prevention bytes the byte stream format inserts.
+///
+/// Everything before the size has to be read to reach it. Everything after
+/// it is the application's business rather than the decoder's, so parsing
+/// stops at `frame_mbs_only_flag` and never touches the crop rectangle.
+fn coded(sps: &[u8]) -> Option<Coded> {
+    let mut bits = Bits::after_header(sps)?;
+    let profile = bits.bits(8)?;
+    bits.bits(8)?;
+    bits.bits(8)?;
+    bits.unsigned()?;
+
+    if PROFILES_WITH_CHROMA.contains(&profile) {
+        let chroma = bits.unsigned()?;
+        if chroma == 3 {
+            bits.bit()?;
+        }
+        bits.unsigned()?;
         bits.unsigned()?;
         bits.bit()?;
-
-        let width_in_macroblocks = bits.unsigned()?.checked_add(1)?;
-        let height_in_map_units = bits.unsigned()?.checked_add(1)?;
-        let fields = 2 - bits.bit()?;
-
-        Some(Self {
-            width: u16::try_from(width_in_macroblocks.checked_mul(16)?).ok()?,
-            height: u16::try_from(height_in_map_units.checked_mul(16 * fields)?).ok()?,
-        })
+        if bits.bit()? == 1 {
+            bits.skip_scaling_lists(if chroma == 3 { 12 } else { 8 })?;
+        }
     }
-}
 
-/// What one access unit turns out to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct AccessUnit<'a> {
-    /// The sequence parameter set it carries, if it carries one.
-    pub(super) parameters: Option<&'a [u8]>,
-    /// Whether it can be decoded with nothing before it.
-    pub(super) key: bool,
-}
-
-impl<'a> AccessUnit<'a> {
-    /// Reads what an Annex B access unit contains.
-    ///
-    /// Only the two facts above are wanted, so this walks the start codes and
-    /// looks at one byte of each unit. It never copies and never allocates, and
-    /// it stops at the first coded slice: the parameter sets come before the
-    /// picture and the picture is the end of the unit, so nothing past there can
-    /// change either answer. That is what keeps a scan for start codes off the
-    /// two hundred kilobytes of a key frame.
-    pub(super) fn of(bytes: &'a [u8]) -> Self {
-        let mut unit = Self {
-            parameters: None,
-            key: false,
-        };
-        for nal in Nals::of(bytes) {
-            match nal.first().map(|header| header & 0x1f) {
-                Some(NAL_SPS) => unit.parameters = Some(nal),
-                Some(NAL_IDR_SLICE) => {
-                    unit.key = true;
-                    break;
-                }
-                Some(NAL_SLICE) => break,
-                _ => {}
+    bits.unsigned()?;
+    match bits.unsigned()? {
+        0 => {
+            bits.unsigned()?;
+        }
+        1 => {
+            bits.bit()?;
+            bits.signed()?;
+            bits.signed()?;
+            let cycle = bits.unsigned()?;
+            // The specification caps this at 255. A larger one is a
+            // misparse or a corrupt unit, and reading it would be a loop
+            // over a number a hostile stream chose.
+            if cycle > 255 {
+                return None;
+            }
+            for _ in 0..cycle {
+                bits.signed()?;
             }
         }
-        unit
+        _ => {}
     }
+    bits.unsigned()?;
+    bits.bit()?;
+
+    let width_in_macroblocks = bits.unsigned()?.checked_add(1)?;
+    let height_in_map_units = bits.unsigned()?.checked_add(1)?;
+    let fields = 2 - bits.bit()?;
+
+    Some(Coded {
+        width: u16::try_from(width_in_macroblocks.checked_mul(16)?).ok()?,
+        height: u16::try_from(height_in_map_units.checked_mul(16 * fields)?).ok()?,
+    })
 }
 
 /// The units of an Annex B byte stream.
@@ -284,7 +239,8 @@ impl<'a> Bits<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessUnit, Coded};
+    use super::super::Coded;
+    use super::{coded, unit};
 
     /// A 3440x1440 sequence parameter set, taken off this host's own encoder.
     const SPS_3440X1440: &[u8] = &[
@@ -332,14 +288,14 @@ mod tests {
     #[test]
     fn a_parameter_set_states_the_size_the_decoder_writes() {
         assert_eq!(
-            Coded::of(SPS_3440X1440),
+            coded(SPS_3440X1440),
             Some(Coded {
                 width: 3440,
                 height: 1440
             })
         );
         assert_eq!(
-            Coded::of(SPS_1920X1088),
+            coded(SPS_1920X1088),
             Some(Coded {
                 width: 1920,
                 height: 1088
@@ -352,14 +308,14 @@ mod tests {
         // 2580x1080 and 1710x720 on the wire; the decoder writes the rounded up
         // sizes below and the crop that says so is never applied on this path.
         assert_eq!(
-            Coded::of(SPS_2592X1088),
+            coded(SPS_2592X1088),
             Some(Coded {
                 width: 2592,
                 height: 1088
             })
         );
         assert_eq!(
-            Coded::of(SPS_1728X720),
+            coded(SPS_1728X720),
             Some(Coded {
                 width: 1728,
                 height: 720
@@ -371,7 +327,7 @@ mod tests {
     fn the_size_changes_when_the_host_changes_resolution() {
         let sizes: Vec<Coded> = [SPS_3440X1440, SPS_2592X1088, SPS_1728X720]
             .into_iter()
-            .filter_map(Coded::of)
+            .filter_map(coded)
             .collect();
         assert_eq!(sizes.len(), 3);
         assert_ne!(sizes[0], sizes[1]);
@@ -380,33 +336,30 @@ mod tests {
 
     #[test]
     fn nothing_that_is_not_a_parameter_set_is_read_as_one() {
-        assert_eq!(Coded::of(PPS), None);
-        assert_eq!(Coded::of(&[]), None);
-        assert_eq!(Coded::of(&[0x27]), None);
+        assert_eq!(coded(PPS), None);
+        assert_eq!(coded(&[]), None);
+        assert_eq!(coded(&[0x27]), None);
         // A parameter set cut off partway through, which is what a lost
         // fragment would leave behind.
         for cut in 1..SPS_3440X1440.len() - 4 {
-            let _ = Coded::of(&SPS_3440X1440[..cut]);
+            let _ = coded(&SPS_3440X1440[..cut]);
         }
     }
 
     #[test]
     fn a_key_frame_is_the_parameter_sets_and_a_refresh_slice() {
         let stream = annex_b(&[&[0x09, 0x10], SPS_3440X1440, PPS, &[0x25, 0x88, 0x80]]);
-        let unit = AccessUnit::of(&stream);
-        assert!(unit.key);
-        assert_eq!(
-            unit.parameters.and_then(Coded::of),
-            Coded::of(SPS_3440X1440)
-        );
+        let read = unit(&stream);
+        assert!(read.key);
+        assert_eq!(read.coded, coded(SPS_3440X1440));
     }
 
     #[test]
     fn a_later_frame_carries_neither() {
         let stream = annex_b(&[&[0x09, 0x30], &[0x21, 0x9a, 0x08]]);
-        let unit = AccessUnit::of(&stream);
-        assert!(!unit.key);
-        assert_eq!(unit.parameters, None);
+        let read = unit(&stream);
+        assert!(!read.key);
+        assert_eq!(read.coded, None);
     }
 
     #[test]
@@ -414,12 +367,9 @@ mod tests {
         let mut stream = vec![0, 0, 1];
         stream.extend_from_slice(SPS_1920X1088);
         stream.extend_from_slice(&[0, 0, 1, 0x25, 0x88]);
-        let unit = AccessUnit::of(&stream);
-        assert!(unit.key);
-        assert_eq!(
-            unit.parameters.and_then(Coded::of),
-            Coded::of(SPS_1920X1088)
-        );
+        let read = unit(&stream);
+        assert!(read.key);
+        assert_eq!(read.coded, coded(SPS_1920X1088));
     }
 
     #[test]
@@ -430,19 +380,16 @@ mod tests {
         // parameter set behind the slice is never seen.
         let mut stream = annex_b(&[&[0x09, 0x10], SPS_1920X1088, PPS, &[0x25, 0x88, 0x80]]);
         stream.extend_from_slice(&annex_b(&[SPS_3440X1440]));
-        let unit = AccessUnit::of(&stream);
-        assert!(unit.key);
-        assert_eq!(
-            unit.parameters.and_then(Coded::of),
-            Coded::of(SPS_1920X1088)
-        );
+        let read = unit(&stream);
+        assert!(read.key);
+        assert_eq!(read.coded, coded(SPS_1920X1088));
     }
 
     #[test]
     fn a_unit_with_no_start_code_at_all_holds_nothing() {
-        let unit = AccessUnit::of(&[0x27, 0x64, 0x00, 0x2a]);
-        assert!(!unit.key);
-        assert_eq!(unit.parameters, None);
+        let read = unit(&[0x27, 0x64, 0x00, 0x2a]);
+        assert!(!read.key);
+        assert_eq!(read.coded, None);
     }
 
     #[test]
@@ -450,9 +397,6 @@ mod tests {
         // The 3440x1440 set carries `00 00 03` three times. Reading it as
         // written would run the picture size off into the escape bytes.
         assert!(SPS_3440X1440.windows(3).any(|window| window == [0, 0, 3]));
-        assert_eq!(
-            Coded::of(SPS_3440X1440).map(|coded| coded.width),
-            Some(3440)
-        );
+        assert_eq!(coded(SPS_3440X1440).map(|size| size.width), Some(3440));
     }
 }

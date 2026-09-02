@@ -8,7 +8,7 @@ use ndk::media_error::MediaError;
 use tachyx_proto::control::{Codec, Codecs};
 use tachyx_unsafe::surface::Producer;
 
-use super::bitstream::{AccessUnit, Coded};
+use super::bitstream::{Coded, Unit};
 use super::decoder::{Decoder, Fed};
 use super::hints;
 use crate::stats::{Stats, Window};
@@ -54,11 +54,13 @@ pub enum Error {
         id: i64,
     },
     /// The device has no decoder for the codec the host encodes with.
-    #[error("this device has no H.264 decoder")]
-    NoDecoder,
+    #[error("this device has no {0} decoder")]
+    NoDecoder(Codec),
     /// No decoder would take the stream, down to the plainest configuration.
-    #[error("no H.264 decoder would take a {width}x{height} stream: {source}")]
+    #[error("no {codec} decoder would take a {width}x{height} stream: {source}")]
     Configure {
+        /// The codec the stream is in.
+        codec: Codec,
         /// The coded width offered.
         width: u16,
         /// The coded height offered.
@@ -86,13 +88,24 @@ pub enum Error {
     Thread(#[source] std::io::Error),
 }
 
-/// The codecs this client decodes on Android. See [`hints::DECODES`].
+/// The codecs this client advertises on Android.
+///
+/// H.264 is always in the set: every Android device is required to decode it,
+/// and in practice does so in hardware. AV1 is offered only when the device
+/// decodes it in hardware. Android's own software decoder exists nearly
+/// everywhere, but at sixty pictures a second it costs big cores and battery
+/// for a picture the hardware H.264 decoder produces at a fraction of the
+/// power, so a device without the hardware is better served by the older
+/// codec.
 ///
 /// # Errors
-/// Never. Nothing is probed: the limit is this client's own bitstream reader
-/// rather than the device.
+/// Never. A device whose platform refuses the probe simply advertises H.264.
 pub fn decoders() -> Result<Codecs, Error> {
-    Ok(hints::DECODES)
+    let mut set = Codecs::of(Codec::H264);
+    if super::decoder::hardware(Codec::Av1) {
+        set = set.with(Codec::Av1);
+    }
+    Ok(set)
 }
 
 /// A decoded video stream, drawn by Flutter from the decoder's own buffers.
@@ -124,6 +137,7 @@ impl VideoTexture {
 
         let shared = Arc::new(Shared {
             start: Instant::now(),
+            codec: OnceLock::new(),
             failure: OnceLock::new(),
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
@@ -143,19 +157,21 @@ impl VideoTexture {
         })
     }
 
-    /// Checks that the codec the host chose is one this client decodes.
+    /// Tells the decode thread which codec the host chose.
     ///
     /// Nothing else to do with it: the platform decoder is configured from the
     /// bitstream rather than from here, and it is opened when the first
-    /// sequence parameter set arrives.
+    /// parameter set arrives.
     ///
     /// # Errors
-    /// If it is not in [`decoders`]. The host picks from that set, so a codec
-    /// that reaches here is a negotiation that went wrong rather than a device
-    /// that could not keep up, and it is reported as such instead of decoding
-    /// into a black rectangle.
+    /// If it is not in [`hints::DECODES`]. The host picks from what the client
+    /// advertised, so a codec that reaches here is a negotiation that went
+    /// wrong rather than a device that could not keep up, and it is reported
+    /// as such instead of decoding into a black rectangle.
     pub fn decode(&self, codec: Codec) -> Result<(), Error> {
         if hints::DECODES.contains(codec) {
+            let _ = self.shared.codec.set(codec);
+            self.shared.wake.notify_one();
             return Ok(());
         }
         let refused = Error::UnexpectedCodec(codec);
@@ -255,6 +271,10 @@ impl fmt::Debug for VideoTexture {
 #[derive(Debug)]
 struct Shared {
     start: Instant,
+    /// The codec the host chose, set once [`VideoTexture::decode`] is told.
+    /// The decode thread cannot read a unit before knowing what it is written
+    /// in, and the host says which before it sends a picture.
+    codec: OnceLock<Codec>,
     failure: OnceLock<String>,
     state: Mutex<State>,
     wake: Condvar,
@@ -430,8 +450,15 @@ impl<'a> Decoding<'a> {
 
     /// Gives one access unit to a decoder that is right for it.
     fn offer(&mut self, unit: &[u8], at: Duration) -> Result<Took, Error> {
-        let read = AccessUnit::of(unit);
-        if let Some(coded) = read.parameters.and_then(Coded::of) {
+        // The host says which codec it encodes before it sends a picture, so
+        // by the time there is a unit to read there is a codec to read it as.
+        let Some(codec) = self.shared.codec.get().copied() else {
+            self.shared
+                .stall("the host has not said which codec the stream is in");
+            return Ok(Took::Dropped);
+        };
+        let read = Unit::of(codec, unit);
+        if let Some(coded) = read.coded {
             self.coded = Some(coded);
         }
         if self.shared.skipping(read.key) {
@@ -442,9 +469,9 @@ impl<'a> Decoding<'a> {
         // Nothing has said how large the pictures are, which is the one thing
         // the decoder cannot be started without. The next key frame carries it,
         // because the host repeats the parameter sets before every one.
-        let Some(coded) = self.coded else {
+        let Some(size) = self.coded else {
             self.shared
-                .stall("no sequence parameter set has arrived, so the picture size is unknown");
+                .stall("no parameter set has arrived, so the picture size is unknown");
             return Ok(Took::Dropped);
         };
         // A decoder that will not start is not the end of the path. The surface
@@ -452,7 +479,7 @@ impl<'a> Decoding<'a> {
         // that has just been abandoned refuses every codec until the next
         // arrives. So this is said rather than raised, and the next key frame
         // tries again.
-        if let Err(refused) = self.prepare(coded) {
+        if let Err(refused) = self.prepare(codec, size) {
             self.shared.stall(refused.to_string());
             return Ok(Took::Dropped);
         }
@@ -478,7 +505,7 @@ impl<'a> Decoding<'a> {
     /// running decoder at it keeps every reference picture, and the alternative
     /// is a still picture until the next key frame, which on a stream that is
     /// losing nothing can be minutes away.
-    fn prepare(&mut self, coded: Coded) -> Result<(), Error> {
+    fn prepare(&mut self, codec: Codec, size: Coded) -> Result<(), Error> {
         // Flutter has taken the surface back, which it does while the
         // application is not in front. The decoder keeps running into the
         // surface it already holds and its frames are thrown away undrawn, so
@@ -489,9 +516,9 @@ impl<'a> Decoding<'a> {
         if self
             .decoder
             .as_ref()
-            .is_none_or(|decoder| decoder.coded() != coded)
+            .is_none_or(|decoder| decoder.coded() != size)
         {
-            self.decoder = Some(Decoder::open(&surface, coded)?);
+            self.decoder = Some(Decoder::open(codec, &surface, size)?);
             self.in_flight = 0;
             return Ok(());
         }
