@@ -505,7 +505,6 @@ async fn run(
     let mut key_frame_tick = tokio::time::interval(KEY_FRAME_MAX_AGE / 4);
 
     let outcome = loop {
-        let now = Instant::now();
         tokio::select! {
             message = from_client.recv::<ClientMessage>() => match message {
                 Ok(ClientMessage::Input(batch)) => {
@@ -548,7 +547,11 @@ async fn run(
                 }
             }
         }
-        live.honour_owed(now);
+        // Read after the wait, not before it. A clock sampled ahead of the
+        // select is as old as whatever woke the loop, which on a quiet session
+        // is a whole heartbeat interval, and the budget then prices every
+        // deferred key frame against a moment that has already passed.
+        live.honour_owed(Instant::now());
     };
 
     drop(live);
