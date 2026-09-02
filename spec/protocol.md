@@ -1,4 +1,4 @@
-# tachyx wire protocol — draft 1
+# tachyx wire protocol — draft 2
 
 Status: draft. Covers only what the current milestone implements: one client, one
 host, one LAN. Pairing, authentication and relaying are specified elsewhere when
@@ -7,6 +7,11 @@ they exist.
 Draft 1 defines `slice_id` 255, which draft 0 reserved. A draft 0 client reads a
 parity packet as a slice of the picture and then completes no frame at all, so
 the version had to move rather than the field being added quietly.
+
+Draft 2 adds the set of codecs a client can decode to `ClientHello`. `postcard`
+writes no field names, so a draft 1 hello read as a draft 2 one ends a field
+short and a draft 2 hello read as a draft 1 one leaves a byte over. Neither
+fails to parse on its own, which is what the version exists to catch.
 
 ## Transport
 
@@ -75,6 +80,26 @@ The video path does not use this encoding, or serde at all. See below.
 : Decoders the client can drive (codec, profile, maximum level, resolution and
   frame rate, bit depth, chroma subsampling), the viewport in physical pixels,
   the device pixel ratio, and the requested resolution mode.
+
+  The codec part is a set, and at draft 2 it is the only part of that list that
+  is really there. Each end probes the machine it runs on rather than assuming
+  its platform: the client asks which decoder elements are installed, the host
+  asks which encoder elements are, and the host encodes the best codec the two
+  sets share. The preference is AV1 then H.264, written down once in the
+  protocol so that both ends can work out the same answer. H.264 is in both
+  sets on every platform either end ships for, so the fallback is not a
+  hypothetical branch. No codec in common ends the session: there is no picture
+  to send.
+
+  The set travels as a bit set rather than a list of codec names. `postcard`
+  refuses an enum discriminant it does not know, so a list carrying a codec
+  added in a later version would fail to decode and take the whole hello with
+  it; a bit nobody knows is simply never in an intersection.
+
+  The host reads the set at the hello and nowhere else. A client builds its
+  decoder once and cannot rebuild it without losing every reference picture it
+  holds, so the same set travels in every later `ViewportChanged` and means
+  nothing new there.
 
 `ViewportChanged`
 : The same capability payload, sent again. The host treats it as renegotiation.
@@ -154,12 +179,17 @@ statuses, and drops to every 250 ms while the host's announced bitrate is under
 `StreamConfig`
 : The host's decision: codec, coded size, visible size, display aspect ratio,
   frame rate and target bitrate. Re-sent whenever any of those change, including
-  a change forced by congestion. It carries no codec configuration bytes: the
-  parameter sets are repeated in the bitstream before every key frame, so the
-  decoder takes the new geometry from the stream itself and a resolution change
-  needs no separate configuration step. The display aspect is here because it is
-  the one thing the bitstream cannot say: the sequence parameter set of a 16:10
-  capture scaled to 16:9 declares no aspect ratio at all.
+  a change forced by congestion. Everything but the codec may change while a
+  session runs; the codec is settled at the hello and never moved.
+
+  It carries no codec configuration bytes: the parameter sets are repeated in
+  the bitstream before every key frame, so the decoder takes the new geometry
+  from the stream itself and a resolution change needs no separate
+  configuration step. That is measured rather than assumed for both codecs, and
+  the AV1 sequence header behaves as the H.264 parameter sets do: 4 key frames
+  in a 200 picture run carried 4 sequence headers. The display aspect is here
+  because it is the one thing the bitstream cannot say: the sequence parameter
+  set of a 16:10 capture scaled to 16:9 declares no aspect ratio at all.
 
 `Heartbeat`
 : Proof the host is alive, and what it has been doing: its session clock, the

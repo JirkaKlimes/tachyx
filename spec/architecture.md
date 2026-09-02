@@ -206,8 +206,11 @@ later. Low-latency settings: zero B-frames, slice encoding, tight VBV/CBR, intra
 **Decode/present (client)** — Vulkan Video / VideoToolbox / MediaCodec / WebCodecs; mailbox
 present mode; local cursor overlay; adaptive 0–2-frame jitter buffer.
 
-**Codec rollout:** H.264 MVP (decode literally everywhere incl. WebCodecs) → AV1 fast-follow
-(~half bitrate; big on mobile data) → HEVC only where hardware on both ends → 4:4:4 "text mode".
+**Codec rollout:** H.264 and AV1 are both negotiated today, per session, from what each end
+probes at run time; H.264 is the fallback and decodes literally everywhere incl. WebCodecs.
+Android advertises H.264 only, because its decoder is configured from the bitstream and only an
+H.264 sequence parameter set reader is written. Next: HEVC only where hardware on both ends →
+4:4:4 "text mode".
 
 **Web client:** WebTransport + WebCodecs, wasm client core, canvas/WebGPU present. Position as
 "check on your machine" — browser event loop will not match native input latency.
@@ -358,7 +361,7 @@ tachyx/
 
 ## 16. MVP & roadmap
 
-**MVP:** Wayland portal host · Linux/macOS/Android clients · H.264 · direct + relay ·
+**MVP:** Wayland portal host · Linux/macOS/Android clients · negotiated AV1 or H.264 · direct + relay ·
 PAKE pairing (QR + 8-digit) · fit-mode scaling · CLI incl. `doctor` · simple metered billing ·
 stats HUD.
 
