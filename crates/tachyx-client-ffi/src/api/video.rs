@@ -1,10 +1,9 @@
-//! The decode and present path, reached from Dart.
+//! What the decode and present path counts, reported to Dart.
 //!
 //! Dart never sees a frame. It gets a texture identifier to put in a `Texture`
 //! widget and hands encoded access units the other way, so the picture goes from
-//! the decoder to the compositor without crossing this boundary at all.
-
-use flutter_rust_bridge::frb;
+//! the decoder to the compositor without crossing this boundary at all. These
+//! figures are all that does cross it.
 
 /// A latency distribution over the last few hundred frames, in microseconds.
 #[derive(Debug, Clone, Copy)]
@@ -59,74 +58,4 @@ impl From<tachyx_video::Stats> for PresentStats {
             present: stats.present.into(),
         }
     }
-}
-
-/// A decoded stream, drawn by a Flutter `Texture` widget.
-///
-/// Holds [`tachyx_video::VideoTexture`] and adds nothing.
-#[frb(opaque)]
-#[derive(Debug)]
-pub struct VideoTexture {
-    core: tachyx_video::VideoTexture,
-}
-
-impl VideoTexture {
-    /// The identifier to give a `Texture` widget.
-    #[frb(sync)]
-    #[must_use]
-    pub fn id(&self) -> i64 {
-        self.core.id()
-    }
-
-    /// Hands one encoded access unit to the decoder.
-    ///
-    /// Synchronous, because a round trip through the isolate for every frame
-    /// would put the thing being measured inside the measurement.
-    ///
-    /// # Errors
-    /// If the decoder rejects the access unit.
-    #[frb(sync)]
-    pub fn push(&self, access_unit: Vec<u8>) -> anyhow::Result<()> {
-        self.core.push(access_unit)?;
-        Ok(())
-    }
-
-    /// Tells the decoder the stream has ended.
-    #[frb(sync)]
-    pub fn finish(&self) {
-        self.core.finish();
-    }
-
-    /// The first thing that went wrong, if anything has.
-    ///
-    /// A pipeline that cannot negotiate posts one message and then goes quiet,
-    /// so a client with no picture has nothing else to show the user.
-    #[frb(sync)]
-    #[must_use]
-    pub fn failure(&self) -> Option<String> {
-        self.core.failure()
-    }
-
-    /// What the path has counted so far.
-    #[frb(sync)]
-    #[must_use]
-    pub fn stats(&self) -> PresentStats {
-        self.core.stats().into()
-    }
-}
-
-/// Registers a texture with the engine.
-///
-/// `engine_handle` comes from the `irondash_engine_context` Dart plugin.
-/// Synchronous so that it runs on the platform thread, which is the only thread
-/// that can reach the engine's texture registry.
-///
-/// # Errors
-/// If GStreamer will not start, a decoder element is missing, or the engine
-/// refuses the texture.
-#[frb(sync)]
-pub fn open_video_texture(engine_handle: i64) -> anyhow::Result<VideoTexture> {
-    Ok(VideoTexture {
-        core: tachyx_video::VideoTexture::new(engine_handle)?,
-    })
 }

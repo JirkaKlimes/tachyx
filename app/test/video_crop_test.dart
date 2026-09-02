@@ -2,6 +2,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:tachyx/src/rust/api/session.dart' show Encoding;
+import 'package:tachyx/src/session/present.dart' show VideoCrop;
 import 'package:tachyx/src/ui/video_texture_view.dart';
 
 Encoding _encoding({

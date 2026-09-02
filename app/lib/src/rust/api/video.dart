@@ -7,48 +7,7 @@ import '../frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `fmt`, `fmt`, `fmt`, `from`, `from`
-
-/// Registers a texture with the engine.
-///
-/// `engine_handle` comes from the `irondash_engine_context` Dart plugin.
-/// Synchronous so that it runs on the platform thread, which is the only thread
-/// that can reach the engine's texture registry.
-///
-/// # Errors
-/// If GStreamer will not start, a decoder element is missing, or the engine
-/// refuses the texture.
-VideoTexture openVideoTexture({required PlatformInt64 engineHandle}) => RustLib
-    .instance
-    .api
-    .crateApiVideoOpenVideoTexture(engineHandle: engineHandle);
-
-// Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<VideoTexture>>
-abstract class VideoTexture implements RustOpaqueInterface {
-  /// The first thing that went wrong, if anything has.
-  ///
-  /// A pipeline that cannot negotiate posts one message and then goes quiet,
-  /// so a client with no picture has nothing else to show the user.
-  String? failure();
-
-  /// Tells the decoder the stream has ended.
-  void finish();
-
-  /// The identifier to give a `Texture` widget.
-  PlatformInt64 id();
-
-  /// Hands one encoded access unit to the decoder.
-  ///
-  /// Synchronous, because a round trip through the isolate for every frame
-  /// would put the thing being measured inside the measurement.
-  ///
-  /// # Errors
-  /// If the decoder rejects the access unit.
-  void push({required List<int> accessUnit});
-
-  /// What the path has counted so far.
-  PresentStats stats();
-}
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `fmt`, `fmt`, `from`, `from`
 
 /// A latency distribution over the last few hundred frames, in microseconds.
 class Latency {
