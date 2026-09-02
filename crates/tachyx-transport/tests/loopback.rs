@@ -16,17 +16,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tachyx_proto::VERSION;
 use tachyx_proto::control::{
-    Aspect, Capabilities, ClientHello, ClientMessage, Codec, CodedSize, HandshakeError, Heartbeat,
-    HostMessage, InputBatch, Size, StreamConfig, TimedInput,
+    Aspect, Capabilities, ClientHello, ClientMessage, Codec, Codecs, CodedSize, HandshakeError,
+    Heartbeat, HostMessage, InputBatch, Size, StreamConfig, TimedInput,
 };
 use tachyx_proto::input::{InputEvent, PointerButton, Press};
-use tachyx_proto::media::{FrameId, FrameKind, Timestamp, HEADER_LEN};
+use tachyx_proto::media::{FrameId, FrameKind, HEADER_LEN, Timestamp};
 use tachyx_proto::packet::{AccessUnit, Frame, Reassembler, ReassemblyStats};
-use tachyx_proto::VERSION;
 use tachyx_transport::{
-    video_send_buffer, Client, ClientSession, ControlError, ControlReader, ControlWriter, Host,
-    HostIdentity, HostSession, PinStore, Sent, TransportError, Tuning, VideoSender,
+    Client, ClientSession, ControlError, ControlReader, ControlWriter, Host, HostIdentity,
+    HostSession, PinStore, Sent, TransportError, Tuning, VideoSender, video_send_buffer,
 };
 
 /// How long the receiver waits for a frame that nothing follows.
@@ -172,6 +172,7 @@ fn capabilities() -> Capabilities {
         max_decode_fps: NonZeroU16::new(60).expect("nonzero"),
         requested_fps: NonZeroU16::new(60).expect("nonzero"),
         bitrate_ceiling: NonZeroU32::new(20_000_000).expect("nonzero"),
+        decode: Codecs::of(Codec::H264),
     }
 }
 

@@ -12,8 +12,9 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::time::{Duration, Instant};
 
 use tachyx_proto::control::{
-    Capabilities, ClientHello, ClientMessage, FEEDBACK_INTERVAL, FEEDBACK_SLOW_BELOW,
-    FEEDBACK_SLOW_INTERVAL, HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size, StreamConfig,
+    Capabilities, ClientHello, ClientMessage, Codec, Codecs, FEEDBACK_INTERVAL,
+    FEEDBACK_SLOW_BELOW, FEEDBACK_SLOW_INTERVAL, HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size,
+    StreamConfig,
 };
 use tachyx_proto::input::InputEvent;
 use tachyx_proto::media::{FrameId, MalformedPacket, Timestamp};
@@ -85,6 +86,11 @@ pub const BITRATE_CEILING: NonZeroU32 = NonZeroU32::new(20_000_000).unwrap();
 /// is never shown, so either one spends bandwidth, decode time and battery on
 /// something that cannot reach the user. The host's ladder is bounded by what is
 /// said here, so saying more than this asks for waste.
+///
+/// The codec set is the floor and not a claim: this crate touches nothing, and
+/// which codecs a machine really decodes is a question only the platform layer
+/// can answer. That layer says so with [`Capabilities::decoding`], and until it
+/// does the answer here is the one codec that needs no hardware newer than 2010.
 #[must_use]
 pub fn capabilities(viewport: Size, refresh: NonZeroU16) -> Capabilities {
     Capabilities {
@@ -93,6 +99,7 @@ pub fn capabilities(viewport: Size, refresh: NonZeroU16) -> Capabilities {
         max_decode_fps: refresh,
         requested_fps: refresh,
         bitrate_ceiling: BITRATE_CEILING,
+        decode: Codecs::of(Codec::H264),
     }
 }
 
@@ -467,7 +474,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use tachyx_proto::control::{
-        Aspect, Codec, CodedSize, FEEDBACK_INTERVAL, FEEDBACK_SLOW_BELOW, FEEDBACK_SLOW_INTERVAL,
+        Aspect, CodedSize, FEEDBACK_INTERVAL, FEEDBACK_SLOW_BELOW, FEEDBACK_SLOW_INTERVAL,
         Feedback, PacketArrival,
     };
     use tachyx_proto::input::{PointerButton, Press};
@@ -597,6 +604,16 @@ mod tests {
         assert_eq!(asked.max_decode_fps.get(), 120);
         assert_eq!(asked.requested_fps.get(), 120);
         assert_eq!(asked.bitrate_ceiling, BITRATE_CEILING);
+        assert_eq!(
+            asked.decode,
+            Codecs::of(Codec::H264),
+            "a crate that touches nothing may claim only the codec that needs no hardware"
+        );
+        assert_eq!(
+            asked.decoding(Codecs::of(Codec::Av1)).decode,
+            Codecs::of(Codec::Av1),
+            "and the platform layer that probed the machine replaces it"
+        );
     }
 
     #[test]

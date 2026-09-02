@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU16;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use flutter_rust_bridge::frb;
 use tachyx_driver::{FrameSink, Link};
@@ -188,13 +188,51 @@ pub struct SessionStats {
 #[derive(Debug)]
 struct Present {
     texture: tachyx_video::VideoTexture,
+    /// Where the host's choice of codec is read from.
+    ///
+    /// Weak, because the link owns this sink: an owning handle back would be a
+    /// cycle and neither end would ever be dropped.
+    link: Weak<Link>,
+    /// Set once the decoder has been told which codec to build for, whether or
+    /// not it managed to.
+    started: OnceLock<()>,
     refused: OnceLock<String>,
 }
 
 impl FrameSink for Present {
     fn push(&self, access_unit: Vec<u8>) {
+        self.start_decoding();
         if let Err(refused) = self.texture.push(access_unit) {
             let _ = self.refused.set(refused.to_string());
+        }
+    }
+}
+
+impl Present {
+    /// Builds the decode pipeline the first time the host's choice of codec is
+    /// known.
+    ///
+    /// Not in [`Session::present_on`], because a texture is registered on
+    /// Flutter's platform thread and may be registered before the host's first
+    /// `StreamConfig` has arrived. Here it cannot be too early: the host sends
+    /// that message on the control stream before it sends a picture, so by the
+    /// time there is an access unit to push there is a codec to read. Anything
+    /// pushed before the pipeline exists queues inside the texture.
+    fn start_decoding(&self) {
+        if self.started.get().is_some() {
+            return;
+        }
+        let Some(codec) = self
+            .link
+            .upgrade()
+            .and_then(|link| link.stats().stream)
+            .map(|stream| stream.codec)
+        else {
+            return;
+        };
+        let _ = self.started.set(());
+        if let Err(error) = self.texture.decode(codec) {
+            let _ = self.refused.set(error.to_string());
         }
     }
 }
@@ -269,7 +307,9 @@ pub struct CursorImage {
 #[frb(opaque)]
 #[derive(Debug)]
 pub struct Session {
-    link: Link,
+    /// Shared rather than owned outright, so that the sink can read the host's
+    /// choice of codec back out of it. See [`Present::start_decoding`].
+    link: Arc<Link>,
     present: Mutex<Option<Arc<Present>>>,
 }
 
@@ -282,12 +322,16 @@ impl Session {
     /// only one that can reach the engine's texture registry.
     ///
     /// # Errors
-    /// If GStreamer will not start, a decoder element is missing, the engine
-    /// refuses the texture, or this target presents some other way.
+    /// If GStreamer will not start, the engine refuses the texture, or this
+    /// target presents some other way. What the codec the host chose costs is
+    /// reported through [`SessionStats::video_fault`] instead, because the
+    /// pipeline for it is built on the first picture rather than here.
     #[frb(sync)]
     pub fn present_on(&self, engine_handle: i64) -> anyhow::Result<i64> {
         let present = Arc::new(Present {
             texture: tachyx_video::VideoTexture::new(engine_handle)?,
+            link: Arc::downgrade(&self.link),
+            started: OnceLock::new(),
             refused: OnceLock::new(),
         });
         let id = present.texture.id();
@@ -454,13 +498,21 @@ pub fn connect(
 ) -> anyhow::Result<Session> {
     let capabilities = asked_for(viewport_width, viewport_height, refresh_hz)?;
     Ok(Session {
-        link: Link::connect(&address, Path::new(&state_directory), capabilities)?,
+        link: Arc::new(Link::connect(
+            &address,
+            Path::new(&state_directory),
+            capabilities,
+        )?),
         present: Mutex::new(None),
     })
 }
 
 /// What the client can drive, once the numbers Dart measured are known to be
 /// numbers.
+///
+/// The codec set is probed here rather than assumed anywhere below, because
+/// this is the lowest layer that is allowed to touch the machine:
+/// `tachyx-client` does no I/O at all and cannot ask.
 fn asked_for(
     width: u16,
     height: u16,
@@ -470,5 +522,5 @@ fn asked_for(
         .ok_or_else(|| anyhow::anyhow!("a {width}x{height} viewport has no picture in it"))?;
     let refresh = NonZeroU16::new(refresh_hz)
         .ok_or_else(|| anyhow::anyhow!("a display that never refreshes cannot show a stream"))?;
-    Ok(tachyx_client::capabilities(viewport, refresh))
+    Ok(tachyx_client::capabilities(viewport, refresh).decoding(tachyx_video::decoders()?))
 }
