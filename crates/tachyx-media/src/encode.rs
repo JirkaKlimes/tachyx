@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -58,6 +58,9 @@ const BUCKET_CEILING: Duration = Duration::from_millis(100);
 /// cheaper repair. A client that notices asks for one sooner; this bounds the
 /// case where it does not notice, or where its request was refused.
 const KEY_FRAME_INTERVAL_SECONDS: u32 = 2;
+
+/// The largest `key-int-max` the element's property accepts.
+const MAX_KEY_INTERVAL: u32 = 1024;
 
 /// What to encode, and at what rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,8 +414,8 @@ impl Encoder {
     /// refused here never reaches the encoder, so the reference chain is
     /// unbroken and every picture that does go out stays decodable. Encoding a
     /// frame and then dropping it on the wire would instead corrupt the picture
-    /// until the next key frame, which with one reference frame and a key
-    /// interval of 1024 is many seconds away.
+    /// until the next key frame, which with one reference frame is up to
+    /// [`KEY_FRAME_INTERVAL_SECONDS`] away.
     ///
     /// It starts set, so an encoder nobody gates encodes everything. Refusals
     /// are counted in [`EncodeStats::refused`], apart from the frames capture
@@ -656,6 +659,13 @@ impl Control {
     /// scaler does not convert frame rate: a filter asking it for another rate
     /// fails to link.
     fn apply_rate(&self, rate: Rate) -> Result<(), Error> {
+        // Written before the caps, because the caps are what make the element
+        // read it. `key-int-max` is not one of the properties marked changeable
+        // while playing: the element stores the value and only builds a group
+        // of pictures out of it when it reconfigures, and the frame rate about
+        // to reach it through the source caps is what forces that.
+        self.encoder
+            .set_property("key-int-max", key_interval(rate.framerate));
         self.source.set_caps(Some(&self.source_caps(rate)?));
         self.encoder.set_property("bitrate", rate.bitrate.kbps());
         // Half the bitrate is the floor. A smaller value is silently replaced
@@ -731,6 +741,24 @@ fn make(element: &'static str) -> Result<gst::Element, Error> {
         .map_err(|_| Error::MissingElement(element))
 }
 
+/// Pictures allowed between key frames at `declared`, in the element's units.
+///
+/// Counted from the frame rate rather than fixed, because the property counts
+/// pictures and the ladder moves the rate under it: a hundred and twenty is two
+/// seconds at sixty hertz, eight seconds at the ladder's fifteen hertz floor,
+/// and one second at a hundred and twenty.
+///
+/// Two seconds is the ceiling on how long a picture stays wrong. With one
+/// reference frame and no intra refresh, a single frame lost on the wire leaves
+/// every frame after it undecodable until the next key frame, and measured on a
+/// phone that cost nine hundred frames out of two thousand eight hundred. Key
+/// frames are cheap enough to spend now that parity carries them and the
+/// picture is scaled to what the client shows.
+fn key_interval(declared: crate::Framerate) -> u32 {
+    (KEY_FRAME_INTERVAL_SECONDS.saturating_mul(declared.millihertz()) / 1000)
+        .clamp(1, MAX_KEY_INTERVAL)
+}
+
 fn configure_encoder(encoder: &gst::Element) {
     // Variable bitrate rather than constant: constant pads every picture to the
     // target with filler, which was 87% of a static desktop's bitstream, and a
@@ -746,14 +774,6 @@ fn configure_encoder(encoder: &gst::Element) {
     // Measured: at a hundred the requested buffer is honoured and no filler
     // returns.
     encoder.set_property("target-percentage", 100u32);
-    // Two seconds, not the seventeen that a thousand frames comes to at sixty
-    // hertz. This is the ceiling on how long a picture stays wrong: with one
-    // reference frame and no intra refresh, a single frame lost on the wire
-    // leaves every frame after it undecodable until the next key frame, and
-    // measured on a phone that cost nine hundred frames out of two thousand
-    // eight hundred. Key frames are cheap enough to spend now that parity
-    // carries them and the picture is scaled to what the client shows.
-    encoder.set_property("key-int-max", KEY_FRAME_INTERVAL_SECONDS * 60u32);
     encoder.set_property("b-frames", 0u32);
     encoder.set_property("ref-frames", 1u32);
     encoder.set_property("aud", true);
@@ -1180,6 +1200,23 @@ mod tests {
             (5..=12).contains(&refused),
             "a 130 kB picture is 130 ms of an eight megabit link, and this \
              refused {refused} frames of the next second"
+        );
+    }
+
+    #[test]
+    fn the_key_interval_is_two_seconds_whatever_the_declared_rate() {
+        let at = |millihertz| {
+            key_interval(crate::Framerate::from_millihertz(millihertz).expect("nonzero"))
+        };
+        assert_eq!(at(60_000), 120);
+        // The ladder's floor, where the fixed hundred and twenty was eight
+        // seconds of a picture nothing could repair.
+        assert_eq!(at(15_000), 30);
+        assert_eq!(at(119_998), 239);
+        assert_eq!(
+            at(1_000_000),
+            MAX_KEY_INTERVAL,
+            "the property's own ceiling"
         );
     }
 
