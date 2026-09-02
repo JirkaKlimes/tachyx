@@ -15,16 +15,25 @@ use tachyx_transport::{Client, ClientSession, ControlError, ControlReader, Contr
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
-use crate::{Command, Shared, GOODBYE};
+use crate::{Command, GOODBYE, Shared};
 
-/// How long input is collected before a batch goes out.
+/// The shortest time between two input batches.
 ///
 /// A finger on a 120 Hz phone produces a sample every eight milliseconds, so
 /// this is short enough that no batch ever holds two samples of one motion for
-/// long, and long enough that a drag costs one packet a tick rather than one
-/// packet a sample. The tick is armed by the first event and disarmed by the
-/// batch, so a session nobody is touching costs no wake-ups.
+/// long, and long enough that a mouse reporting a thousand times a second costs
+/// one packet a tick rather than one packet a sample. See [`Ticker`].
 const INPUT_TICK: Duration = Duration::from_millis(4);
+
+/// How long the loop may go without copying what it knows to the handle.
+///
+/// Everything that reads it draws: the statistics panel at the display's rate,
+/// the pointer once a frame. A twenty megabit stream lands a datagram every
+/// half millisecond, so publishing after each one takes the lock the drawing
+/// thread wants some seventeen hundred times a second, to move numbers that are
+/// read sixty. Half a frame of the fastest display anyone streams to is as
+/// fresh as a reader can use, and it costs at most a quarter of the locks.
+const PUBLISH_TICK: Duration = Duration::from_millis(4);
 
 /// Runs one session until the connection ends or the handle is dropped.
 pub(crate) async fn session(
@@ -46,13 +55,11 @@ pub(crate) async fn session(
     tokio::spawn(read_control(from_host, messages));
 
     let mut to_host = to_host;
-    let mut flush_at: Option<Instant> = None;
+    let mut input = Ticker::default();
+    let mut published = Instant::now();
     // Whether a complete picture has been thrown away for want of a decoder.
     let mut unshown = false;
-    // A device has no terminal, so what reassembly saw is only visible if it is
-    // said out loud at a steady cadence. Half a second is often enough to watch
-    // a link collapse and rare enough to read.
-    let mut report = tokio::time::interval(Duration::from_millis(500));
+    let mut reports = tokio::time::interval(REPORT_EVERY);
     let ended = loop {
         let expiry = session.next_deadline();
         let ended = tokio::select! {
@@ -76,8 +83,16 @@ pub(crate) async fn session(
             },
             command = commands.recv() => match command {
                 Some(Command::Input(at, event)) => {
-                    session.input(at, Instant::now(), event);
-                    flush_at.get_or_insert_with(|| Instant::now() + INPUT_TICK);
+                    let now = Instant::now();
+                    // Asked before the push, because what decides this is
+                    // whether the event has a batch to join, not whether it
+                    // made one.
+                    let alone = !session.input_pending();
+                    session.input(at, now, event);
+                    if alone && input.open(now) {
+                        session.flush_input();
+                        input.close(now);
+                    }
                     None
                 }
                 Some(Command::Viewport(capabilities)) => {
@@ -94,9 +109,9 @@ pub(crate) async fn session(
                 // The handle is gone, so the user has left.
                 None => break None,
             },
-            () = sleep_until(at(flush_at)), if flush_at.is_some() => {
+            () = sleep_until(at(input.due)), if input.due.is_some() => {
                 session.flush_input();
-                flush_at = None;
+                input.close(Instant::now());
                 None
             },
             () = sleep_until(at(expiry)), if expiry.is_some() => {
@@ -104,28 +119,23 @@ pub(crate) async fn session(
                 present(&mut session, &shared, &mut unshown);
                 None
             },
-            _ = report.tick() => {
-                let stats = session.video_stats();
-                let live = Liveness::at(Instant::now(), session.heard_at(), session.saw_at());
-                tracing::info!(
-                    ?live,
-                    recv = stats.packets_received,
-                    lost = stats.packets_lost,
-                    late = stats.packets_late,
-                    recovered = stats.frames_recovered,
-                    delivered = stats.frames_delivered,
-                    dropped = stats.frames_dropped,
-                    undecodable = stats.frames_undecodable,
-                    rtt_ms = u64::try_from(connection.rtt().as_millis()).unwrap_or(u64::MAX),
-                    "client",
-                );
+            _ = reports.tick() => {
+                report(&session, connection.rtt());
                 None
             },
         };
 
         let written = write_out(&mut session, &mut to_host, &shared).await;
-        publish(&shared, &session);
-        if let Some(reason) = ended.or(written) {
+        let over = ended.or(written);
+        let now = Instant::now();
+        // Whoever reads this draws, so copying faster than a frame is copying
+        // into a lock nobody looks at. The last word of a session is not a
+        // redraw and does not wait for one.
+        if over.is_some() || now >= published + PUBLISH_TICK {
+            publish(&shared, &session);
+            published = now;
+        }
+        if let Some(reason) = over {
             break Some(reason);
         }
     };
@@ -136,18 +146,85 @@ pub(crate) async fn session(
     connection.close(GOODBYE, b"the client is leaving");
 }
 
+/// How often the loop says out loud what it has seen.
+///
+/// A device has no terminal, so what reassembly saw is only visible if it is
+/// said at a steady cadence. Half a second is often enough to watch a link
+/// collapse and rare enough to read.
+const REPORT_EVERY: Duration = Duration::from_millis(500);
+
+/// Writes one line about what the video path has done since the session opened.
+fn report(session: &Session, round_trip: Duration) {
+    let stats = session.video_stats();
+    let live = Liveness::at(Instant::now(), session.heard_at(), session.saw_at());
+    tracing::info!(
+        ?live,
+        recv = stats.packets_received,
+        lost = stats.packets_lost,
+        late = stats.packets_late,
+        recovered = stats.frames_recovered,
+        delivered = stats.frames_delivered,
+        dropped = stats.frames_dropped,
+        undecodable = stats.frames_undecodable,
+        rtt_ms = u64::try_from(round_trip.as_millis()).unwrap_or(u64::MAX),
+        "client",
+    );
+}
+
+/// When input last went out, and when what is waiting is due.
+///
+/// Two batches never come closer together than [`INPUT_TICK`], which is what
+/// holds a drag to one packet a tick however fast the device samples. What the
+/// tick must not do is make the first event of a quiet period wait for a batch
+/// that nothing will join: a mouse at rest sends exactly that, and the wait is
+/// four milliseconds of latency bought for nothing. So a batch that is already
+/// a tick clear of the last one goes out at once, and only a batch that would
+/// crowd it waits. Both cost no wake-up while nobody is touching the session.
+#[derive(Debug, Default)]
+struct Ticker {
+    /// When the last batch went out, if one has.
+    sent: Option<Instant>,
+    /// When the batch now collecting is due on the wire.
+    due: Option<Instant>,
+}
+
+impl Ticker {
+    /// Opens a batch for an event that arrived with nothing queued behind it,
+    /// and says whether that batch goes out now.
+    ///
+    /// A batch that does not is made due a tick after the last one, so the rate
+    /// on the wire is the same either way.
+    fn open(&mut self, now: Instant) -> bool {
+        match self.sent {
+            Some(last) if now < last + INPUT_TICK => {
+                self.due = Some(last + INPUT_TICK);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Notes the batch that was waiting as gone.
+    fn close(&mut self, now: Instant) {
+        self.sent = Some(now);
+        self.due = None;
+    }
+}
+
 /// Hands every picture the session has finished to the decoder.
 ///
 /// One datagram can finish more than one: the datagram that completes a frame
 /// is also what decides the damaged frames below it, and any of those the
 /// parity rebuilt come out ahead of it.
 fn present(session: &mut Session, shared: &Arc<Shared>, unshown: &mut bool) {
+    let mut sink = None;
     while let Some(frame) = session.pop_frame() {
-        // Taken out of the lock before it is used. Handing a frame to a decoder
-        // takes as long as the decoder takes, and the statistics panel reads
-        // this same lock from the thread that draws the application.
-        let sink = shared.state().sink.clone();
-        match sink {
+        // Read once a batch, and only where there is a picture to present:
+        // most datagrams finish none, and this is the lock the thread that
+        // draws the application reads. Taken out of it before it is used,
+        // because handing a frame to a decoder takes as long as the decoder
+        // takes.
+        match sink.get_or_insert_with(|| shared.state().sink.clone()) {
             Some(sink) => sink.push(frame.data),
             // Nothing is presenting yet, so this picture is gone and every
             // picture after it refers back to one no decoder has seen. Only
@@ -209,4 +286,70 @@ async fn read_control(
 /// Only reached on an enabled branch, and every enabled branch has one.
 fn at(deadline: Option<Instant>) -> tokio::time::Instant {
     deadline.map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INPUT_TICK, Ticker};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_first_event_of_a_quiet_period_does_not_wait() {
+        let mut ticker = Ticker::default();
+        let start = Instant::now();
+        assert!(ticker.open(start), "nothing has gone out, so nothing waits");
+        ticker.close(start);
+        assert!(
+            ticker.open(start + INPUT_TICK),
+            "a tick has passed, so the batch is alone and goes now"
+        );
+    }
+
+    #[test]
+    fn an_event_that_would_crowd_the_last_batch_waits_out_the_tick() {
+        let mut ticker = Ticker::default();
+        let start = Instant::now();
+        ticker.close(start);
+        assert!(!ticker.open(start + Duration::from_millis(1)));
+        assert_eq!(
+            ticker.due,
+            Some(start + INPUT_TICK),
+            "due a tick after the last batch, not a tick after the event"
+        );
+    }
+
+    #[test]
+    fn a_device_sampling_faster_than_the_tick_still_costs_one_batch_a_tick() {
+        // A gaming mouse at a thousand hertz, for a tenth of a second.
+        let start = Instant::now();
+        let mut ticker = Ticker::default();
+        let mut sent = Vec::new();
+        let mut waiting = false;
+        for step in 0..100 {
+            let now = start + Duration::from_millis(step);
+            if waiting && ticker.due.is_some_and(|due| due <= now) {
+                ticker.close(now);
+                sent.push(now);
+                waiting = false;
+            }
+            if waiting {
+                continue;
+            }
+            if ticker.open(now) {
+                ticker.close(now);
+                sent.push(now);
+            } else {
+                waiting = true;
+            }
+        }
+        assert!(
+            sent.windows(2).all(|pair| pair[1] >= pair[0] + INPUT_TICK),
+            "no two batches came closer than a tick: {sent:?}"
+        );
+        assert!(
+            sent.len() <= 100 / 4 + 1,
+            "a hundred milliseconds holds twenty five ticks, and got {}",
+            sent.len()
+        );
+    }
 }

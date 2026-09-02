@@ -281,10 +281,14 @@ async fn stream_and_listen(mut host: HostSession, report: Sender<String>) {
         .await
         .expect("a live stream");
 
-    let batch = next_of_interest(&mut host.from_client).await;
-    report
-        .send(format!("{batch:?}"))
-        .expect("the test is waiting");
+    // Two, because the first move of a quiet period travels on its own and the
+    // tick collects what follows it.
+    for _ in 0..2 {
+        let batch = next_of_interest(&mut host.from_client).await;
+        report
+            .send(format!("{batch:?}"))
+            .expect("the test is waiting");
+    }
     // Held open until the client leaves, so the departure is a close and not a
     // reset.
     host.connection.closed().await;
@@ -324,8 +328,10 @@ fn video_input_and_liveness_all_cross_a_real_socket() {
         assert_eq!(*shown, unit(id, kind(id)), "frame {id} came back wrong");
     }
 
-    // The user drags and clicks. Both reach the host in one batch, because the
-    // driver ends a tick rather than sending an event.
+    // The user drags and clicks. The first sample of the drag leaves at once,
+    // because the pointer had been still and no batch was waiting for it to
+    // join. Everything the tick then collects reaches the host together, click
+    // included, because the driver ends a tick rather than sending an event.
     for step in 1..=8u64 {
         link.input(
             Timestamp::from_session_micros(step * 1_000),
@@ -339,10 +345,15 @@ fn video_input_and_liveness_all_cross_a_real_socket() {
             press: Press::Down,
         },
     );
+    let first = loopback.report();
+    assert!(
+        first.contains("PointerMotion { dx: 2.0, dy: -1.0 }"),
+        "the first sample does not wait out a tick to be alone, and got {first}"
+    );
     let batch = loopback.report();
     assert!(
-        batch.contains("PointerMotion { dx: 16.0, dy: -8.0 }"),
-        "eight samples of one motion arrive summed, and got {batch}"
+        batch.contains("PointerMotion { dx: 14.0, dy: -7.0 }"),
+        "the seven samples behind it arrive summed, and got {batch}"
     );
     assert!(
         batch.contains("Left"),
@@ -464,7 +475,14 @@ fn a_frame_the_wire_ate_earns_one_key_frame_request() {
         "one request, naming the last picture that did decode"
     );
 
-    let stats = link.stats();
+    // Waited for rather than read: the loop publishes on its own cadence, so
+    // the host having the request is no proof the handle has the count behind
+    // it yet.
+    let stats = until(&link, |stats| {
+        stats.video.frames_delivered == 1
+            && stats.video.frames_dropped == 1
+            && stats.video.frames_undecodable == 1
+    });
     assert_eq!(
         stats.video.frames_delivered, 1,
         "only the key frame was decodable: {stats:?}"

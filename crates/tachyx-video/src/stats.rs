@@ -35,30 +35,50 @@ pub struct Stats {
 }
 
 /// A rolling window of one measurement.
+///
+/// The samples are held in two orders at once. Every number a summary reports
+/// is an order statistic, so filing each sample where it belongs as it arrives
+/// makes the summary four lookups instead of a sort of the whole window. The
+/// frame that arrives pays for it, on the thread that decoded it, rather than
+/// the thread that draws paying every time it puts a number on the screen.
 #[derive(Debug, Default)]
-pub(crate) struct Window(VecDeque<u32>);
+pub(crate) struct Window {
+    /// Oldest first, which is what says which sample leaves next.
+    arrival: VecDeque<u32>,
+    /// The same samples, smallest first.
+    sorted: Vec<u32>,
+}
 
 impl Window {
     pub(crate) fn record(&mut self, elapsed: Duration) {
-        if self.0.len() == WINDOW {
-            self.0.pop_front();
+        let sample = u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX);
+        if self.arrival.len() == WINDOW {
+            let oldest = self
+                .arrival
+                .pop_front()
+                .expect("a full window holds a sample");
+            // Equal samples are interchangeable, so any of them is the one that
+            // left.
+            let filed = self
+                .sorted
+                .binary_search(&oldest)
+                .expect("every sample in the window is filed");
+            self.sorted.remove(filed);
         }
-        self.0
-            .push_back(u32::try_from(elapsed.as_micros()).unwrap_or(u32::MAX));
+        self.arrival.push_back(sample);
+        let at = self.sorted.partition_point(|filed| *filed < sample);
+        self.sorted.insert(at, sample);
     }
 
     pub(crate) fn summary(&self) -> Latency {
-        if self.0.is_empty() {
+        let Some(last) = self.sorted.len().checked_sub(1) else {
             return Latency::default();
-        }
-        let mut sorted: Vec<u32> = self.0.iter().copied().collect();
-        sorted.sort_unstable();
-        let at = |fraction: usize| sorted[(sorted.len() - 1) * fraction / 100];
+        };
         Latency {
-            min_us: sorted[0],
-            median_us: at(50),
-            p95_us: at(95),
-            max_us: sorted[sorted.len() - 1],
+            min_us: self.sorted[0],
+            median_us: self.sorted[last * 50 / 100],
+            p95_us: self.sorted[last * 95 / 100],
+            max_us: self.sorted[last],
         }
     }
 }
@@ -84,6 +104,25 @@ mod tests {
         assert_eq!(summary.max_us, 100);
         assert_eq!(summary.median_us, 50);
         assert_eq!(summary.p95_us, 95);
+    }
+
+    #[test]
+    fn the_filed_order_follows_what_the_window_evicts() {
+        // The two orders disagree on which sample leaves: the window drops the
+        // oldest, and the file has to lose that one and not the smallest.
+        let length = u64::try_from(WINDOW).expect("a window of a few hundred");
+        let mut window = Window::default();
+        for micros in 1..=length + 100 {
+            window.record(Duration::from_micros(micros));
+        }
+        let summary = window.summary();
+        assert_eq!(summary.min_us, 101, "the first hundred were forgotten");
+        assert_eq!(u64::from(summary.max_us), length + 100);
+        assert_eq!(
+            u64::from(summary.median_us),
+            101 + (length - 1) * 50 / 100,
+            "the middle of what is left, not of what was recorded"
+        );
     }
 
     #[test]

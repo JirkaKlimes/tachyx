@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tachyx_driver::{FrameSink, Link};
-use tachyx_proto::control::{Capabilities, Size};
+use tachyx_proto::control::{Capabilities, Codec, Codecs, Size};
 
 #[derive(Debug, Default)]
 struct Counter {
@@ -48,6 +48,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_decode_fps: NonZeroU16::new(120).expect("a frame rate"),
         requested_fps: NonZeroU16::new(60).expect("a frame rate"),
         bitrate_ceiling: NonZeroU32::new(20_000_000).expect("a bitrate"),
+        // This probe counts bytes and decodes nothing, so it asks for what a
+        // client on this host would have to decode.
+        decode: Codecs::of(Codec::H264),
     };
 
     let started = Instant::now();
