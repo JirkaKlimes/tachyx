@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:tachyx/src/rust/api/session.dart' as rust;
 import 'package:tachyx/src/session/link.dart';
 import 'package:tachyx/src/session/viewport.dart';
+import 'package:tachyx/src/settings.dart';
 import 'package:tachyx/src/ui/connect_screen.dart';
 import 'package:tachyx/src/ui/session_screen.dart';
 import 'package:tachyx/src/ui/theme.dart';
@@ -26,47 +27,46 @@ class TachyxApp extends StatefulWidget {
 
 class _TachyxAppState extends State<TachyxApp> {
   final HostLink _link = HostLink();
+  final Settings _settings = Settings();
   late final int _protocolVersion = rust.protocolVersion();
 
   @override
   void initState() {
     super.initState();
-    unawaited(_link.restore());
+    unawaited(_settings.restore());
     // Naming a host in the environment dials it as soon as there is a view to
     // measure. Without this a session can only begin by hand, which makes an
     // end-to-end run something nobody can repeat.
     final String preset = Platform.environment['TACHYX_HOST'] ?? '';
     if (preset.isNotEmpty) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _dialAddress(preset));
+      WidgetsBinding.instance.addPostFrameCallback((_) => _dial(preset));
     }
-  }
-
-  /// Dials `host:port`, or the default port when the address names none.
-  void _dialAddress(String address) {
-    final int colon = address.lastIndexOf(':');
-    if (colon < 0) {
-      _dial(address, HostLink.defaultPort);
-      return;
-    }
-    final int? port = int.tryParse(address.substring(colon + 1));
-    _dial(address.substring(0, colon), port ?? HostLink.defaultPort);
   }
 
   @override
   void dispose() {
     _link.dispose();
+    _settings.dispose();
     super.dispose();
   }
 
-  void _dial(String host, int port) {
+  /// Dials `host:port`, or the default port when the address names none.
+  void _dial(String address) {
+    final String dialled = address.contains(':')
+        ? address
+        : '$address:${HostLink.defaultPort}';
     final FlutterView view = View.of(context);
-    unawaited(
-      _link.dial(
-        '$host:$port',
+    unawaited(() async {
+      await _link.dial(
+        dialled,
         viewport: viewportOf(view),
         refreshHz: refreshHz(view),
-      ),
-    );
+        bitrateCeiling: _settings.streamBitrate,
+      );
+      // Only an address that answered is worth keeping, and keeping it again
+      // moves it to the top: the list stays in most-recently-reached order.
+      if (_link.state is Live) await _settings.keepHost(dialled);
+    }());
   }
 
   @override
@@ -86,17 +86,19 @@ class _TachyxAppState extends State<TachyxApp> {
             address: address,
             session: session,
             protocolVersion: _protocolVersion,
+            settings: _settings,
             onLeave: _link.hangUp,
           ),
         Detached() => SessionScreen(
           key: const ValueKey<String>('detached'),
           protocolVersion: _protocolVersion,
+          settings: _settings,
           onLeave: _link.hangUp,
         ),
         final Link state => ConnectScreen(
           state: state,
           protocolVersion: _protocolVersion,
-          remembered: _link.remembered,
+          settings: _settings,
           onDial: _dial,
           onDetach: _link.detach,
         ),

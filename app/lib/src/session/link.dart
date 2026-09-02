@@ -7,7 +7,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException, PanicException;
 import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:tachyx/src/rust/api/session.dart';
 
@@ -69,11 +68,11 @@ final class Detached extends Link {
   const Detached();
 }
 
-/// Opens sessions and remembers where the last one was.
+/// Opens sessions.
+///
+/// Which hosts are worth remembering is the settings store's business; this
+/// holds only where the client is with the one it is talking to now.
 class HostLink extends ChangeNotifier {
-  /// Where the last successful address is kept between runs.
-  static const String _addressKey = 'tachyx.host.address';
-
   /// The port a host listens on unless told otherwise.
   ///
   /// Must match `tachyx_hostd::config::DEFAULT_PORT`. A client whose default
@@ -86,26 +85,19 @@ class HostLink extends ChangeNotifier {
   /// Where the client is with a host.
   Link get state => _state;
 
-  String _remembered = '';
-
-  /// The last address that was dialled, or empty if there has not been one.
-  String get remembered => _remembered;
-
-  /// Reads back the address the last run dialled.
-  Future<void> restore() async {
-    final SharedPreferences store = await SharedPreferences.getInstance();
-    _remembered = store.getString(_addressKey) ?? '';
-    notifyListeners();
-  }
-
   /// Opens a session with the host at [address], for a video surface of
   /// [viewport] physical pixels on a display that refreshes [refreshHz] times a
-  /// second.
+  /// second, spending at most [bitrateCeiling] bits a second.
+  ///
+  /// A dial while one is already under way is ignored here rather than in
+  /// every screen that can ask for one.
   Future<void> dial(
     String address, {
     required (int, int) viewport,
     required int refreshHz,
+    required int bitrateCeiling,
   }) async {
+    if (_state is Dialling) return;
     _set(Dialling(address));
     try {
       // The host's key is pinned here, so it must outlive the run. Anywhere the
@@ -118,8 +110,8 @@ class HostLink extends ChangeNotifier {
         viewportHeight: viewport.$2,
         refreshHz: refreshHz,
         stateDirectory: state.path,
+        bitrateCeiling: bitrateCeiling,
       );
-      await _remember(address);
       _set(Live(address, session));
     } on Object catch (error) {
       _set(Refused(address, describe(error)));
@@ -134,12 +126,6 @@ class HostLink extends ChangeNotifier {
     final Link was = _state;
     if (was is Live) was.session.dispose();
     _set(const Offline());
-  }
-
-  Future<void> _remember(String address) async {
-    _remembered = address;
-    final SharedPreferences store = await SharedPreferences.getInstance();
-    await store.setString(_addressKey, address);
   }
 
   void _set(Link state) {

@@ -105,6 +105,9 @@ struct Pipeline {
     ladder: Ladder,
     /// The most this session may ever ask for, in bits a second.
     ceiling: NonZeroU32,
+    /// The daemon's own configured bound, kept apart from `ceiling` so that a
+    /// renegotiation can fold a new client cap against it.
+    allowed: u32,
     capture_size: tachyx_media::Size,
     /// The output's own refresh, lowered by what the client asked for.
     refresh: u32,
@@ -162,6 +165,7 @@ fn start(config: &Config, session: &HostSession) -> Result<Pipeline, SessionErro
         units,
         ladder,
         ceiling,
+        allowed: config.max_bitrate,
         capture_size,
         refresh,
     })
@@ -191,6 +195,8 @@ struct Live {
     last_key: Instant,
     started: Instant,
     ceiling: NonZeroU32,
+    /// The daemon's configured bound, folded against every client cap.
+    allowed: u32,
     refresh: u32,
     capture_size: tachyx_media::Size,
 }
@@ -341,7 +347,20 @@ impl Live {
     /// The rungs are what the client can show, so a different client needs a
     /// different ladder. Its opening point is what the link is known to carry,
     /// which by now is a measurement rather than a guess.
+    ///
+    /// The bitrate ceiling is re-read too: a client shrunk into a
+    /// picture-in-picture window sends a lower cap with its smaller viewport,
+    /// and a host that kept spending against the old one would flood a window
+    /// nobody is watching at full size.
     fn viewport_changed(&mut self, capabilities: tachyx_proto::control::Capabilities) {
+        if let Some(ceiling) = NonZeroU32::new(
+            self.allowed
+                .min(capabilities.bitrate_ceiling.get())
+                .max(MIN_TARGET),
+        ) {
+            self.ceiling = ceiling;
+            self.controller.set_ceiling(ceiling);
+        }
         let wanted = viewport(capabilities, self.capture_size);
         if let Ok(top) = top_rung(self.capture_size, wanted) {
             self.ladder = Ladder::new(
@@ -458,6 +477,7 @@ async fn run(
         units,
         ladder,
         ceiling,
+        allowed,
         capture_size,
         refresh,
     } = pipeline;
@@ -491,6 +511,7 @@ async fn run(
         padded,
         started,
         ceiling,
+        allowed,
         refresh,
         capture_size,
     };

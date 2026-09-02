@@ -100,7 +100,7 @@ class StatsOverlay extends StatelessWidget {
       decoration: BoxDecoration(
         color: Shade.panel,
         border: Border.all(color: Shade.edge),
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.circular(kCorner),
       ),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),

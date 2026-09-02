@@ -27,6 +27,9 @@ int protocolVersion() => RustLib.instance.api.crateApiSessionProtocolVersion();
 /// host presenting a different key on a later connection is refused rather than
 /// silently accepted.
 ///
+/// `bitrate_ceiling` caps what the stream may cost, in bits per second. `None`
+/// keeps the client's default.
+///
 /// # Errors
 /// If the address names nothing, the viewport has no area, the host presents a
 /// key other than the one already pinned for it, or the host refuses the
@@ -38,12 +41,14 @@ Future<Session> connect({
   required int viewportHeight,
   required int refreshHz,
   required String stateDirectory,
+  int? bitrateCeiling,
 }) => RustLib.instance.api.crateApiSessionConnect(
   address: address,
   viewportWidth: viewportWidth,
   viewportHeight: viewportHeight,
   refreshHz: refreshHz,
   stateDirectory: stateDirectory,
+  bitrateCeiling: bitrateCeiling,
 );
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Session>>
@@ -98,12 +103,18 @@ abstract class Session implements RustOpaqueInterface {
   /// Tells the host the client can take something different now, after a
   /// rotation, a resize, or a change of resolution mode.
   ///
+  /// `bitrate_ceiling` caps what the stream may cost, in bits per second.
+  /// `None` keeps the client's default. A client shrunk into a
+  /// picture-in-picture window passes a low one, because a thumbnail is not
+  /// worth a full-rate stream.
+  ///
   /// # Errors
   /// If the viewport has no area or the display never refreshes.
   void viewportChanged({
     required int viewportWidth,
     required int viewportHeight,
     required int refreshHz,
+    int? bitrateCeiling,
   });
 }
 

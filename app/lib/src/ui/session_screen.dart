@@ -12,9 +12,11 @@ import 'package:tachyx/src/input/keyboard.dart';
 import 'package:tachyx/src/input/touchpad.dart';
 import 'package:tachyx/src/rust/api/session.dart';
 import 'package:tachyx/src/session/cursor.dart';
+import 'package:tachyx/src/session/pip.dart';
 import 'package:tachyx/src/session/pipe.dart';
 import 'package:tachyx/src/session/present.dart';
 import 'package:tachyx/src/session/viewport.dart';
+import 'package:tachyx/src/settings.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 import 'package:tachyx/src/ui/theme.dart';
 import 'package:tachyx/src/ui/video_surface.dart';
@@ -22,12 +24,14 @@ import 'package:tachyx/src/ui/video_texture_view.dart';
 
 /// The remote desktop, and the touch surface that drives it.
 ///
-/// The picture is the whole window, under the system bars and all. Everything
-/// the client draws of its own is an overlay that arrives when it is asked for:
-/// a bar that says where the session is and offers a way out of it, and the
-/// statistics panel. A three-finger swipe down brings both back, a three-finger
-/// swipe up puts both away, and the bar retires by itself. See [Touchpad] for
-/// why that gesture and not an edge swipe.
+/// The picture is the whole window, under the system bars and all. The only
+/// thing the client keeps on the glass is a corner mark, which fades to a
+/// ghost when it is left alone and opens the controls when it is tapped: the
+/// glass is a trackpad, so a tap is a click wherever the pointer is and the
+/// corner costs nothing to give up. The mark is the one way in; a
+/// three-finger swipe up puts everything away, and the first session ever
+/// says all of this once. See [Touchpad] for why that gesture and not an
+/// edge swipe.
 ///
 /// There is no [Scaffold] here on purpose. The Android template asks for
 /// `adjustResize`, and a scaffold would take the on-screen keyboard's inset out
@@ -37,6 +41,7 @@ class SessionScreen extends StatefulWidget {
   /// A session with the host at [address], or with none when [session] is null.
   const SessionScreen({
     required this.protocolVersion,
+    required this.settings,
     required this.onLeave,
     this.address,
     this.session,
@@ -51,6 +56,10 @@ class SessionScreen extends StatefulWidget {
 
   /// The protocol version this build speaks.
   final int protocolVersion;
+
+  /// The user's choices, read live: a cap or a sensitivity moved on the
+  /// settings screen reaches a running session.
+  final Settings settings;
 
   /// Called when the user is done.
   final VoidCallback onLeave;
@@ -69,21 +78,27 @@ class _SessionScreenState extends State<SessionScreen>
   /// The shape a picture is drawn at before the host has said what it is.
   static const double _unknownAspect = 16 / 9;
 
-  /// How long the bar stays before it retires on its own. Long enough to read
-  /// the address and reach a button, short enough that nobody has to dismiss
-  /// it. The statistics panel is not on this clock: it is read for as long as
-  /// the reader wants it, and there is a gesture that puts it away.
-  static const Duration _barLingers = Duration(seconds: 5);
+  /// How long the open controls stay before they fade back to the corner
+  /// mark. Long enough to read the address and reach a button, short enough
+  /// that nobody has to dismiss them.
+  static const Duration _linger = Duration(seconds: 5);
+
+  /// The most a stream may cost while the window is a picture-in-picture
+  /// thumbnail. A thumbnail a few hundred pixels wide cannot show what a
+  /// full-rate stream costs, so the cap is dropped with the viewport and
+  /// restored with it.
+  static const int _pipBitrate = 2000000;
 
   final InputPipe _pipe = InputPipe();
+  final Pip _pip = Pip.instance;
   late final CursorFeed _cursor;
   late final Touchpad _pad;
   late final HardwareKeys _keys;
   late final SoftKeyboard _soft;
   Timer? _sampler;
-  Timer? _linger;
-  bool _showStats = true;
-  bool _showBar = true;
+  Timer? _lingerTimer;
+  bool _showStats = false;
+  bool _expanded = true;
 
   /// The counters, held apart from the element tree.
   ///
@@ -117,23 +132,30 @@ class _SessionScreenState extends State<SessionScreen>
     _pad = Touchpad(
       emit: _pipe.send,
       toggleKeyboard: _toggleKeyboard,
-      showControls: _reveal,
       hideControls: _dismiss,
       onDragLock: _buzz,
+      sensitivity: widget.settings.sensitivity,
+      pointerAccel: widget.settings.pointerAccel,
     );
     _keys = HardwareKeys(_pipe.send)..attach();
     WidgetsBinding.instance.addObserver(this);
+    widget.settings.addListener(_settingsMoved);
+    _pip.active.addListener(_pipMoved);
     _sampler = Timer.periodic(_sampleEvery, (_) => _sample());
-    // A session opens with its own chrome showing. It says which host was
-    // reached, it puts the gesture that brings it back in front of the user
-    // once, and then it gets out of the way without being asked.
-    _linger = Timer(_barLingers, _retire);
+    // A session opens with its controls showing. They say which host was
+    // reached, they put the corner mark in front of the user once, and then
+    // they get out of the way without being asked.
+    _lingerTimer = Timer(_linger, _retire);
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     _rescale();
+    // Also the first place the view is reachable, so the first arm is here
+    // rather than in initState, and a media change re-arms with the rectangle
+    // the picture has moved to.
+    _armPip();
     // Not in `initState`: opening a presentation needs the size of the view,
     // and the view is only reachable once the widget has its dependencies.
     final Session? session = widget.session;
@@ -145,18 +167,47 @@ class _SessionScreenState extends State<SessionScreen>
 
   @override
   void didChangeMetrics() {
-    // A rotation or a resize. The host chose its rung from the viewport the
-    // hello named, so it has to be told the viewport changed or it keeps
-    // encoding for a screen that is no longer there.
+    // A rotation, a resize, or the window folding into a picture-in-picture
+    // thumbnail. The host chose its rung from the viewport the hello named,
+    // so it has to be told or it keeps encoding for a screen that is no
+    // longer there.
+    _renegotiate();
+  }
+
+  /// Tells the host what the window can take now, and what it may cost.
+  ///
+  /// The ceiling travels with every renegotiation because it moves for the
+  /// same reasons the viewport does: a thumbnail is capped low, and a cap
+  /// moved on the settings screen reaches the live session here.
+  void _renegotiate() {
     final Session? session = widget.session;
     if (session == null || !mounted) return;
     final FlutterView view = View.of(context);
     final (int width, int height) = viewportOf(view);
+    final int ceiling = _pip.active.value
+        ? _pipBitrate
+        : widget.settings.streamBitrate;
     session.viewportChanged(
       viewportWidth: width,
       viewportHeight: height,
       refreshHz: refreshHz(view),
+      bitrateCeiling: ceiling,
     );
+  }
+
+  void _settingsMoved() {
+    _pad.sensitivity = widget.settings.sensitivity;
+    _pad.pointerAccel = widget.settings.pointerAccel;
+    _renegotiate();
+    // The build also reads settings: the onboarding hint stands on it.
+    if (mounted) setState(() {});
+  }
+
+  void _pipMoved() {
+    // The window's own resize renegotiates the viewport; this renegotiates
+    // the ceiling, which no metrics change carries by itself.
+    _renegotiate();
+    if (mounted) setState(() {});
   }
 
   @override
@@ -172,8 +223,11 @@ class _SessionScreenState extends State<SessionScreen>
   @override
   void dispose() {
     _sampler?.cancel();
-    _linger?.cancel();
+    _lingerTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    widget.settings.removeListener(_settingsMoved);
+    _pip.active.removeListener(_pipMoved);
+    unawaited(_pip.disarm());
     _keys.detach();
     _soft.hide();
     _cursor.dispose();
@@ -224,6 +278,45 @@ class _SessionScreenState extends State<SessionScreen>
     setState(() => _encoding = encoding);
     _rescale();
     _resize();
+    _armPip();
+  }
+
+  /// Keeps the fold armed with the picture's current shape and place.
+  ///
+  /// The thumbnail the system folds the window into should be the shape of
+  /// the picture, not of the phone, and the fold should shrink from where the
+  /// picture really is, which moves on every rotation and every change of
+  /// aspect.
+  void _armPip() {
+    if (widget.session == null || !mounted) return;
+    final Encoding? encoding = _encoding;
+    final int aspectWidth = encoding?.aspectWidth ?? 16;
+    final int aspectHeight = encoding?.aspectHeight ?? 9;
+    unawaited(
+      _pip.arm(
+        aspectWidth: aspectWidth,
+        aspectHeight: aspectHeight,
+        source: _pictureRect(View.of(context), aspectWidth / aspectHeight),
+      ),
+    );
+  }
+
+  /// Where the picture sits in the window, in physical pixels.
+  ///
+  /// Computed rather than measured: the picture is drawn centred at its
+  /// aspect ratio inside the whole window, so the letterboxed rectangle
+  /// follows from the window and the aspect alone.
+  static Rect _pictureRect(FlutterView view, double aspect) {
+    final Size window = view.physicalSize;
+    if (window.isEmpty) return Rect.zero;
+    final Size fitted = window.width / window.height > aspect
+        ? Size(window.height * aspect, window.height)
+        : Size(window.width, window.width / aspect);
+    return Offset(
+          (window.width - fitted.width) / 2,
+          (window.height - fitted.height) / 2,
+        ) &
+        fitted;
   }
 
   /// Keeps the presentation the size the decoder is writing.
@@ -265,36 +358,32 @@ class _SessionScreenState extends State<SessionScreen>
     setState(() {});
   }
 
-  /// Brings the client's own chrome back, statistics and all.
+  /// Opens the controls, on their own countdown.
   void _reveal() {
-    _linger?.cancel();
-    _linger = Timer(_barLingers, _retire);
-    setState(() {
-      _showBar = true;
-      _showStats = true;
-    });
+    _lingerTimer?.cancel();
+    _lingerTimer = Timer(_linger, _retire);
+    setState(() => _expanded = true);
   }
 
-  /// Takes everything the client draws off the picture.
+  /// Takes everything the client draws back to the corner mark.
   void _dismiss() {
-    _linger?.cancel();
-    _linger = null;
+    _lingerTimer?.cancel();
+    _lingerTimer = null;
     setState(() {
-      _showBar = false;
+      _expanded = false;
       _showStats = false;
     });
   }
 
-  /// The bar's own countdown, which leaves the panel where it is.
+  /// The controls' own countdown, which leaves the panel where it is.
   void _retire() {
     if (!mounted) return;
-    setState(() => _showBar = false);
+    setState(() => _expanded = false);
   }
 
-  /// Drops or restores the panel without losing the bar that asked for it.
+  /// Drops or restores the panel without losing the controls that asked.
   void _toggleStats() {
-    _linger?.cancel();
-    _linger = Timer(_barLingers, _retire);
+    _reveal();
     setState(() => _showStats = !_showStats);
   }
 
@@ -326,6 +415,9 @@ class _SessionScreenState extends State<SessionScreen>
   Widget build(BuildContext context) {
     final MediaQueryData media = MediaQuery.of(context);
     final bool keyboardUp = media.viewInsets.bottom > 0;
+    // A thumbnail shows the picture and nothing of the client's own: there is
+    // no room, and nothing in it can be touched anyway.
+    final bool thumbnail = _pip.active.value;
     return Material(
       color: Shade.ground,
       child: Stack(
@@ -335,10 +427,10 @@ class _SessionScreenState extends State<SessionScreen>
           // video occupies, and the host keeps encoding for the screen that is
           // really there.
           Positioned.fill(child: TouchSurface(pad: _pad, child: _picture())),
-          // The panel keeps the top left corner and the bar takes the bottom
-          // right, so that the two never cover each other on a screen as short
-          // as a phone held sideways.
-          if (_showStats)
+          // The panel keeps the top left corner and the controls the bottom
+          // right, so the two never cover each other on a screen as short as
+          // a phone held sideways.
+          if (_showStats && !thumbnail)
             Positioned(
               left: 0,
               top: 0,
@@ -367,114 +459,226 @@ class _SessionScreenState extends State<SessionScreen>
                 ),
               ),
             ),
-          Positioned(
-            left: 0,
-            right: 0,
-            // Above the on-screen keyboard rather than behind it, so that the
-            // way out of the session is reachable while the user is typing.
-            bottom: media.viewInsets.bottom,
-            child: SafeArea(
-              top: false,
-              child: _ControlBar(
-                showing: _showBar,
-                address: widget.address,
-                showingStats: _showStats,
-                onToggleStats: _toggleStats,
-                onLeave: widget.onLeave,
+          if (!thumbnail)
+            Positioned(
+              right: 0,
+              // Above the on-screen keyboard rather than behind it, so that
+              // the way out of the session is reachable while typing.
+              bottom: media.viewInsets.bottom,
+              child: SafeArea(
+                top: false,
+                left: false,
+                child: _CornerDock(
+                  expanded: _expanded,
+                  address: widget.address,
+                  showingStats: _showStats,
+                  onOpen: _reveal,
+                  onKeyboard: _toggleKeyboard,
+                  onToggleStats: _toggleStats,
+                  onLeave: widget.onLeave,
+                ),
               ),
             ),
-          ),
+          if (!widget.settings.onboarded && !thumbnail)
+            _Onboarding(onDone: widget.settings.markOnboarded),
         ],
       ),
     );
   }
 }
 
-/// The controls, which are on the glass only while they are wanted.
+/// The controls, folded into a corner mark whenever they are left alone.
 ///
-/// Built whether or not it is [showing], so that it can slide off the bottom
-/// edge rather than blink out, and made deaf to touch while it is away so that
-/// none of the surface under it stops being a trackpad.
-class _ControlBar extends StatelessWidget {
-  const _ControlBar({
-    required this.showing,
+/// The mark never leaves the glass entirely: it fades to a ghost that still
+/// answers a tap, because a control that has to be summoned by a gesture
+/// nobody can see is a control that does not exist. The glass is a trackpad,
+/// so the corner it occupies costs the remote desktop nothing: a tap is a
+/// click wherever the pointer is, and the pointer is never under the finger.
+class _CornerDock extends StatelessWidget {
+  const _CornerDock({
+    required this.expanded,
     required this.address,
     required this.showingStats,
+    required this.onOpen,
+    required this.onKeyboard,
     required this.onToggleStats,
     required this.onLeave,
   });
 
   /// Long enough to read as a movement, short enough not to be waited on.
-  static const Duration _slide = Duration(milliseconds: 160);
+  static const Duration _fade = Duration(milliseconds: 200);
 
-  final bool showing;
+  final bool expanded;
   final String? address;
   final bool showingStats;
+  final VoidCallback onOpen;
+  final VoidCallback onKeyboard;
   final VoidCallback onToggleStats;
   final VoidCallback onLeave;
 
   @override
-  Widget build(BuildContext context) => IgnorePointer(
-    ignoring: !showing,
-    child: AnimatedSlide(
-      offset: showing ? Offset.zero : const Offset(0, 1),
-      duration: _slide,
-      curve: Curves.easeOut,
-      child: AnimatedOpacity(
-        opacity: showing ? 1 : 0,
-        duration: _slide,
-        child: Align(
-          alignment: Alignment.bottomRight,
-          child: Padding(
-            padding: const EdgeInsets.all(8),
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: Shade.panel,
-                border: Border.all(color: Shade.edge),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: SizedBox(height: 44, child: _row()),
-            ),
-          ),
-        ),
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.all(10),
+    child: AnimatedSwitcher(
+      duration: _fade,
+      switchInCurve: Curves.easeOut,
+      switchOutCurve: Curves.easeIn,
+      transitionBuilder: (Widget child, Animation<double> animation) =>
+          FadeTransition(opacity: animation, child: child),
+      layoutBuilder: (Widget? current, List<Widget> previous) => Stack(
+        alignment: Alignment.bottomRight,
+        children: <Widget>[...previous, ?current],
+      ),
+      child: expanded ? _controls() : _mark(),
+    ),
+  );
+
+  /// The ghost in the corner: a bracket the shape of the corner it keeps.
+  Widget _mark() => GestureDetector(
+    key: const ValueKey<String>('mark'),
+    onTap: onOpen,
+    behavior: HitTestBehavior.opaque,
+    child: AnimatedOpacity(
+      opacity: 0.35,
+      duration: _fade,
+      child: const SizedBox(
+        width: 44,
+        height: 44,
+        child: CustomPaint(painter: _CornerMark()),
       ),
     ),
   );
 
-  Widget _row() => Row(
-    mainAxisSize: MainAxisSize.min,
-    children: <Widget>[
-      IconButton(
-        onPressed: onLeave,
-        icon: const Icon(Icons.arrow_back, size: 18),
-        color: Shade.faint,
-        tooltip: 'leave',
-      ),
-      Flexible(
-        child: Text(
-          address ?? 'no host — input monitor',
-          style: readout.copyWith(
-            color: address == null ? Shade.faint : Shade.text,
+  Widget _controls() => DecoratedBox(
+    key: const ValueKey<String>('controls'),
+    decoration: BoxDecoration(
+      color: Shade.panel,
+      border: Border.all(color: Shade.edge),
+      borderRadius: BorderRadius.circular(kCorner),
+    ),
+    child: SizedBox(
+      height: 44,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          IconButton(
+            onPressed: onLeave,
+            icon: const Icon(Icons.arrow_back, size: 18),
+            color: Shade.faint,
+            tooltip: 'leave',
           ),
-          overflow: TextOverflow.ellipsis,
+          Flexible(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 2),
+              child: Text(
+                address ?? 'no host — input monitor',
+                style: readout.copyWith(
+                  color: address == null ? Shade.faint : Shade.text,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+          IconButton(
+            onPressed: onKeyboard,
+            icon: const Icon(Icons.keyboard_outlined, size: 18),
+            color: Shade.faint,
+            tooltip: 'keyboard',
+          ),
+          IconButton(
+            onPressed: onToggleStats,
+            icon: const Icon(Icons.monitor_heart_outlined, size: 18),
+            color: showingStats ? Shade.good : Shade.faint,
+            tooltip: 'statistics',
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+/// The corner bracket the dock folds into.
+class _CornerMark extends CustomPainter {
+  const _CornerMark();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint stroke = Paint()
+      ..color = Shade.text
+      ..strokeWidth = 1.5
+      ..strokeCap = StrokeCap.square
+      ..style = PaintingStyle.stroke;
+    const double inset = 12;
+    final double right = size.width - inset;
+    final double bottom = size.height - inset;
+    final Path bracket = Path()
+      ..moveTo(right - 14, bottom)
+      ..lineTo(right, bottom)
+      ..lineTo(right, bottom - 14);
+    canvas.drawPath(bracket, stroke);
+  }
+
+  @override
+  bool shouldRepaint(_CornerMark oldDelegate) => false;
+}
+
+/// The one-time hint that says where the controls live.
+///
+/// Shown over the first session ever and never again. It has to exist because
+/// the whole design hides the controls: a corner mark that fades and a
+/// three-finger gesture are invisible precisely when someone is looking for
+/// them the first time.
+class _Onboarding extends StatelessWidget {
+  const _Onboarding({required this.onDone});
+
+  /// Marks the hint as seen, for good.
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) => Positioned.fill(
+    child: GestureDetector(
+      onTap: onDone,
+      behavior: HitTestBehavior.opaque,
+      child: ColoredBox(
+        color: const Color(0xCC000000),
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.end,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: <Widget>[
+              const Text(
+                'this screen is a trackpad',
+                textAlign: TextAlign.right,
+                style: TextStyle(fontSize: 16, color: Shade.text),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'tap to click, two fingers to scroll,\n'
+                'hold then drag to grab.\n\n'
+                'the mark in this corner opens the controls.\n'
+                'three fingers: swipe up to clear the glass,\n'
+                'tap for keyboard.',
+                textAlign: TextAlign.right,
+                style: readout.copyWith(color: Shade.faint, height: 1.8),
+              ),
+              const SizedBox(height: 24),
+              OutlinedButton(
+                onPressed: onDone,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Shade.text,
+                  side: const BorderSide(color: Shade.edgeLit),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(kCorner),
+                  ),
+                ),
+                child: const Text('got it'),
+              ),
+              const SizedBox(height: 40),
+            ],
+          ),
         ),
       ),
-      // The only place the gesture is written down. The bar shows itself once
-      // when a session opens, which is the one moment it can say how to ask
-      // for it again.
-      const Padding(
-        padding: EdgeInsets.symmetric(horizontal: 10),
-        child: Text(
-          'three fingers ↕',
-          style: TextStyle(color: Shade.faint, fontSize: 11),
-        ),
-      ),
-      IconButton(
-        onPressed: onToggleStats,
-        icon: const Icon(Icons.data_usage, size: 18),
-        color: showingStats ? Shade.good : Shade.faint,
-        tooltip: 'statistics',
-      ),
-    ],
+    ),
   );
 }

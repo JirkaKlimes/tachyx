@@ -1,6 +1,6 @@
 //! Opening a session, feeding it what the user does, and reading what it saw.
 
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
@@ -460,6 +460,11 @@ impl Session {
     /// Tells the host the client can take something different now, after a
     /// rotation, a resize, or a change of resolution mode.
     ///
+    /// `bitrate_ceiling` caps what the stream may cost, in bits per second.
+    /// `None` keeps the client's default. A client shrunk into a
+    /// picture-in-picture window passes a low one, because a thumbnail is not
+    /// worth a full-rate stream.
+    ///
     /// # Errors
     /// If the viewport has no area or the display never refreshes.
     #[frb(sync)]
@@ -468,9 +473,14 @@ impl Session {
         viewport_width: u16,
         viewport_height: u16,
         refresh_hz: u16,
+        bitrate_ceiling: Option<u32>,
     ) -> anyhow::Result<()> {
-        self.link
-            .viewport_changed(asked_for(viewport_width, viewport_height, refresh_hz)?);
+        self.link.viewport_changed(asked_for(
+            viewport_width,
+            viewport_height,
+            refresh_hz,
+            bitrate_ceiling,
+        )?);
         Ok(())
     }
 
@@ -485,6 +495,9 @@ impl Session {
 /// `state_directory` is where the host's fingerprint is remembered, so that a
 /// host presenting a different key on a later connection is refused rather than
 /// silently accepted.
+///
+/// `bitrate_ceiling` caps what the stream may cost, in bits per second. `None`
+/// keeps the client's default.
 ///
 /// # Errors
 /// If the address names nothing, the viewport has no area, the host presents a
@@ -501,8 +514,9 @@ pub fn connect(
     viewport_height: u16,
     refresh_hz: u16,
     state_directory: String,
+    bitrate_ceiling: Option<u32>,
 ) -> anyhow::Result<Session> {
-    let capabilities = asked_for(viewport_width, viewport_height, refresh_hz)?;
+    let capabilities = asked_for(viewport_width, viewport_height, refresh_hz, bitrate_ceiling)?;
     Ok(Session {
         link: Arc::new(Link::connect(
             &address,
@@ -523,10 +537,26 @@ fn asked_for(
     width: u16,
     height: u16,
     refresh_hz: u16,
+    bitrate_ceiling: Option<u32>,
 ) -> anyhow::Result<tachyx_proto::control::Capabilities> {
     let viewport = Size::new(width, height)
         .ok_or_else(|| anyhow::anyhow!("a {width}x{height} viewport has no picture in it"))?;
     let refresh = NonZeroU16::new(refresh_hz)
         .ok_or_else(|| anyhow::anyhow!("a display that never refreshes cannot show a stream"))?;
-    Ok(tachyx_client::capabilities(viewport, refresh).decoding(tachyx_video::decoders()?))
+    let capabilities =
+        tachyx_client::capabilities(viewport, refresh).decoding(tachyx_video::decoders()?);
+    Ok(
+        match bitrate_ceiling.and_then(|cap| NonZeroU32::new(cap.clamp(CAP_FLOOR, CAP_ROOF))) {
+            Some(ceiling) => capabilities.ceiling(ceiling),
+            None => capabilities,
+        },
+    )
 }
+
+/// The least a cap from the settings screen may ask for. Below this the ladder
+/// bottoms out and the session is frozen stills; a user asking for less is
+/// asking for a session that does not work.
+const CAP_FLOOR: u32 = 500_000;
+
+/// The most a cap may ask for, which is well past what any rung spends.
+const CAP_ROOF: u32 = 100_000_000;

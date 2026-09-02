@@ -13,12 +13,18 @@
         android:label="tachyx"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- The window folds into a thumbnail that goes on drawing when the user
+             leaves the app, so that a glance at a message does not end the
+             session. The configuration changes a fold and an unfold report are
+             already in the list this activity handles itself: screenSize,
+             smallestScreenSize, screenLayout and orientation. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
+            android:supportsPictureInPicture="true"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">

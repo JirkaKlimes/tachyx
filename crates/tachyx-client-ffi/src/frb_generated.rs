@@ -320,6 +320,7 @@ fn wire__crate__api__session__Session_viewport_changed_impl(
             let api_viewport_width = <u16>::sse_decode(&mut deserializer);
             let api_viewport_height = <u16>::sse_decode(&mut deserializer);
             let api_refresh_hz = <u16>::sse_decode(&mut deserializer);
+            let api_bitrate_ceiling = <Option<u32>>::sse_decode(&mut deserializer);
             deserializer.end();
             transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                 (move || {
@@ -342,6 +343,7 @@ fn wire__crate__api__session__Session_viewport_changed_impl(
                         api_viewport_width,
                         api_viewport_height,
                         api_refresh_hz,
+                        api_bitrate_ceiling,
                     )?;
                     std::result::Result::Ok(output_ok)
                 })(),
@@ -376,6 +378,7 @@ fn wire__crate__api__session__connect_impl(
             let api_viewport_height = <u16>::sse_decode(&mut deserializer);
             let api_refresh_hz = <u16>::sse_decode(&mut deserializer);
             let api_state_directory = <String>::sse_decode(&mut deserializer);
+            let api_bitrate_ceiling = <Option<u32>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
@@ -386,6 +389,7 @@ fn wire__crate__api__session__connect_impl(
                             api_viewport_height,
                             api_refresh_hz,
                             api_state_directory,
+                            api_bitrate_ceiling,
                         )?;
                         std::result::Result::Ok(output_ok)
                     })(),
@@ -849,6 +853,17 @@ impl SseDecode for Option<crate::api::video::PresentStats> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<crate::api::video::PresentStats>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<u32> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<u32>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -1684,6 +1699,16 @@ impl SseEncode for Option<crate::api::video::PresentStats> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <crate::api::video::PresentStats>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<u32> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <u32>::sse_encode(value, serializer);
         }
     }
 }

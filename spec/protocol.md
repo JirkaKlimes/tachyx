@@ -104,6 +104,10 @@ The video path does not use this encoding, or serde at all. See below.
 `ViewportChanged`
 : The same capability payload, sent again. The host treats it as renegotiation.
   Sent on rotation, window resize, or when the user changes the resolution mode.
+  The bitrate ceiling is re-read along with the viewport, unlike the codec set:
+  a client folded into a picture-in-picture thumbnail caps the stream low and
+  restores it on the way back, and a cap moved on the client's settings screen
+  reaches the live session the same way.
 
 `InputBatch`
 : A batch of input events, each with the client's monotonic timestamp. Batched on

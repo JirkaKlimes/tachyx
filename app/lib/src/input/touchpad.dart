@@ -5,9 +5,12 @@
 /// screen reachable without the hand covering it.
 library;
 
+import 'dart:math' as math;
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 
+import 'package:tachyx/src/input/accel.dart';
 import 'package:tachyx/src/rust/api/input.dart';
 
 /// How a displacement on the glass maps to a displacement on the streamed
@@ -71,6 +74,53 @@ class _Finger {
   double reach = 0;
 }
 
+/// How fast the finger on the glass is travelling, smoothed.
+///
+/// A single report is a poor speedometer: a touch digitiser quantises position,
+/// so two samples a frame apart can differ by a pixel that was never there, and
+/// feeding that straight to [pointerGain] would make the pointer jump while the
+/// finger crawls. The estimate is a first-order low pass instead, so one bad
+/// sample moves it by a fraction of itself.
+class _FingerSpeed {
+  /// How long the estimate takes to follow a change in speed, in seconds.
+  ///
+  /// 30 milliseconds is about two frames at 60 Hz: long enough that a single
+  /// jittery sample moves the estimate less than half way, short enough that a
+  /// flick is at full gain within the first 30 milliseconds of it.
+  static const double _tau = 0.030;
+
+  double _speed = 0;
+  Duration _at = Duration.zero;
+
+  /// Starts again from rest at [at], the event clock when the finger landed.
+  ///
+  /// A gesture that inherited the speed of the one before it would accelerate
+  /// its own first millimetre for something the user has already finished.
+  void reset(Duration at) {
+    _speed = 0;
+    _at = at;
+  }
+
+  /// Folds a step of [delta] logical pixels seen at [at] into the estimate, and
+  /// reports the speed in logical pixels per second.
+  ///
+  /// The smoothing weight is derived from the interval rather than fixed, so a
+  /// 120 Hz digitiser and a 60 Hz one settle in the same wall-clock time. It
+  /// also makes a long gap behave: the weight approaches 1, and a finger that
+  /// rested keeps nothing of the speed it had before the rest.
+  double sample(Duration at, Offset delta) {
+    final double dt =
+        (at - _at).inMicroseconds / Duration.microsecondsPerSecond;
+    _at = at;
+    // Coalesced reports share a timestamp. A step that took no time says
+    // nothing about speed, so the estimate stands rather than dividing by zero.
+    if (dt <= 0) return _speed;
+    final double weight = 1 - math.exp(-dt / _tau);
+    _speed += weight * (delta.distance / dt - _speed);
+    return _speed;
+  }
+}
+
 /// Which pointer button each mouse button bit stands for.
 const List<(int, PointerButton)> _mouseButtons = <(int, PointerButton)>[
   (kPrimaryMouseButton, PointerButton.left),
@@ -96,8 +146,7 @@ const List<(int, PointerButton)> _mouseButtons = <(int, PointerButton)>[
 /// | One-finger drag | Move the pointer |
 /// | Two-finger drag | Scroll |
 /// | Long press, then drag | Move the pointer with the left button held |
-/// | Three-finger swipe down | Show the client's own controls |
-/// | Three-finger swipe up | Hide them |
+/// | Three-finger swipe up | Hide the client's own controls |
 ///
 /// There are no timers. The largest number of fingers that were down at once is
 /// latched on the way down, and the gesture is decided when the last one
@@ -111,10 +160,11 @@ class Touchpad {
   Touchpad({
     required this.emit,
     required this.toggleKeyboard,
-    this.showControls,
     this.hideControls,
     this.onDragLock,
     this.scale = ImageScale.identity,
+    this.sensitivity = 1,
+    this.pointerAccel = 0,
     this.slop = kTouchSlop,
     this.holdDelay = const Duration(milliseconds: 500),
   });
@@ -128,10 +178,11 @@ class Touchpad {
   /// Asked for by a three-finger tap.
   final VoidCallback toggleKeyboard;
 
-  /// Asked for by a three-finger swipe down.
-  final VoidCallback? showControls;
-
   /// Asked for by a three-finger swipe up.
+  ///
+  /// There is no gesture the other way. The controls are opened by the corner
+  /// mark, which can be seen; a gesture that opens something is invisible at
+  /// the one moment somebody is looking for it.
   final VoidCallback? hideControls;
 
   /// Called when a long press turns into a held button, for haptic feedback.
@@ -141,6 +192,22 @@ class Touchpad {
   /// the resolution it encodes, or when the surface is resized.
   ImageScale scale;
 
+  /// The user's own multiplier on pointer travel, from settings.
+  ///
+  /// Applied to motion and to nothing else: scrolling follows the content
+  /// under the fingers and a click has no distance, so neither has a speed
+  /// the user could mean by this.
+  double sensitivity;
+
+  /// How much a fast finger outruns a slow one, from settings. See
+  /// [pointerGain].
+  ///
+  /// Fingers only. A real mouse already reports travel in the units its own
+  /// driver decided on, after whatever curve the operating system applies, so a
+  /// second curve here would be arguing with a decision the user made once for
+  /// the whole desktop.
+  double pointerAccel;
+
   /// How far a finger may travel and still count as a tap.
   final double slop;
 
@@ -148,6 +215,8 @@ class Touchpad {
   final Duration holdDelay;
 
   final Map<int, _Finger> _fingers = <int, _Finger>{};
+
+  final _FingerSpeed _pace = _FingerSpeed();
 
   /// The most fingers that were down at once during this gesture.
   int _peak = 0;
@@ -171,6 +240,9 @@ class Touchpad {
       _mouse(event.timeStamp, event.buttons);
       return;
     }
+    // Every gesture begins with a finger landing, so this is the one place the
+    // speed estimate has to start again from rest.
+    _pace.reset(event.timeStamp);
     _fingers[event.pointer] = _Finger(event.position, event.timeStamp);
     if (_fingers.length > _peak) _peak = _fingers.length;
   }
@@ -191,7 +263,7 @@ class Touchpad {
     if (reach > _reach) _reach = reach;
 
     if (_dragLocked) {
-      _motion(event.timeStamp, event.delta);
+      _motion(event.timeStamp, event.delta, gain: _gain(event));
       return;
     }
     switch (_peak) {
@@ -206,7 +278,7 @@ class Touchpad {
         }
         // No slop gate: motion is relative, so the few pixels of jitter before a
         // click cost nothing and waiting for them would cost latency.
-        _motion(event.timeStamp, event.delta);
+        _motion(event.timeStamp, event.delta, gain: _gain(event));
       case 2:
         // Each finger contributes its share of the movement of the pair, so two
         // fingers moving together scroll by what one of them travelled.
@@ -300,7 +372,7 @@ class Touchpad {
     _swiped = false;
   }
 
-  /// Reads three fingers that are travelling as a request for the controls.
+  /// Reads three fingers swiping up as a request to clear the glass.
   ///
   /// Three fingers that move are the one thing on this surface that meant
   /// nothing, so the client's own chrome can be hung on them without making a
@@ -309,18 +381,34 @@ class Touchpad {
   /// the finger has got to since it landed, so the swipe is decided by distance
   /// exactly as every other gesture here is.
   ///
-  /// A three-finger tap still toggles the keyboard, because a tap is a gesture
-  /// that stayed inside [slop] and this one has left it.
+  /// Only up. Opening is the corner mark's job, so a swipe down means
+  /// nothing. A three-finger tap still toggles the keyboard, because a tap is
+  /// a gesture that stayed inside [slop] and this one has left it.
   void _swipe(Offset from) {
-    if (_swiped || from.dy.abs() <= slop || from.dy.abs() <= from.dx.abs()) {
+    if (_swiped || from.dy >= -slop || from.dy.abs() <= from.dx.abs()) {
       return;
     }
     _swiped = true;
-    (from.dy > 0 ? showControls : hideControls)?.call();
+    hideControls?.call();
   }
 
-  void _motion(Duration at, Offset delta) {
-    final Offset moved = scale.apply(delta);
+  /// How much this finger has earned by how fast it is going.
+  ///
+  /// Called on every move a finger makes that reaches [_motion], because the
+  /// estimate is only as good as the samples it was given: skipping the slow
+  /// ones would leave it reading a speed the finger no longer has.
+  double _gain(PointerMoveEvent event) => pointerGain(
+    speed: _pace.sample(event.timeStamp, event.delta),
+    accel: pointerAccel,
+  );
+
+  /// Sends [delta], the travel on the glass, as travel of the remote pointer.
+  ///
+  /// [gain] is acceleration and defaults to none, so a caller that has no
+  /// finger speed to offer, which is every caller holding a mouse, gets the
+  /// flat mapping without having to ask for it.
+  void _motion(Duration at, Offset delta, {double gain = 1}) {
+    final Offset moved = scale.apply(delta) * (sensitivity * gain);
     if (moved == Offset.zero) return;
     emit(at, InputEvent.pointerMotion(dx: moved.dx, dy: moved.dy));
   }

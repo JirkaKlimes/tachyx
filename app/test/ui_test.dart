@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:tachyx/src/input/touchpad.dart';
 import 'package:tachyx/src/rust/api/input.dart';
@@ -9,11 +10,27 @@ import 'package:tachyx/src/rust/api/session.dart'
     show Encoding, HostReport, Liveness, SessionStats, VideoStats;
 import 'package:tachyx/src/rust/api/video.dart' show Latency, PresentStats;
 import 'package:tachyx/src/session/link.dart';
+import 'package:tachyx/src/settings.dart';
 import 'package:tachyx/src/ui/connect_screen.dart';
 import 'package:tachyx/src/ui/session_screen.dart';
+import 'package:tachyx/src/ui/settings_screen.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 
 Widget _wrap(Widget child) => MaterialApp(home: child);
+
+/// A settings store over mocked preferences, restored so its listeners work.
+Future<Settings> _settings({
+  List<String> hosts = const <String>[],
+  bool onboarded = true,
+}) async {
+  SharedPreferences.setMockInitialValues(<String, Object>{
+    'tachyx.hosts': hosts,
+    'tachyx.session.onboarded': onboarded,
+  });
+  final Settings settings = Settings();
+  await settings.restore();
+  return settings;
+}
 
 VideoStats _video() => VideoStats(
   packetsReceived: BigInt.from(2000),
@@ -70,6 +87,8 @@ SessionStats _stats({
 );
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('the statistics overlay', () {
     testWidgets('says there is no session rather than showing zeros', (
       WidgetTester tester,
@@ -212,62 +231,85 @@ void main() {
   });
 
   group('the connect screen', () {
-    testWidgets('starts from the address the last run used', (
+    testWidgets('a kept host connects with one tap', (
       WidgetTester tester,
     ) async {
-      String? dialledHost;
-      int? dialledPort;
+      final Settings settings = await _settings(
+        hosts: <String>['10.0.0.4:9999'],
+      );
+      String? dialled;
       await tester.pumpWidget(
         _wrap(
           ConnectScreen(
             state: const Offline(),
             protocolVersion: 1,
-            remembered: '10.0.0.4:9999',
-            onDial: (String host, int port) {
-              dialledHost = host;
-              dialledPort = port;
-            },
+            settings: settings,
+            onDial: (String address) => dialled = address,
             onDetach: () {},
           ),
         ),
       );
 
-      expect(find.text('10.0.0.4'), findsOneWidget);
-      expect(find.text('9999'), findsOneWidget);
-
-      await tester.tap(find.text('connect'));
+      await tester.tap(find.text('10.0.0.4:9999'));
       await tester.pump();
 
-      expect(dialledHost, '10.0.0.4');
-      expect(dialledPort, 9999);
+      expect(dialled, '10.0.0.4:9999');
     });
 
-    testWidgets('an address with no port takes the default one', (
+    testWidgets('an empty list opens the add form and explains itself', (
       WidgetTester tester,
     ) async {
+      final Settings settings = await _settings();
       await tester.pumpWidget(
         _wrap(
           ConnectScreen(
             state: const Offline(),
             protocolVersion: 1,
-            remembered: '10.0.0.4',
-            onDial: (String host, int port) {},
+            settings: settings,
+            onDial: (String address) {},
             onDetach: () {},
           ),
         ),
       );
 
-      // Read the field rather than the text, because the hint says the same
-      // thing and matching on it would pass whether or not the field was filled.
-      final TextField port = tester.widget<TextField>(
-        find.byType(TextField).last,
-      );
-      expect(port.controller?.text, '${HostLink.defaultPort}');
+      expect(find.textContaining('no hosts yet'), findsOneWidget);
+      expect(find.text('add host'), findsOneWidget);
+
+      await tester.enterText(find.byType(TextField).first, '10.0.0.7');
+      await tester.tap(find.text('add host'));
+      await tester.pump();
+
+      expect(settings.hosts, <String>['10.0.0.7:${HostLink.defaultPort}']);
     });
 
-    testWidgets('a refusal is shown in the words the client was given', (
-      WidgetTester tester,
-    ) async {
+    testWidgets('a host can be forgotten', (WidgetTester tester) async {
+      final Settings settings = await _settings(
+        hosts: <String>['10.0.0.4:9999'],
+      );
+      await tester.pumpWidget(
+        _wrap(
+          ConnectScreen(
+            state: const Offline(),
+            protocolVersion: 1,
+            settings: settings,
+            onDial: (String address) {},
+            onDetach: () {},
+          ),
+        ),
+      );
+
+      await tester.tap(find.byTooltip('forget'));
+      await tester.pump();
+
+      expect(settings.hosts, isEmpty);
+      expect(find.textContaining('no hosts yet'), findsOneWidget);
+    });
+
+    testWidgets('a refusal is shown in the words the client was given, '
+        'on the row that refused', (WidgetTester tester) async {
+      final Settings settings = await _settings(
+        hosts: <String>['10.0.0.4:4433'],
+      );
       await tester.pumpWidget(
         _wrap(
           ConnectScreen(
@@ -276,14 +318,13 @@ void main() {
               'the QUIC transport is not implemented yet',
             ),
             protocolVersion: 1,
-            remembered: '',
-            onDial: (String host, int port) {},
+            settings: settings,
+            onDial: (String address) {},
             onDetach: () {},
           ),
         ),
       );
 
-      expect(find.text('10.0.0.4:4433 refused'), findsOneWidget);
       expect(
         find.text('the QUIC transport is not implemented yet'),
         findsOneWidget,
@@ -293,23 +334,74 @@ void main() {
     testWidgets('dialling cannot be started twice', (
       WidgetTester tester,
     ) async {
+      final Settings settings = await _settings(
+        hosts: <String>['10.0.0.4:4433'],
+      );
       int dials = 0;
       await tester.pumpWidget(
         _wrap(
           ConnectScreen(
             state: const Dialling('10.0.0.4:4433'),
             protocolVersion: 1,
-            remembered: '10.0.0.4:4433',
-            onDial: (String host, int port) => dials++,
+            settings: settings,
+            onDial: (String address) => dials++,
             onDetach: () {},
           ),
         ),
       );
 
-      await tester.tap(find.text('connecting…'));
+      expect(find.text('dialling…'), findsOneWidget);
+      await tester.tap(find.text('10.0.0.4:4433'));
       await tester.pump();
 
       expect(dials, 0);
+    });
+  });
+
+  group('the settings screen', () {
+    testWidgets('moving a slider stores the choice', (
+      WidgetTester tester,
+    ) async {
+      final Settings settings = await _settings();
+      await tester.pumpWidget(
+        _wrap(SettingsScreen(settings: settings, onConnect: (String _) {})),
+      );
+
+      expect(find.text('20 Mbit/s'), findsOneWidget, reason: 'the default cap');
+      expect(find.text('1.0×'), findsOneWidget, reason: 'default sensitivity');
+
+      await tester.drag(find.byType(Slider).first, const Offset(-400, 0));
+      await tester.pump();
+
+      expect(
+        settings.streamBitrate,
+        Settings.minBitrate,
+        reason: 'dragged to the floor of the range',
+      );
+    });
+
+    testWidgets('hosts can be added and removed here too', (
+      WidgetTester tester,
+    ) async {
+      final Settings settings = await _settings(
+        hosts: <String>['10.0.0.4:9999'],
+      );
+      await tester.pumpWidget(
+        _wrap(SettingsScreen(settings: settings, onConnect: (String _) {})),
+      );
+
+      // The screen scrolls, so the hosts at the foot of it need bringing into
+      // view before they can be touched. A test window is smaller than a phone.
+      await tester.ensureVisible(find.byTooltip('forget'));
+      await tester.tap(find.byTooltip('forget'));
+      await tester.pump();
+      expect(settings.hosts, isEmpty);
+
+      await tester.enterText(find.byType(TextField).first, 'desk.local');
+      await tester.ensureVisible(find.text('add host'));
+      await tester.tap(find.text('add host'));
+      await tester.pump();
+      expect(settings.hosts, <String>['desk.local:${HostLink.defaultPort}']);
     });
   });
 
@@ -321,10 +413,23 @@ void main() {
 
     /// A session with no host, which is the one shape a widget test can build:
     /// anything else needs the client core on the other end.
-    Future<void> pumpSession(WidgetTester tester, {VoidCallback? onLeave}) =>
-        tester.pumpWidget(
-          _wrap(SessionScreen(protocolVersion: 1, onLeave: onLeave ?? () {})),
-        );
+    Future<Settings> pumpSession(
+      WidgetTester tester, {
+      VoidCallback? onLeave,
+      bool onboarded = true,
+    }) async {
+      final Settings settings = await _settings(onboarded: onboarded);
+      await tester.pumpWidget(
+        _wrap(
+          SessionScreen(
+            protocolVersion: 1,
+            settings: settings,
+            onLeave: onLeave ?? () {},
+          ),
+        ),
+      );
+      return settings;
+    }
 
     /// Three fingers travelling [by] on the pad, and the frames that follow.
     Future<void> swipe(WidgetTester tester, Offset by) async {
@@ -344,9 +449,8 @@ void main() {
       await tester.pump(const Duration(milliseconds: 250));
     }
 
-    /// Where the bar has been told to sit, in multiples of its own height.
-    Offset barOffset(WidgetTester tester) =>
-        tester.widget<AnimatedSlide>(find.byType(AnimatedSlide)).offset;
+    Finder controls() => find.byKey(const ValueKey<String>('controls'));
+    Finder mark() => find.byKey(const ValueKey<String>('mark'));
 
     testWidgets('the picture is the whole window', (WidgetTester tester) async {
       await pumpSession(tester);
@@ -361,55 +465,115 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('a three-finger swipe puts the chrome away and brings it back', (
+    testWidgets('the controls fold into the corner mark and come back', (
       WidgetTester tester,
     ) async {
       await pumpSession(tester);
-      expect(find.byType(StatsOverlay), findsOneWidget);
+      expect(controls(), findsOneWidget, reason: 'a session opens showing');
 
       await swipe(tester, const Offset(0, -60));
+      await tester.pump(const Duration(milliseconds: 250));
 
-      expect(find.byType(StatsOverlay), findsNothing);
-      expect(barOffset(tester), const Offset(0, 1), reason: 'off the bottom');
+      expect(controls(), findsNothing);
+      expect(mark(), findsOneWidget, reason: 'the ghost stays reachable');
 
+      // The mark is the one way back in: a downward swipe means nothing.
       await swipe(tester, const Offset(0, 60));
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(controls(), findsNothing);
 
-      expect(find.byType(StatsOverlay), findsOneWidget);
-      expect(barOffset(tester), Offset.zero);
+      await tester.tapAt(tester.getCenter(mark()));
+      await tester.pump(const Duration(milliseconds: 250));
+
+      expect(controls(), findsOneWidget);
 
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('the bar retires on its own and leaves the panel', (
+    testWidgets('the controls retire on their own', (
       WidgetTester tester,
     ) async {
       await pumpSession(tester);
-      expect(barOffset(tester), Offset.zero);
+      expect(controls(), findsOneWidget);
 
       await tester.pump(const Duration(seconds: 6));
       await tester.pump(const Duration(milliseconds: 250));
 
-      expect(barOffset(tester), const Offset(0, 1));
+      expect(controls(), findsNothing);
+      expect(mark(), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('tapping the mark opens the controls', (
+      WidgetTester tester,
+    ) async {
+      await pumpSession(tester);
+      await tester.pump(const Duration(seconds: 6));
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(mark(), findsOneWidget);
+
+      await tester.tap(mark());
+      await tester.pump(const Duration(milliseconds: 250));
+
+      expect(controls(), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('the statistics panel is asked for, not default', (
+      WidgetTester tester,
+    ) async {
+      await pumpSession(tester);
+      expect(find.byType(StatsOverlay), findsNothing);
+
+      await tester.tap(find.byTooltip('statistics'));
+      await tester.pump();
+
+      expect(find.byType(StatsOverlay), findsOneWidget);
+
+      await swipe(tester, const Offset(0, -60));
+
       expect(
         find.byType(StatsOverlay),
-        findsOneWidget,
-        reason: 'the panel is read for as long as its reader wants it',
+        findsNothing,
+        reason: 'a swipe up clears the glass entirely',
       );
 
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('a bar that is away takes no touch from the pad', (
+    testWidgets('the first session ever explains itself, once', (
+      WidgetTester tester,
+    ) async {
+      final Settings settings = await pumpSession(tester, onboarded: false);
+      expect(find.textContaining('this screen is a trackpad'), findsOneWidget);
+
+      await tester.tap(find.text('got it'));
+      await tester.pump();
+
+      expect(find.textContaining('this screen is a trackpad'), findsNothing);
+      expect(settings.onboarded, isTrue);
+
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('a retired dock takes no touch but the mark itself', (
       WidgetTester tester,
     ) async {
       int left = 0;
       await pumpSession(tester, onLeave: () => left++);
       await swipe(tester, const Offset(0, -60));
+      await tester.pump(const Duration(milliseconds: 250));
 
-      await tester.tap(find.byTooltip('leave'), warnIfMissed: false);
-      await tester.pump();
+      // The buttons are out of the tree entirely, not merely invisible, so
+      // a tap where the leave button sat cannot leave the session.
+      expect(find.byTooltip('leave'), findsNothing);
+      await tester.tapAt(tester.getCenter(mark()));
+      await tester.pump(const Duration(milliseconds: 250));
 
       expect(left, 0);
+      expect(controls(), findsOneWidget, reason: 'the tap opened the dock');
 
       await tester.pumpWidget(const SizedBox());
     });
@@ -424,7 +588,10 @@ void main() {
     });
 
     test('anything else is shown as it describes itself', () {
-      expect(HostLink.describe(const FormatException('bad port')), contains('bad port'));
+      expect(
+        HostLink.describe(const FormatException('bad port')),
+        contains('bad port'),
+      );
     });
   });
 }

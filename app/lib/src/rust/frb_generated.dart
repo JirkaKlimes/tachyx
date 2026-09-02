@@ -108,6 +108,7 @@ abstract class RustLibApi extends BaseApi {
     required int viewportWidth,
     required int viewportHeight,
     required int refreshHz,
+    int? bitrateCeiling,
   });
 
   Future<Session> crateApiSessionConnect({
@@ -116,6 +117,7 @@ abstract class RustLibApi extends BaseApi {
     required int viewportHeight,
     required int refreshHz,
     required String stateDirectory,
+    int? bitrateCeiling,
   });
 
   Future<void> crateApiSessionInit();
@@ -296,6 +298,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required int viewportWidth,
     required int viewportHeight,
     required int refreshHz,
+    int? bitrateCeiling,
   }) {
     return handler.executeSync(
       SyncTask(
@@ -308,6 +311,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_u_16(viewportWidth, serializer);
           sse_encode_u_16(viewportHeight, serializer);
           sse_encode_u_16(refreshHz, serializer);
+          sse_encode_opt_box_autoadd_u_32(bitrateCeiling, serializer);
           return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 6)!;
         },
         codec: SseCodec(
@@ -315,7 +319,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiSessionSessionViewportChangedConstMeta,
-        argValues: [that, viewportWidth, viewportHeight, refreshHz],
+        argValues: [
+          that,
+          viewportWidth,
+          viewportHeight,
+          refreshHz,
+          bitrateCeiling,
+        ],
         apiImpl: this,
       ),
     );
@@ -324,7 +334,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiSessionSessionViewportChangedConstMeta =>
       const TaskConstMeta(
         debugName: "Session_viewport_changed",
-        argNames: ["that", "viewportWidth", "viewportHeight", "refreshHz"],
+        argNames: [
+          "that",
+          "viewportWidth",
+          "viewportHeight",
+          "refreshHz",
+          "bitrateCeiling",
+        ],
       );
 
   @override
@@ -334,6 +350,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     required int viewportHeight,
     required int refreshHz,
     required String stateDirectory,
+    int? bitrateCeiling,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -344,6 +361,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_u_16(viewportHeight, serializer);
           sse_encode_u_16(refreshHz, serializer);
           sse_encode_String(stateDirectory, serializer);
+          sse_encode_opt_box_autoadd_u_32(bitrateCeiling, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -363,6 +381,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           viewportHeight,
           refreshHz,
           stateDirectory,
+          bitrateCeiling,
         ],
         apiImpl: this,
       ),
@@ -377,6 +396,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       "viewportHeight",
       "refreshHz",
       "stateDirectory",
+      "bitrateCeiling",
     ],
   );
 
@@ -528,6 +548,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   PresentStats dco_decode_box_autoadd_present_stats(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_present_stats(raw);
+  }
+
+  @protected
+  int dco_decode_box_autoadd_u_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
   }
 
   @protected
@@ -751,6 +777,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int? dco_decode_opt_box_autoadd_u_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_u_32(raw);
+  }
+
+  @protected
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_u_64(raw);
@@ -964,6 +996,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_present_stats(deserializer));
+  }
+
+  @protected
+  int sse_decode_box_autoadd_u_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_u_32(deserializer));
   }
 
   @protected
@@ -1240,6 +1278,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int? sse_decode_opt_box_autoadd_u_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_u_32(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1494,6 +1543,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_u_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self, serializer);
+  }
+
+  @protected
   void sse_encode_box_autoadd_u_64(BigInt self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_u_64(self, serializer);
@@ -1725,6 +1780,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_u_32(int? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_u_32(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1899,16 +1964,23 @@ class SessionImpl extends RustOpaque implements Session {
   /// Tells the host the client can take something different now, after a
   /// rotation, a resize, or a change of resolution mode.
   ///
+  /// `bitrate_ceiling` caps what the stream may cost, in bits per second.
+  /// `None` keeps the client's default. A client shrunk into a
+  /// picture-in-picture window passes a low one, because a thumbnail is not
+  /// worth a full-rate stream.
+  ///
   /// # Errors
   /// If the viewport has no area or the display never refreshes.
   void viewportChanged({
     required int viewportWidth,
     required int viewportHeight,
     required int refreshHz,
+    int? bitrateCeiling,
   }) => RustLib.instance.api.crateApiSessionSessionViewportChanged(
     that: this,
     viewportWidth: viewportWidth,
     viewportHeight: viewportHeight,
     refreshHz: refreshHz,
+    bitrateCeiling: bitrateCeiling,
   );
 }

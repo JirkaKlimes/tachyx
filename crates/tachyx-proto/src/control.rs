@@ -5,14 +5,14 @@
 //! carries [`VERSION`] ahead of everything else, and [`Hello::decode`] reads
 //! that field before it reads anything a later version might have reshaped.
 
-use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU8};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::VERSION;
 use crate::input::InputEvent;
 use crate::media::{FrameId, Seq, Timestamp};
+use crate::VERSION;
 
 /// A picture size in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +228,19 @@ impl Capabilities {
     #[must_use]
     pub const fn decoding(self, decode: Codecs) -> Self {
         Self { decode, ..self }
+    }
+
+    /// The same capabilities, spending at most this many bits a second.
+    ///
+    /// What a client with a user-set bitrate cap, or one shrunk into a
+    /// picture-in-picture window, calls. The host reads it from the hello and
+    /// from every [`ClientMessage::ViewportChanged`] after it.
+    #[must_use]
+    pub const fn ceiling(self, bitrate_ceiling: NonZeroU32) -> Self {
+        Self {
+            bitrate_ceiling,
+            ..self
+        }
     }
 }
 

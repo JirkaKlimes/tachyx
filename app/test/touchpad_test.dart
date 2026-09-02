@@ -2,6 +2,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:tachyx/src/input/accel.dart';
 import 'package:tachyx/src/input/touchpad.dart';
 import 'package:tachyx/src/rust/api/input.dart';
 
@@ -10,7 +11,6 @@ class _Recorder {
   final List<InputEvent> events = <InputEvent>[];
   int keyboardToggles = 0;
   int dragLocks = 0;
-  int controlsShown = 0;
   int controlsHidden = 0;
 
   void emit(Duration at, InputEvent event) => events.add(event);
@@ -42,15 +42,18 @@ InputEvent _release(PointerButton button) =>
 Future<(Touchpad, _Recorder)> _surface(
   WidgetTester tester, {
   ImageScale scale = ImageScale.identity,
+  double sensitivity = 1,
+  double pointerAccel = 0,
 }) async {
   final _Recorder log = _Recorder();
   final Touchpad pad = Touchpad(
     emit: log.emit,
     toggleKeyboard: () => log.keyboardToggles++,
-    showControls: () => log.controlsShown++,
     hideControls: () => log.controlsHidden++,
     onDragLock: () => log.dragLocks++,
     scale: scale,
+    sensitivity: sensitivity,
+    pointerAccel: pointerAccel,
   );
   await tester.pumpWidget(
     TouchSurface(
@@ -299,19 +302,18 @@ void main() {
   });
 
   group("the client's own controls", () {
-    testWidgets('a three-finger swipe down asks for them', (
+    testWidgets('a three-finger swipe up puts them away', (
       WidgetTester tester,
     ) async {
       final (_, _Recorder log) = await _surface(tester);
       final List<TestGesture> fingers = await _threeFingers(tester);
       for (final TestGesture finger in fingers) {
-        await finger.moveBy(const Offset(0, 40));
+        await finger.moveBy(const Offset(0, -40));
       }
 
       // Asserted before the fingers lift: the swipe is read from how far they
       // have got, so nothing is waiting on the end of the gesture.
-      expect(log.controlsShown, 1);
-      expect(log.controlsHidden, 0);
+      expect(log.controlsHidden, 1);
 
       await _lift(fingers);
       expect(log.events, isEmpty, reason: 'a swipe is not a click');
@@ -322,19 +324,21 @@ void main() {
       );
     });
 
-    testWidgets('a three-finger swipe up puts them away', (
+    testWidgets('a three-finger swipe down means nothing', (
       WidgetTester tester,
     ) async {
+      // Opening is the corner mark's job, so the downward swipe is spare and
+      // deliberately unbound.
       final (_, _Recorder log) = await _surface(tester);
       final List<TestGesture> fingers = await _threeFingers(tester);
       for (final TestGesture finger in fingers) {
-        await finger.moveBy(const Offset(0, -40));
+        await finger.moveBy(const Offset(0, 40));
       }
       await _lift(fingers);
 
-      expect(log.controlsHidden, 1);
-      expect(log.controlsShown, 0);
+      expect(log.controlsHidden, 0);
       expect(log.events, isEmpty);
+      expect(log.keyboardToggles, 0);
     });
 
     testWidgets('one swipe asks once, however far the fingers travel', (
@@ -344,12 +348,12 @@ void main() {
       final List<TestGesture> fingers = await _threeFingers(tester);
       for (int i = 0; i < 6; i++) {
         for (final TestGesture finger in fingers) {
-          await finger.moveBy(const Offset(0, 30));
+          await finger.moveBy(const Offset(0, -30));
         }
       }
       await _lift(fingers);
 
-      expect(log.controlsShown, 1);
+      expect(log.controlsHidden, 1);
     });
 
     testWidgets('three fingers travelling sideways say nothing', (
@@ -362,7 +366,6 @@ void main() {
       }
       await _lift(fingers);
 
-      expect(log.controlsShown, 0);
       expect(log.controlsHidden, 0);
       expect(log.events, isEmpty);
       expect(log.keyboardToggles, 0);
@@ -443,8 +446,8 @@ void main() {
       expect(log.dragLocks, 1, reason: 'a long press still locks the drag');
 
       expect(
-        <int>[log.controlsShown, log.controlsHidden],
-        <int>[0, 0],
+        log.controlsHidden,
+        0,
         reason: 'not one row of the table reached the controls',
       );
     });
@@ -476,6 +479,236 @@ void main() {
       expect(
         ImageScale.of(image: const Size(2400, 1080), box: Size.zero),
         ImageScale.identity,
+      );
+    });
+
+    testWidgets('sensitivity multiplies motion and nothing else', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester, sensitivity: 2);
+
+      final TestGesture finger = await tester.startGesture(
+        const Offset(100, 100),
+        pointer: 30,
+      );
+      await finger.moveBy(const Offset(10, 5));
+      await finger.up();
+
+      expect(log.travelled, const Offset(20, 10));
+
+      // Two fingers scrolling travel unscaled: the content follows the
+      // fingers, and a multiplier would break that contact.
+      final TestGesture first = await tester.startGesture(
+        const Offset(100, 200),
+        pointer: 31,
+      );
+      final TestGesture second = await tester.startGesture(
+        const Offset(160, 200),
+        pointer: 32,
+      );
+      await first.moveBy(const Offset(0, 10));
+      await second.moveBy(const Offset(0, 10));
+      await first.up();
+      await second.up();
+
+      expect(log.scrolled, const Offset(0, -10));
+    });
+  });
+
+  /// Drags one finger [steps] times by [by], one step every [every] on the
+  /// event clock, and reports what reached the wire.
+  ///
+  /// The timestamps are the point of it: acceleration reads the speed of the
+  /// finger, and the only speed a test can state is a distance over a clock the
+  /// test sets itself.
+  Future<Offset> dragged(
+    WidgetTester tester, {
+    required Offset by,
+    required Duration every,
+    int steps = 10,
+    double pointerAccel = 0,
+  }) async {
+    final (_, _Recorder log) = await _surface(
+      tester,
+      pointerAccel: pointerAccel,
+    );
+    final TestGesture finger = await tester.startGesture(
+      const Offset(60, 400),
+      pointer: 40,
+    );
+    for (int i = 1; i <= steps; i++) {
+      await finger.moveBy(by, timeStamp: every * i);
+    }
+    await finger.up();
+    return log.travelled;
+  }
+
+  group('acceleration', () {
+    testWidgets('a careful drag arrives at the size it left', (
+      WidgetTester tester,
+    ) async {
+      // 80 logical pixels per second, which is the band a finger uses to put
+      // the pointer on a checkbox. Asserted exactly: the curve is flat here,
+      // not merely gentle.
+      expect(
+        await dragged(
+          tester,
+          by: const Offset(8, 0),
+          every: const Duration(milliseconds: 100),
+          pointerAccel: 1,
+        ),
+        const Offset(80, 0),
+      );
+    });
+
+    testWidgets('a flick goes further than flat, but never past the cap', (
+      WidgetTester tester,
+    ) async {
+      // 4000 logical pixels per second, which is a thrown finger.
+      const Offset step = Offset(40, 0);
+      const Duration every = Duration(milliseconds: 10);
+      final Offset flat = await dragged(tester, by: step, every: every);
+      final Offset flung = await dragged(
+        tester,
+        by: step,
+        every: every,
+        pointerAccel: 1,
+      );
+
+      expect(flat, const Offset(400, 0), reason: 'the setting off is flat');
+      expect(flung.dx, greaterThan(2 * flat.dx));
+      expect(flung.dx, lessThanOrEqualTo((1 + maxBoost) * flat.dx));
+    });
+
+    testWidgets('a new gesture inherits nothing from the last one', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester, pointerAccel: 1);
+      final TestGesture flick = await tester.startGesture(
+        const Offset(60, 400),
+        pointer: 45,
+      );
+      for (int i = 1; i <= 10; i++) {
+        await flick.moveBy(
+          const Offset(40, 0),
+          timeStamp: Duration(milliseconds: 10 * i),
+        );
+      }
+      await flick.up();
+      final Offset afterFlick = log.travelled;
+      expect(afterFlick.dx, greaterThan(800), reason: 'the flick was fast');
+
+      final TestGesture careful = await tester.startGesture(
+        const Offset(60, 400),
+        pointer: 46,
+      );
+      for (int i = 1; i <= 10; i++) {
+        await careful.moveBy(
+          const Offset(8, 0),
+          timeStamp: Duration(milliseconds: 100 * (i + 1)),
+        );
+      }
+      await careful.up();
+
+      expect(
+        log.travelled - afterFlick,
+        const Offset(80, 0),
+        reason: 'the careful drag starts from rest, not from the flick',
+      );
+    });
+
+    testWidgets('reports that share a timestamp keep the last speed', (
+      WidgetTester tester,
+    ) async {
+      final (_, _Recorder log) = await _surface(tester, pointerAccel: 1);
+      final TestGesture finger = await tester.startGesture(
+        const Offset(60, 400),
+        pointer: 44,
+      );
+      // The first move has a clock behind it. The three after it are coalesced
+      // onto the same reading, so they have no interval of their own.
+      for (int i = 0; i < 4; i++) {
+        await finger.moveBy(
+          const Offset(40, 0),
+          timeStamp: const Duration(milliseconds: 10),
+        );
+      }
+      await finger.up();
+
+      final List<double> steps = log.motions
+          .map((InputEvent e) => (e as InputEvent_PointerMotion).dx)
+          .toList();
+      expect(steps, hasLength(4));
+      expect(steps.every((double dx) => dx.isFinite), isTrue);
+      expect(steps[0], greaterThan(40), reason: 'the first one was fast');
+      expect(
+        steps.sublist(1),
+        everyElement(steps[0]),
+        reason: 'no interval, so no new speed and no new gain',
+      );
+    });
+
+    testWidgets('a mouse is left alone', (WidgetTester tester) async {
+      final (Touchpad pad, _Recorder log) = await _surface(
+        tester,
+        pointerAccel: 1,
+      );
+      final TestGesture mouse = await tester.startGesture(
+        const Offset(100, 100),
+        pointer: 42,
+        kind: PointerDeviceKind.mouse,
+        buttons: kPrimaryMouseButton,
+      );
+      for (int i = 1; i <= 10; i++) {
+        await mouse.moveBy(
+          const Offset(40, 0),
+          timeStamp: Duration(milliseconds: 10 * i),
+        );
+      }
+      await mouse.up();
+      expect(
+        log.travelled,
+        const Offset(400, 0),
+        reason: "the mouse already came through the desktop's own curve",
+      );
+
+      log.events.clear();
+      for (int i = 1; i <= 10; i++) {
+        pad.hover(
+          PointerHoverEvent(
+            kind: PointerDeviceKind.mouse,
+            position: Offset(100 + 40.0 * i, 100),
+            delta: const Offset(40, 0),
+            timeStamp: Duration(milliseconds: 200 + 10 * i),
+          ),
+        );
+      }
+      expect(log.travelled, const Offset(400, 0), reason: 'hovering too');
+    });
+
+    testWidgets('scrolling is left alone', (WidgetTester tester) async {
+      final (_, _Recorder log) = await _surface(tester, pointerAccel: 1);
+      final TestGesture left = await tester.startGesture(
+        const Offset(100, 300),
+        pointer: 47,
+      );
+      final TestGesture right = await tester.startGesture(
+        const Offset(160, 300),
+        pointer: 48,
+      );
+      for (int i = 1; i <= 10; i++) {
+        final Duration at = Duration(milliseconds: 10 * i);
+        await left.moveBy(const Offset(0, 40), timeStamp: at);
+        await right.moveBy(const Offset(0, 40), timeStamp: at);
+      }
+      await left.up();
+      await right.up();
+
+      expect(log.motions, isEmpty);
+      expect(
+        log.scrolled,
+        const Offset(0, -400),
+        reason: 'the content follows the fingers, however fast they go',
       );
     });
   });
