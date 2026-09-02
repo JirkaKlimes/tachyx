@@ -837,7 +837,6 @@ fn pump(
 ) -> Result<(), Error> {
     let allocator = DmaBufAllocator::new();
     let mut next = 0u32;
-    let mut scratch = Vec::new();
     let mut bucket = Bucket::new(Instant::now());
     let mut cadence = Cadence::default();
     let mut key_frame_bits = 0.0f64;
@@ -894,7 +893,7 @@ fn pump(
         let elapsed = started.elapsed();
         drop(lease);
 
-        let Some(unit) = describe(&sample, next, &mut scratch, counters) else {
+        let Some(unit) = describe(&sample, next, counters) else {
             continue;
         };
         bucket.charge(unit.bytes.len());
@@ -920,21 +919,17 @@ fn pump(
 }
 
 /// Turns one encoded sample into an access unit, dropping filler.
-fn describe(
-    sample: &gst::Sample,
-    id: u32,
-    scratch: &mut Vec<u8>,
-    counters: &Counters,
-) -> Option<AccessUnit> {
+fn describe(sample: &gst::Sample, id: u32, counters: &Counters) -> Option<AccessUnit> {
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;
-    scratch.clear();
-    scratch.reserve(map.size());
-    let filler = without_filler(&map, scratch);
+    // Exactly the one allocation the access unit is handed on with. Filler has
+    // measured at nought per cent, so this is also its final length.
+    let mut bytes = Vec::with_capacity(map.size());
+    let filler = without_filler(&map, &mut bytes);
     counters.filler.fetch_add(filler as u64, Ordering::Relaxed);
     counters
         .bytes
-        .fetch_add(scratch.len() as u64, Ordering::Relaxed);
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
     counters.encoded.fetch_add(1, Ordering::Relaxed);
     Some(AccessUnit {
         frame: FrameId(id),
@@ -944,7 +939,7 @@ fn describe(
         } else {
             FrameKind::Key
         },
-        bytes: std::mem::take(scratch),
+        bytes,
     })
 }
 
