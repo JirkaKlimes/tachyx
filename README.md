@@ -24,7 +24,7 @@ you trust, and only there.
 
 ```
 crates/            Rust workspace (virtual manifest)
-apps/flutter/      Flutter client: Android and Linux
+app/               Flutter client: Android and Linux
 spec/              Protocol and architecture documents
 ```
 

@@ -154,7 +154,7 @@
               # GStreamer or glib cannot find them under `flutter build`, only
               # under a bare `cargo build`. Smuggling it through under a NIX_
               # name is the only channel the hook leaves open;
-              # apps/flutter/hook/build.dart puts it back.
+              # app/hook/build.dart puts it back.
               export NIX_PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
 
               # Gradle and pub write to their caches, and the store is read only.

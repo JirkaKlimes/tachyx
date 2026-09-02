@@ -647,7 +647,7 @@ notch, not a measurement.
 
 ### iOS
 
-There is no `ios/` directory. `apps/flutter/` holds `android/` and `linux/` and
+There is no `ios/` directory. `app/` holds `android/` and `linux/` and
 nothing else, and `flake.nix:17-21` targets two Linux systems, so a build host
 does not exist in this repository either.
 

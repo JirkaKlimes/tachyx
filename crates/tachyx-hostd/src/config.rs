@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// The port the daemon listens on when nothing says otherwise.
 ///
 /// The client's own default must match this, in
-/// `apps/flutter/lib/src/session/link.dart`.
+/// `app/lib/src/session/link.dart`.
 pub const DEFAULT_PORT: u16 = 47_989;
 
 /// Settings for the daemon.

@@ -349,7 +349,7 @@ tachyx/
     relayd/         # relay (+ optional billing module)
     coordd/         # accounts, billing, directory
     cli/            # tachyx
-  apps/flutter/     # desktop, mobile, web UI
+  app/              # desktop, mobile, web UI
   spec/             # protocol document (the "whitepaper")
   nix/              # packages, NixOS modules, deploy
 ```

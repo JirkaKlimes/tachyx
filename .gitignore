@@ -5,19 +5,15 @@
 .direnv/
 
 # Flutter / Dart
-apps/flutter/.dart_tool/
-apps/flutter/.flutter-plugins
-apps/flutter/.flutter-plugins-dependencies
-apps/flutter/build/
-apps/flutter/android/.gradle/
-apps/flutter/android/local.properties
-apps/flutter/ios/Pods/
-apps/flutter/linux/flutter/ephemeral/
-apps/flutter/.pub-cache/
-apps/flutter/pubspec.lock
-
-# Generated FFI bindings are checked in; their intermediates are not.
-apps/flutter/rust_builder/
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/build/
+app/android/.gradle/
+app/android/build/
+app/android/local.properties
+app/linux/flutter/ephemeral/
+app/.pub-cache/
 
 # Tooling caches
 .ruff_cache/
