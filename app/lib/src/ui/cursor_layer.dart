@@ -1,6 +1,8 @@
 /// The remote pointer, drawn over the video.
 library;
 
+import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
@@ -53,7 +55,10 @@ class CursorLayer extends StatelessWidget {
   Widget build(BuildContext context) => IgnorePointer(
     child: RepaintBoundary(
       child: CustomPaint(
-        painter: CursorPainter(cursor),
+        painter: CursorPainter(
+          cursor,
+          pixelRatio: MediaQuery.devicePixelRatioOf(context),
+        ),
         size: Size.infinite,
       ),
     ),
@@ -62,11 +67,16 @@ class CursorLayer extends StatelessWidget {
 
 /// Paints one pointer.
 class CursorPainter extends CustomPainter {
-  /// Repaints whenever [cursor] changes.
-  CursorPainter(this.cursor) : super(repaint: cursor);
+  /// Repaints whenever [cursor] changes, onto a grid of [pixelRatio] device
+  /// pixels to the logical pixel.
+  CursorPainter(this.cursor, {this.pixelRatio = 1}) : super(repaint: cursor);
 
   /// Where the pointer is.
   final ValueListenable<RemoteCursor?> cursor;
+
+  /// Device pixels to the logical pixel, which is the grid the picture is put
+  /// on. See [onWholePixels].
+  final double pixelRatio;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -86,8 +96,36 @@ class CursorPainter extends CustomPainter {
         art.image.width.toDouble(),
         art.image.height.toDouble(),
       ),
-      rect,
+      onWholePixels(rect),
       Paint()..filterQuality = FilterQuality.medium,
+    );
+  }
+
+  /// [rect] moved and sized onto whole device pixels.
+  ///
+  /// The pointer is a few dozen pixels of hard edges, and the prediction puts
+  /// it wherever the finger asked for, which is almost never a whole pixel of
+  /// anything. Drawn there, all four edges fall between two device pixels and
+  /// the filter smears the picture across both. That is what makes a remote
+  /// pointer look soft beside the one the platform draws, and it is worse the
+  /// smaller the picture is, which on a phone is very small indeed.
+  ///
+  /// A cursor the hardware draws sits on whole device pixels. This puts this
+  /// one there. The cost is up to half a device pixel of position, which is
+  /// less than the width of the blur it buys back.
+  @visibleForTesting
+  Rect onWholePixels(Rect rect) {
+    if (pixelRatio <= 0) return rect;
+    double whole(double logical) =>
+        (logical * pixelRatio).roundToDouble() / pixelRatio;
+    // A picture rounded away to nothing is a pointer that vanishes, which is
+    // worse than one drawn a fraction too large.
+    final double least = 1 / pixelRatio;
+    return Rect.fromLTWH(
+      whole(rect.left),
+      whole(rect.top),
+      math.max(least, whole(rect.width)),
+      math.max(least, whole(rect.height)),
     );
   }
 
@@ -109,5 +147,6 @@ class CursorPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(CursorPainter old) => old.cursor != cursor;
+  bool shouldRepaint(CursorPainter old) =>
+      old.cursor != cursor || old.pixelRatio != pixelRatio;
 }

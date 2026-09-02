@@ -340,10 +340,15 @@ impl CursorTracker {
             .applied
             .iter()
             .filter(|(when, _)| *when >= taken_at)
-            .fold(reported, |spot, (_, delta)| {
-                spot.plus(delta.scaled(self.gain))
-            })
-            .onto_screen();
+            // Held on the screen at every step, exactly as [`Self::moved`]
+            // holds it, so that the two reckonings are the same arithmetic. A
+            // replay that added the whole excursion up before clamping would
+            // hand back the travel an edge had already eaten, and a pointer
+            // pushed into an edge and pulled away from it would jump by the
+            // overshoot.
+            .fold(reported.onto_screen(), |spot, (_, delta)| {
+                spot.plus(delta.scaled(self.gain)).onto_screen()
+            });
         if replayed.distance(self.predicted) >= SNAP {
             replayed
         } else {
@@ -637,6 +642,32 @@ mod tests {
         assert!(
             (after - learned).abs() < 0.05,
             "the scale moved from {learned:.3} to {after:.3} against an edge"
+        );
+    }
+
+    #[test]
+    fn a_pointer_pushed_into_an_edge_does_not_jump_when_it_comes_back() {
+        let now = Instant::now();
+        let mut tracker = CursorTracker::new();
+        tracker.reported(now, &tracked(Some(at(950, 500)), None), RTT);
+
+        // Shoved off the right edge and pulled back. The client's own reckoning
+        // stopped at the edge on the way out, so the overshoot is gone.
+        let later = now + Duration::from_millis(1);
+        tracker.moved(later, 0.2, 0.0);
+        tracker.moved(later, -0.2, 0.0);
+        assert!(close(tracker.view().expect("reported").at.x, 0.8));
+
+        // The same report again: nothing has happened on the host that the
+        // client did not already know. A replay that added the excursion up
+        // before clamping would give the overshoot back and jump the pointer a
+        // fifth of the screen to the right.
+        tracker.reported(later, &tracked(Some(at(950, 500)), None), RTT);
+        let view = tracker.view().expect("reported");
+        assert!(
+            close(view.at.x, 0.8),
+            "the pointer jumped to {:?} coming off the edge",
+            view.at
         );
     }
 

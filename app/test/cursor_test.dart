@@ -47,6 +47,96 @@ void main() {
     expect(large.height, closeTo(small.height * 2, 1e-9));
   });
 
+  // The pointer has to be the size it would be on the remote desktop, seen
+  // through the video: the same fraction of the drawn picture as it is of the
+  // screen it was captured on. Anything else leaves it out of scale with the
+  // interface it is pointing at, which on a phone is what makes it look huge.
+  group('the size the remote desktop would draw it', () {
+    test('a phone shrinks it exactly as much as it shrinks the desktop', () {
+      // The 2000-pixel-wide screen drawn 400 logical pixels wide: a fifth.
+      final Rect rect = arrow.rectAt(const Offset(200, 100), const Size(400, 200));
+      expect(rect.width, closeTo(48 / 5, 1e-9));
+      expect(
+        rect.width / 400,
+        closeTo(48 / 2000, 1e-9),
+        reason: 'the same share of the picture as of the screen it came from',
+      );
+    });
+
+    test('a viewport larger than the desktop grows it by the same factor', () {
+      final Rect rect = arrow.rectAt(
+        const Offset(2000, 1000),
+        const Size(4000, 2000),
+      );
+      expect(rect.width, closeTo(48 * 2, 1e-9));
+      expect(rect.height, closeTo(48 * 2, 1e-9));
+    });
+
+    test('the hotspot keeps its place inside the picture under any scale', () {
+      for (final Size drawn in <Size>[
+        const Size(400, 200),
+        const Size(2000, 1000),
+        const Size(4000, 2000),
+      ]) {
+        final Rect rect = arrow.rectAt(
+          Offset(drawn.width / 2, drawn.height / 2),
+          drawn,
+        );
+        expect(
+          (drawn.width / 2 - rect.left) / rect.width,
+          closeTo(5 / 48, 1e-9),
+          reason: 'the hotspot sits 5 pixels into a 48-pixel picture, always',
+        );
+      }
+    });
+  });
+
+  group('a picture on whole device pixels', () {
+    /// The painter for a screen of [ratio] device pixels to the logical pixel.
+    CursorPainter painter(double ratio) => CursorPainter(
+      ValueNotifier<RemoteCursor?>(null),
+      pixelRatio: ratio,
+    );
+
+    test('a rectangle between pixels is moved onto them', () {
+      final Rect snapped = painter(
+        3,
+      ).onWholePixels(const Rect.fromLTWH(10.1, 20.9, 11.7, 11.7));
+      for (final double edge in <double>[
+        snapped.left,
+        snapped.top,
+        snapped.width,
+        snapped.height,
+      ]) {
+        expect(
+          (edge * 3 - (edge * 3).roundToDouble()).abs(),
+          lessThan(1e-9),
+          reason: 'every edge has to land on a whole device pixel',
+        );
+      }
+    });
+
+    test('nothing moves by more than half a device pixel', () {
+      const Rect wanted = Rect.fromLTWH(10.1, 20.9, 11.7, 4.4);
+      final Rect snapped = painter(3).onWholePixels(wanted);
+      expect((snapped.left - wanted.left).abs(), lessThan(0.5 / 3 + 1e-9));
+      expect((snapped.top - wanted.top).abs(), lessThan(0.5 / 3 + 1e-9));
+    });
+
+    test('a picture too small to round to a pixel is still drawn', () {
+      final Rect snapped = painter(
+        1,
+      ).onWholePixels(const Rect.fromLTWH(4, 4, 0.2, 0.2));
+      expect(snapped.width, greaterThan(0));
+      expect(snapped.height, greaterThan(0));
+    });
+
+    test('a screen of whole pixels is left where it was', () {
+      const Rect already = Rect.fromLTWH(10, 20, 12, 12);
+      expect(painter(1).onWholePixels(already), already);
+    });
+  });
+
   test('a pointer with no picture has no rectangle to draw', () {
     const RemoteCursor cursor = RemoteCursor(x: 0.5, y: 0.5, confirmed: false);
     expect(
