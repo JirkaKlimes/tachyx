@@ -5,15 +5,15 @@
 //! for actually runs.
 
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use tachyx_congestion::{Controller, MIN_TARGET, START_TARGET};
 use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Idle, Rate};
 use tachyx_proto::control::{
-    Aspect, ClientMessage, Codec, CodedSize, Feedback, Heartbeat, HostMessage, Size as WireSize,
-    StreamConfig, HEARTBEAT_INTERVAL,
+    Aspect, ClientMessage, Codec, CodedSize, Feedback, HEARTBEAT_INTERVAL, Heartbeat, HostMessage,
+    Size as WireSize, StreamConfig,
 };
 use tachyx_proto::media::Timestamp;
 use tachyx_proto::packet::{AccessUnit as WireUnit, Parity};
@@ -72,6 +72,12 @@ pub enum SessionError {
     /// The encoder produced a picture the wire format will not carry.
     #[error("the encoder produced a picture that cannot be sent")]
     Unsendable,
+    /// This host encodes nothing the client can decode.
+    ///
+    /// H.264 is in both sets on every platform either end ships for, so this is
+    /// a host with no video hardware at all or a client that said so.
+    #[error("this host encodes nothing the client can decode")]
+    NoSharedCodec,
 }
 
 /// Runs a session until the client goes away.
@@ -111,6 +117,7 @@ struct Pipeline {
 /// a session that starts at the ceiling is the single largest cause of the
 /// failure `spec/congestion.md` opens with.
 fn start(config: &Config, session: &HostSession) -> Result<Pipeline, SessionError> {
+    let codec = negotiate(session.hello.capabilities.decode)?;
     let (capture, frames) = Capture::start(config.output.as_deref().unwrap_or_default())?;
     let format = capture.format().clone();
     let capture_size = format.size;
@@ -148,7 +155,7 @@ fn start(config: &Config, session: &HostSession) -> Result<Pipeline, SessionErro
         ceiling.get(),
     );
     let opened = ladder.settings();
-    let (encoder, units) = Encoder::start(frames, encode_config(capture_size, opened)?)?;
+    let (encoder, units) = Encoder::start(frames, encode_config(codec, capture_size, opened)?)?;
     Ok(Pipeline {
         capture,
         encoder: Arc::new(encoder),
@@ -281,7 +288,7 @@ impl Live {
             self.encoder.set_resolution(EncodeSize::new(
                 u32::from(want.size.width),
                 u32::from(want.size.height),
-            )?)?;
+            )?);
         }
         self.encoder.set_rate(rate_of(want)?)?;
         self.budget.retarget(want.bitrate);
@@ -756,12 +763,32 @@ fn viewport(capabilities: tachyx_proto::control::Capabilities, capture: tachyx_m
         .min(capture.height())
 }
 
+/// The codec both ends can drive, best first.
+///
+/// The host offers only what it can really encode and the client only what it
+/// can really decode, both probed on the machine they run on, so this is the
+/// whole of the negotiation: the best codec the two sets share. It is settled
+/// once, before capture starts, and never moved. A codec changed mid-session
+/// would need the client to rebuild a decoder, which loses every reference
+/// picture it holds and shows nothing until the next key frame.
+fn negotiate(client: tachyx_proto::control::Codecs) -> Result<Codec, SessionError> {
+    let host = tachyx_media::encoders()?;
+    let chosen = host
+        .intersection(client)
+        .best()
+        .ok_or(SessionError::NoSharedCodec)?;
+    tracing::info!(%chosen, ?host, ?client, "negotiated the video codec");
+    Ok(chosen)
+}
+
 /// The encoder configuration for one rung of the ladder.
 fn encode_config(
+    codec: Codec,
     capture: tachyx_media::Size,
     settings: Settings,
 ) -> Result<EncodeConfig, SessionError> {
     Ok(EncodeConfig {
+        codec,
         size: EncodeSize::fit(capture, u32::from(settings.size.height))?,
         rate: rate_of(settings)?,
     })
@@ -780,7 +807,7 @@ fn stream_config(encoder: &Encoder, bitrate: u32) -> Result<StreamConfig, Sessio
     let geometry = encoder.geometry();
     let rate = encoder.rate();
     Ok(StreamConfig {
-        codec: Codec::H264,
+        codec: encoder.codec(),
         coded: CodedSize::new(
             narrow(geometry.coded.width()),
             narrow(geometry.coded.height()),
@@ -860,7 +887,7 @@ fn narrow(value: u32) -> u16 {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{answer, halving_for, Budget, Reason, Verdict};
+    use super::{Budget, Reason, Verdict, answer, halving_for};
 
     /// The session measured on the phone: 1720x720 at the 2 Mbit/s opening
     /// target, a break in the reference chain, and a client repeating its
