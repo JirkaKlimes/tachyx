@@ -160,6 +160,9 @@ pub struct Parity {
     /// the first report that asks for it and falls only once the lower reading
     /// has held.
     falling: u8,
+    /// Consecutive observations of a link that lost nothing at all. See
+    /// [`Parity::QUIET`].
+    clean: u8,
 }
 
 impl Parity {
@@ -168,6 +171,8 @@ impl Parity {
     /// Loss is measured after the fact, so a link that has just started
     /// dropping packets is measured as clean. This is what covers the reports
     /// between the first loss and the level that answers it.
+    ///
+    /// It is not what a link that loses nothing carries. See `QUIET`.
     pub const FLOOR: u8 = 5;
 
     /// The most parity a frame carries.
@@ -188,6 +193,24 @@ impl Parity {
     /// ms report interval specified in `spec/congestion.md` this is 200 ms.
     const HOLD: u8 = 4;
 
+    /// Consecutive reports of a link that lost nothing at all before parity is
+    /// asked to stop.
+    ///
+    /// [`Parity::FLOOR`] is not free. Shards are rounded up, so a 12-datagram
+    /// delta frame pays a whole 1434-byte shard for a level of 5, which is 8%
+    /// of the frame, and a one-datagram frame pays 100%. On a link that is
+    /// dropping nothing, that buys nothing, for ever.
+    ///
+    /// Far longer than [`Parity::HOLD`], because the two answer different
+    /// questions. `HOLD` decides that a lower level is enough for a link that
+    /// is still losing packets. This decides that a link is losing none, which
+    /// is the reading the floor exists to be wrong about safely: the first
+    /// report showing any loss restores the floor, and the frames between that
+    /// loss and that report went out unprotected. Twenty reports is a second of
+    /// a link that lost nothing in any of them, and the fall itself still waits
+    /// out `HOLD` on top.
+    const QUIET: u8 = 20;
+
     /// A session that carries `percent` of parity on every delta frame, and
     /// proportionally more on every key frame.
     #[must_use]
@@ -199,6 +222,7 @@ impl Parity {
                 percent
             },
             falling: 0,
+            clean: 0,
         }
     }
 
@@ -261,7 +285,19 @@ impl Parity {
         let Some(total) = lost.checked_add(received).filter(|total| *total > 0) else {
             return;
         };
-        let wanted = Self::wanted(lost * 1000 / total);
+        self.clean = if lost == 0 {
+            self.clean.saturating_add(1)
+        } else {
+            0
+        };
+        // A link that has lost nothing for [`Parity::QUIET`] reports running is
+        // the one case where the floor buys nothing, and so the one case that
+        // asks for none. Any loss at all puts the floor back on the next line.
+        let wanted = if self.clean >= Self::QUIET {
+            0
+        } else {
+            Self::wanted(lost * 1000 / total)
+        };
         if wanted > self.level {
             self.level = wanted;
             self.falling = 0;
@@ -283,6 +319,10 @@ impl Parity {
     /// constant is set by the measurement: 27.9 parts per thousand asks for
     /// 20%, which is the level `spec/findings.md` measured at 99.9% of frames
     /// delivered.
+    ///
+    /// Never below [`Parity::FLOOR`], not even for a report of no loss at all.
+    /// Nothing but a run of `QUIET` clean reports asks for no parity, and
+    /// [`Parity::observe`] is where that is decided.
     fn wanted(permille: u64) -> u8 {
         u8::try_from((permille * 18).div_ceil(25))
             .unwrap_or(Self::CEILING)
@@ -379,8 +419,8 @@ impl Packetiser {
 
     /// Sets how much parity frames are sent with.
     ///
-    /// The hook the congestion controller drives once a receiver report exists
-    /// to drive it from. See [`Parity`].
+    /// The hook the congestion controller drives from the receiver report. See
+    /// [`Parity`].
     pub const fn set_parity(&mut self, parity: Parity) {
         self.parity = parity;
     }
@@ -1977,6 +2017,48 @@ mod tests {
             steady.observe(250, 9750);
         }
         assert_eq!(steady.level(), 20);
+    }
+
+    #[test]
+    fn a_link_that_loses_nothing_gives_up_its_parity_and_takes_it_back_at_once() {
+        let mut parity = Parity::fixed(Parity::MEASURED);
+        for _ in 0..Parity::HOLD {
+            parity.observe(0, 1000);
+        }
+        // The floor is where a clean link settles first, and the floor is not
+        // free: shards round up, so a 12-datagram delta frame pays a whole one.
+        assert_eq!(parity.level(), Parity::FLOOR);
+        assert_eq!(parity.shards(FrameKind::Delta, 12), 1);
+        assert_eq!(parity.shards(FrameKind::Delta, 1), 1);
+
+        let mut reports = u32::from(Parity::HOLD);
+        while parity.level() > 0 && reports < 100 {
+            parity.observe(0, 1000);
+            reports += 1;
+        }
+        assert_eq!(
+            reports, 23,
+            "a second of reports with no loss in any of them, and the fall's own hold"
+        );
+        assert_eq!(parity.shards(FrameKind::Delta, 12), 0);
+        assert_eq!(parity.shards(FrameKind::Key, 92), 0);
+
+        // One report showing any loss at all restores the floor, because the
+        // loss it describes has already happened.
+        parity.observe(1, 999);
+        assert_eq!(parity.level(), Parity::FLOOR);
+    }
+
+    #[test]
+    fn a_link_that_loses_anything_at_all_keeps_the_floor() {
+        let mut parity = Parity::fixed(Parity::FLOOR);
+        // One datagram in a thousand is a tenth of a percent, which asks for
+        // less than the floor and is given the floor. Two hundred reports of it
+        // is ten seconds, and not one of them is a clean report.
+        for _ in 0..200 {
+            parity.observe(1, 999);
+        }
+        assert_eq!(parity.level(), Parity::FLOOR);
     }
 
     /// A deterministic link at the loss rate measured on the real wireless
