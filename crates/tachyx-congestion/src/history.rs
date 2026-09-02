@@ -85,7 +85,7 @@ impl History {
         let extended = match self.newest {
             None => u64::from(release.seq.0),
             Some(newest) => {
-                let ahead = release.seq.distance_from(wire(newest));
+                let ahead = release.seq.distance_from(Seq::wire(newest));
                 match newest.checked_add_signed(i64::from(ahead)) {
                     Some(extended) if extended > newest => extended,
                     // Out of order or repeated. The packetiser stamps in order,
@@ -132,7 +132,7 @@ impl History {
     /// all, which is the caller's signal to discard the history and restart.
     pub(crate) fn read(&self, report: &Feedback) -> Option<Vec<Acked>> {
         let newest = self.newest?;
-        let behind = wire(newest).distance_from(report.base);
+        let behind = Seq::wire(newest).distance_from(report.base);
         // A report can only ever name datagrams the host has already released,
         // so its base is behind the newest one. Anything else means the two
         // ends disagree about where the sequence is.
@@ -173,12 +173,6 @@ impl History {
             .ok()?;
         self.records.get(index).copied()
     }
-}
-
-/// The sixteen bits of an extended sequence number that travel on the wire.
-const fn wire(extended: u64) -> Seq {
-    // The mask is exactly the sixteen bits a `Seq` carries.
-    Seq((extended & 0xFFFF) as u16)
 }
 
 /// A duration in microseconds, for arithmetic that has to go negative.

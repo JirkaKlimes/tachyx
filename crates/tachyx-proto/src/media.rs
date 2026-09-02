@@ -172,6 +172,18 @@ impl Seq {
         Self(self.0.wrapping_add(1))
     }
 
+    /// The sixteen bits of an extended sequence number that travel on the wire.
+    ///
+    /// An extended number counts the wraps as well, and neither end sends one:
+    /// both rebuild it from the wire number and what they have already seen.
+    /// Coming back the other way is a mask, and both ends need it, so it lives
+    /// here rather than beside either.
+    #[must_use]
+    pub const fn wire(extended: u64) -> Self {
+        // The mask is exactly the sixteen bits a `Seq` carries.
+        Self((extended & 0xFFFF) as u16)
+    }
+
     /// How far `self` is ahead of `other`, treating the space as circular in the
     /// manner of RFC 1982.
     ///

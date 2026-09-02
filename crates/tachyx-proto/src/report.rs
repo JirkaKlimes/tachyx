@@ -170,7 +170,7 @@ impl Reporter {
             ));
         }
 
-        let base = wire(self.base);
+        let base = Seq::wire(self.base);
         self.base += take as u64;
         self.lost = lost;
         self.received = received;
@@ -206,7 +206,8 @@ impl Reporter {
             self.base = u64::from(seq.0);
             return Some(self.base);
         };
-        let extended = highest.checked_add_signed(i64::from(seq.distance_from(wire(highest))))?;
+        let extended =
+            highest.checked_add_signed(i64::from(seq.distance_from(Seq::wire(highest))))?;
         (extended >= self.base).then_some(extended)
     }
 
@@ -215,12 +216,6 @@ impl Reporter {
         let elapsed = now.saturating_duration_since(self.started);
         u32::try_from(elapsed.as_micros() / FEEDBACK_TICK.as_micros()).unwrap_or(u32::MAX)
     }
-}
-
-/// The sixteen bits of an extended sequence number that travel on the wire.
-const fn wire(extended: u64) -> Seq {
-    // The mask is exactly the sixteen bits a `Seq` carries.
-    Seq((extended & 0xFFFF) as u16)
 }
 
 #[cfg(test)]
