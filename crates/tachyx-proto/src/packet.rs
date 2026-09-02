@@ -145,11 +145,12 @@ pub enum MalformedUnit {
 /// it replaces: a recovery key frame costs eight frames and parity costs a
 /// fifth of one.
 ///
-/// There is no receiver report on the control stream yet, so nothing feeds
-/// [`Parity::observe`] in a running session. Until there is, a session runs at
-/// [`Parity::MEASURED`], which is the level that measurement was taken at, and
-/// the congestion work can drive the level from real feedback by calling
-/// [`Packetiser::set_parity`].
+/// A session opens at [`Parity::MEASURED`], the level that measurement was
+/// taken at, because nothing is known about the link before it carries
+/// anything. From the first receiver report onward the host puts the reported
+/// counters through [`Parity::observe`] and applies what comes back with
+/// [`Packetiser::set_parity`], so the level follows the link rather than the
+/// measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parity {
     level: u8,

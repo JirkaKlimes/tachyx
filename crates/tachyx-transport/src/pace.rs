@@ -43,9 +43,11 @@ use std::time::{Duration, Instant};
 /// It is not higher because the release rate is exactly what an unseen
 /// bottleneck queue sees whenever the configured bitrate is above what the path
 /// carries. 250 is libwebrtc's `kDefaultPaceMultiplier`, which is what it uses
-/// before send-side feedback exists, and no feedback exists here yet: quinn's
-/// own estimate was measured reporting 0.00 Mbit/s on a healthy 100 Mbit/s
-/// path, for every sample of a twenty-second run.
+/// when it has no send-side estimate to pace against, and this has none either:
+/// quinn's own estimate was measured reporting 0.00 Mbit/s on a healthy 100
+/// Mbit/s path, for every sample of a twenty-second run. What `tachyx_congestion`
+/// derives from the receiver report is the bitrate the session is configured to
+/// send, which this multiplies rather than replaces.
 pub const PACE_PERCENT: u32 = 250;
 
 /// How long a whole picture may take to leave, however low the configured
