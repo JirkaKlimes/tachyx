@@ -19,6 +19,31 @@ use crate::api::video::PresentStats;
 #[frb(init)]
 pub fn init() {
     flutter_rust_bridge::setup_default_user_utils();
+    init_logging();
+}
+
+/// Sends the client's own logs to the platform's log, once.
+///
+/// A phone has no stdout a developer can read, so without this the transport
+/// and the reassembly say nothing on the device. The filter is generous on the
+/// client's own crates and quiet elsewhere, and `try_init` means a second
+/// bridge setup installs nothing rather than panicking.
+fn init_logging() {
+    #[cfg(target_os = "android")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "info,tachyx_client=debug,tachyx_driver=debug,tachyx_transport=info",
+            )
+        });
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(paranoid_android::layer("tachyx"))
+            .try_init();
+    }
 }
 
 /// The protocol version this build speaks.

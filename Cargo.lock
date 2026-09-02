@@ -1492,6 +1492,15 @@ dependencies = [
 
 [[package]]
 name = "ndk-sys"
+version = "0.5.0+25.2.9519653"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c196769dd60fd4f363e11d948139556a344e79d451aeb2fa2fd040738ef7691"
+dependencies = [
+ "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "ndk-sys"
 version = "0.6.0+11769913"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
@@ -1664,6 +1673,20 @@ dependencies = [
  "cc",
  "dashmap",
  "log",
+]
+
+[[package]]
+name = "paranoid-android"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "101795d63d371b43e38d6e7254677657be82f17022f7f7893c268f33ac0caadc"
+dependencies = [
+ "lazy_static",
+ "ndk-sys 0.5.0+25.2.9519653",
+ "sharded-slab",
+ "smallvec",
+ "tracing-core",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2251,10 +2274,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flutter_rust_bridge",
+ "paranoid-android",
  "tachyx-client",
  "tachyx-driver",
  "tachyx-proto",
  "tachyx-video",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2383,6 +2409,7 @@ dependencies = [
  "rustls",
  "rustls-webpki",
  "serde",
+ "socket2",
  "tachyx-congestion",
  "tachyx-proto",
  "thiserror 2.0.20",

@@ -5,8 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{AckFrequencyConfig, Connection, Endpoint, IdleTimeout, TransportConfig, VarInt};
+use quinn::{
+    AckFrequencyConfig, Connection, Endpoint, EndpointConfig, IdleTimeout, TokioRuntime,
+    TransportConfig, VarInt,
+};
 use rustls::crypto::CryptoProvider;
+use socket2::{Domain, Protocol, Socket, Type};
 use tachyx_proto::control::{ClientHello, HostHello};
 
 use crate::control::{ControlError, ControlReader, ControlWriter};
@@ -87,6 +91,98 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// The receive and send buffer this transport asks the kernel for, in bytes.
+///
+/// A 1080p key frame is about ninety datagrams, released in a burst. Under GRO
+/// the kernel hands the receiver several datagrams at once, so a receiver that
+/// does not drain in time drops the tail of the burst. That shreds the key frame
+/// and forces a re-sync. Four MiB holds many such bursts, so the drain margin
+/// stops being the limit. This is hygiene, not a congestion control: it widens a
+/// margin, it does not pace or retransmit.
+///
+/// The kernel clamps a request above `net.core.rmem_max` (and `wmem_max`). An
+/// unprivileged process cannot exceed that ceiling, and this build does not use
+/// `SO_RCVBUFFORCE`, which needs `CAP_NET_ADMIN`. So the grant may be smaller
+/// than this. The kernel also reports a granted size as twice the value it
+/// stored, so the logged figure reads as double the request when the request was
+/// granted in full.
+const SOCKET_BUFFER_TARGET: usize = 4 * 1024 * 1024;
+
+/// Binds a UDP socket at `address`, with its receive and send buffers raised.
+///
+/// # Errors
+/// If the socket cannot be opened or bound. A failure to raise a buffer is not
+/// one of these: the stream works with whatever buffer the socket already has,
+/// so that failure is logged and the socket is returned unchanged.
+fn bind_socket(address: SocketAddr) -> Result<std::net::UdpSocket, TransportError> {
+    let socket = Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    socket.bind(&address.into())?;
+    raise_buffers(&socket);
+    mark_priority(&socket, address);
+    // quinn hands the socket to tokio, which needs it non-blocking.
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+/// The differentiated services class the video is marked with.
+///
+/// Expedited Forwarding, the class real time media uses. A Wi-Fi access point
+/// maps it to the voice access category and gives it airtime, where an unmarked
+/// best effort flow of the same rate is throttled behind everything else and,
+/// on a busy access point, starved until it stalls. Zoom and WebRTC mark their
+/// media for exactly this reason. The value is the whole eight bit field, so
+/// the six DSCP bits sit above the two that are always zero here.
+const DSCP_EXPEDITED: u32 = 46 << 2;
+
+/// Marks the socket's packets as real time media, so a Wi-Fi access point gives
+/// them airtime instead of throttling them as a best effort flood.
+///
+/// Not fatal if it fails: the stream still works unmarked, this only wins it
+/// priority on a contended link.
+fn mark_priority(socket: &Socket, address: SocketAddr) {
+    let marked = if address.is_ipv6() {
+        socket.set_tclass_v6(DSCP_EXPEDITED)
+    } else {
+        socket.set_tos_v4(DSCP_EXPEDITED)
+    };
+    if let Err(err) = marked {
+        tracing::warn!(?err, "could not mark the video as priority traffic");
+    } else {
+        tracing::info!(dscp = 46, "marked the socket as expedited real time media");
+    }
+}
+
+/// Asks the kernel for [`SOCKET_BUFFER_TARGET`] on both buffers, then logs what
+/// it granted, so an operator can see on-device what the kernel gave against
+/// what was asked.
+fn raise_buffers(socket: &Socket) {
+    if let Err(err) = socket.set_recv_buffer_size(SOCKET_BUFFER_TARGET) {
+        tracing::warn!(?err, "could not raise the UDP receive buffer");
+    }
+    if let Err(err) = socket.set_send_buffer_size(SOCKET_BUFFER_TARGET) {
+        tracing::warn!(?err, "could not raise the UDP send buffer");
+    }
+    match (socket.recv_buffer_size(), socket.send_buffer_size()) {
+        (Ok(recv), Ok(send)) => tracing::info!(
+            requested = SOCKET_BUFFER_TARGET,
+            recv,
+            send,
+            "UDP socket buffers set (the kernel reports about twice the stored size)"
+        ),
+        (recv, send) => {
+            tracing::warn!(
+                ?recv,
+                ?send,
+                "could not read back the UDP socket buffer sizes"
+            );
+        }
+    }
+}
+
 /// The host end of the connection.
 #[derive(Debug)]
 pub struct Host {
@@ -113,10 +209,14 @@ impl Host {
         let quic = QuicServerConfig::try_from(tls).map_err(|_| TransportError::NoTls13)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
         config.transport_config(Arc::new(transport_config(tuning)));
-        Ok(Self {
-            endpoint: Endpoint::server(config, address)?,
-            tuning,
-        })
+        let socket = bind_socket(address)?;
+        let endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            Some(config),
+            socket,
+            Arc::new(TokioRuntime),
+        )?;
+        Ok(Self { endpoint, tuning })
     }
 
     /// The address the host actually bound, which is what to advertise.
@@ -241,9 +341,16 @@ impl Client {
         config.transport_config(Arc::new(transport_config(tuning)));
 
         // Unspecified address and port: the client opens the connection, so
-        // nothing has to reach it at a known one.
-        let mut endpoint = Endpoint::client((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
-            .or_else(|_| Endpoint::client((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))?;
+        // nothing has to reach it at a known one. A dual-stack IPv6 bind is
+        // tried first, then IPv4, for a host without IPv6.
+        let socket = bind_socket((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
+            .or_else(|_| bind_socket((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))?;
+        let mut endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            None,
+            socket,
+            Arc::new(TokioRuntime),
+        )?;
         endpoint.set_default_client_config(config);
         Ok(Self { endpoint })
     }

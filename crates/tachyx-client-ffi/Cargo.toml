@@ -19,6 +19,14 @@ tachyx-proto.workspace = true
 tachyx-video.workspace = true
 anyhow.workspace = true
 flutter_rust_bridge = "=2.13.0"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# The device has no stdout a developer can read, so the client's own tracing
+# reaches a phone's log only through this. Android only: the desktop client
+# writes to the terminal it was started from.
+[target.'cfg(target_os = "android")'.dependencies]
+paranoid-android = "0.2"
 
 # This crate cannot take the workspace lints, because they forbid unsafe and
 # `frb_generated.rs` is full of it: every call across the Dart boundary reads a

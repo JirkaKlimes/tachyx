@@ -9,13 +9,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tachyx_client::Session;
+use tachyx_client::{Liveness, Session};
 use tachyx_proto::control::{ClientMessage, HostMessage};
 use tachyx_transport::{Client, ClientSession, ControlError, ControlReader, ControlWriter};
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
-use crate::{Command, GOODBYE, Shared};
+use crate::{Command, Shared, GOODBYE};
 
 /// How long input is collected before a batch goes out.
 ///
@@ -49,6 +49,10 @@ pub(crate) async fn session(
     let mut flush_at: Option<Instant> = None;
     // Whether a complete picture has been thrown away for want of a decoder.
     let mut unshown = false;
+    // A device has no terminal, so what reassembly saw is only visible if it is
+    // said out loud at a steady cadence. Half a second is often enough to watch
+    // a link collapse and rare enough to read.
+    let mut report = tokio::time::interval(Duration::from_millis(500));
     let ended = loop {
         let expiry = session.next_deadline();
         let ended = tokio::select! {
@@ -98,6 +102,23 @@ pub(crate) async fn session(
             () = sleep_until(at(expiry)), if expiry.is_some() => {
                 session.expire(Instant::now());
                 present(&mut session, &shared, &mut unshown);
+                None
+            },
+            _ = report.tick() => {
+                let stats = session.video_stats();
+                let live = Liveness::at(Instant::now(), session.heard_at(), session.saw_at());
+                tracing::info!(
+                    ?live,
+                    recv = stats.packets_received,
+                    lost = stats.packets_lost,
+                    late = stats.packets_late,
+                    recovered = stats.frames_recovered,
+                    delivered = stats.frames_delivered,
+                    dropped = stats.frames_dropped,
+                    undecodable = stats.frames_undecodable,
+                    rtt_ms = u64::try_from(connection.rtt().as_millis()).unwrap_or(u64::MAX),
+                    "client",
+                );
                 None
             },
         };

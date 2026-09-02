@@ -53,6 +53,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 rustix = { version = "1.1", features = ["event", "fs", "time"] }
 serde = { version = "1.0", features = ["derive"] }
+# The UDP socket the transport binds itself, to raise its receive and send
+# buffers. quinn pulls socket2 in transitively but does not re-export it.
+socket2 = "0.6"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 toml = "0.9"

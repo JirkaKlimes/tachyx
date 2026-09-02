@@ -16,17 +16,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tachyx_proto::VERSION;
 use tachyx_proto::control::{
     Aspect, Capabilities, ClientHello, ClientMessage, Codec, CodedSize, HandshakeError, Heartbeat,
     HostMessage, InputBatch, Size, StreamConfig, TimedInput,
 };
 use tachyx_proto::input::{InputEvent, PointerButton, Press};
-use tachyx_proto::media::{FrameId, FrameKind, HEADER_LEN, Timestamp};
+use tachyx_proto::media::{FrameId, FrameKind, Timestamp, HEADER_LEN};
 use tachyx_proto::packet::{AccessUnit, Frame, Reassembler, ReassemblyStats};
+use tachyx_proto::VERSION;
 use tachyx_transport::{
-    Client, ClientSession, ControlError, ControlReader, ControlWriter, Host, HostIdentity,
-    HostSession, PinStore, Sent, TransportError, Tuning, VideoSender, video_send_buffer,
+    video_send_buffer, Client, ClientSession, ControlError, ControlReader, ControlWriter, Host,
+    HostIdentity, HostSession, PinStore, Sent, TransportError, Tuning, VideoSender,
 };
 
 /// How long the receiver waits for a frame that nothing follows.
@@ -511,6 +511,14 @@ async fn a_receive_buffer_smaller_than_a_key_frame_shreds_it() {
     let Sent::Queued { datagrams } = queued else {
         panic!("the host's own queue holds a key frame")
     };
+    // Nothing reads while the key frame arrives, so it piles into quinn's own
+    // datagram buffer, which `video_buffer` sizes, and that buffer evicts the
+    // oldest to make room. The discard is then the buffer's and only the
+    // buffer's. Draining as the frame arrived would instead race quinn's
+    // driver, and a generous OS socket buffer, the transport now asks for one,
+    // hands the whole frame up before the small buffer can overflow, so some
+    // runs lost nothing at all.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let arrived = drain(&client, Duration::from_millis(300)).await;
     println!(
         "\n  receive buffer     {} bytes, key frame {} datagrams of {payload} bytes\n  \
