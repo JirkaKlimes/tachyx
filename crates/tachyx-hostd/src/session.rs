@@ -548,10 +548,37 @@ async fn run(
         live.honour_owed(Instant::now());
     };
 
-    drop(live);
+    // Detaching, not stopping: the pump ends by itself once the encoder it
+    // reads from is gone, and dropping the handle cannot block.
     drop(pump);
-    capture.stop()?;
+    teardown(live, capture).await?;
     outcome
+}
+
+/// Stops the pipeline without holding a runtime worker while it happens.
+///
+/// Both halves join an OS thread: dropping the encoder joins the encode thread,
+/// and stopping capture joins the capture thread. Either can take as long as a
+/// frame. A runtime worker is the wrong place to wait, because every other task
+/// that worker holds waits with it.
+///
+/// Awaited rather than left to finish on its own. The next session opens its own
+/// capture on the same output, and it must not race this one's closing.
+async fn teardown(live: Live, capture: Capture) -> Result<(), SessionError> {
+    let stopped = tokio::task::spawn_blocking(move || {
+        drop(live);
+        capture.stop()
+    })
+    .await;
+    match stopped {
+        Ok(result) => Ok(result?),
+        Err(error) => {
+            // Nothing is left to close, and a panic has already been reported
+            // where it happened.
+            tracing::warn!(%error, "the teardown thread did not finish");
+            Ok(())
+        }
+    }
 }
 
 /// A periodic tick that does not try to catch up.
