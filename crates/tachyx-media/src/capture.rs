@@ -675,10 +675,18 @@ struct Pump {
     next_id: u64,
 }
 
-/// One buffer of the ring: the allocation and the compositor's handle on it.
+/// One buffer of the ring: the allocation, the compositor's handle on it, and
+/// the shared descriptor the encoder imports.
 struct Slab {
     object: BufferObject<()>,
     buffer: wl_buffer::WlBuffer,
+    /// The descriptor covering the whole object, exported once.
+    ///
+    /// Every frame gives GStreamer a descriptor of its own, because GStreamer
+    /// closes what it is given, so each frame duplicates this one. A duplicate
+    /// is a `dup`; asking the allocator to export the plane again is a DRM
+    /// ioctl, and there are only three buffers to export.
+    fd: OwnedFd,
 }
 
 /// The cursor session, and the shared memory its picture is copied into once
@@ -933,7 +941,7 @@ impl Pump {
             id,
             captured: Timestamp::from_session_micros(presented.saturating_sub(self.epoch) / 1000),
             presented_nanos: presented,
-            fd: self.buffers[index].object.fd_for_plane(0)?,
+            fd: self.buffers[index].fd.try_clone()?,
             lease: Lease {
                 index,
                 returned: Arc::clone(&self.returned),
@@ -1193,7 +1201,8 @@ impl Slab {
             handle,
             (),
         );
-        Ok(Self { object, buffer })
+        let fd = object.fd_for_plane(0)?;
+        Ok(Self { object, buffer, fd })
     }
 
     /// Where each plane sits, and how long the descriptor is.
@@ -1221,8 +1230,7 @@ impl Slab {
                 stride: self.object.stride_for_plane(plane),
             });
         }
-        let fd = self.object.fd_for_plane(0)?;
-        let length = rustix::fs::seek(&fd, rustix::fs::SeekFrom::End(0))?;
+        let length = rustix::fs::seek(&self.fd, rustix::fs::SeekFrom::End(0))?;
         Ok((planes, usize::try_from(length).unwrap_or(usize::MAX)))
     }
 }
