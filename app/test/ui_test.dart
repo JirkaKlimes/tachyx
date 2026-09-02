@@ -41,6 +41,7 @@ SessionStats _stats({
   batches: BigInt.from(9),
   video: _video(),
   encoding: const Encoding(
+    codec: 'AV1',
     codedWidth: 1920,
     codedHeight: 1088,
     visibleWidth: 1920,
@@ -119,7 +120,7 @@ void main() {
       expect(find.text('up'), findsOneWidget);
       expect(find.text('streaming'), findsOneWidget);
       expect(find.text('1.23 ms'), findsOneWidget, reason: 'the round trip');
-      expect(find.text('1920x1080 @60 8.0 Mbit/s'), findsOneWidget);
+      expect(find.text('AV1 1920x1080 @60 8.0 Mbit/s'), findsOneWidget);
     });
 
     testWidgets('reports the stages it can measure without the host clock', (

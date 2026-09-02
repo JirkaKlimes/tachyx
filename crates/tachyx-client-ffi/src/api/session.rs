@@ -116,8 +116,10 @@ pub struct VideoStats {
 ///
 /// Not called `Stream`, because Dart already has one and a client that imported
 /// both would have to say which it meant on every line.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Encoding {
+    /// The codec the host chose, in the name the viewer knows it by.
+    pub codec: String,
     /// The width the encoder codes.
     pub coded_width: u16,
     /// The height the encoder codes, which is the visible height rounded up to
@@ -368,6 +370,7 @@ impl Session {
                 frames_undecodable: stats.video.frames_undecodable,
             },
             encoding: stats.stream.map(|stream| Encoding {
+                codec: stream.codec.to_string(),
                 coded_width: stream.coded.size().width.get(),
                 coded_height: stream.coded.size().height.get(),
                 visible_width: stream.visible.width.get(),

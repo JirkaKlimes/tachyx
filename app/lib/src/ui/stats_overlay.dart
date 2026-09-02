@@ -196,10 +196,10 @@ String describeHost(HostReport report) =>
     '${report.framesSent} sent, ${report.framesGated} gated, '
     '${describeMicros(report.pipelineUs)} pipeline';
 
-/// The geometry and the cost, on one line.
+/// The codec, the geometry and the cost, on one line.
 String describeEncoding(Encoding encoding) {
   final String rate = (encoding.bitrate / 1000000).toStringAsFixed(1);
-  return '${encoding.visibleWidth}x${encoding.visibleHeight} '
+  return '${encoding.codec} ${encoding.visibleWidth}x${encoding.visibleHeight} '
       '@${encoding.framerate} $rate Mbit/s';
 }
 

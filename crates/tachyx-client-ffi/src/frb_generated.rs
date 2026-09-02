@@ -601,6 +601,7 @@ impl SseDecode for crate::api::session::CursorShape {
 impl SseDecode for crate::api::session::Encoding {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_codec = <String>::sse_decode(deserializer);
         let mut var_codedWidth = <u16>::sse_decode(deserializer);
         let mut var_codedHeight = <u16>::sse_decode(deserializer);
         let mut var_visibleWidth = <u16>::sse_decode(deserializer);
@@ -610,6 +611,7 @@ impl SseDecode for crate::api::session::Encoding {
         let mut var_framerate = <u16>::sse_decode(deserializer);
         let mut var_bitrate = <u32>::sse_decode(deserializer);
         return crate::api::session::Encoding {
+            codec: var_codec,
             coded_width: var_codedWidth,
             coded_height: var_codedHeight,
             visible_width: var_visibleWidth,
@@ -1121,6 +1123,7 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::session::CursorShape>
 impl flutter_rust_bridge::IntoDart for crate::api::session::Encoding {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
+            self.codec.into_into_dart().into_dart(),
             self.coded_width.into_into_dart().into_dart(),
             self.coded_height.into_into_dart().into_dart(),
             self.visible_width.into_into_dart().into_dart(),
@@ -1479,6 +1482,7 @@ impl SseEncode for crate::api::session::CursorShape {
 impl SseEncode for crate::api::session::Encoding {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.codec, serializer);
         <u16>::sse_encode(self.coded_width, serializer);
         <u16>::sse_encode(self.coded_height, serializer);
         <u16>::sse_encode(self.visible_width, serializer);

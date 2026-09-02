@@ -258,6 +258,9 @@ class CursorShape {
 /// Not called `Stream`, because Dart already has one and a client that imported
 /// both would have to say which it meant on every line.
 class Encoding {
+  /// The codec the host chose, in the name the viewer knows it by.
+  final String codec;
+
   /// The width the encoder codes.
   final int codedWidth;
 
@@ -284,6 +287,7 @@ class Encoding {
   final int bitrate;
 
   const Encoding({
+    required this.codec,
     required this.codedWidth,
     required this.codedHeight,
     required this.visibleWidth,
@@ -296,6 +300,7 @@ class Encoding {
 
   @override
   int get hashCode =>
+      codec.hashCode ^
       codedWidth.hashCode ^
       codedHeight.hashCode ^
       visibleWidth.hashCode ^
@@ -310,6 +315,7 @@ class Encoding {
       identical(this, other) ||
       other is Encoding &&
           runtimeType == other.runtimeType &&
+          codec == other.codec &&
           codedWidth == other.codedWidth &&
           codedHeight == other.codedHeight &&
           visibleWidth == other.visibleWidth &&

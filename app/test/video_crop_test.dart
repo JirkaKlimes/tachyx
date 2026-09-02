@@ -11,6 +11,7 @@ Encoding _encoding({
   required int visibleWidth,
   required int visibleHeight,
 }) => Encoding(
+  codec: 'H.264',
   codedWidth: codedWidth,
   codedHeight: codedHeight,
   visibleWidth: visibleWidth,

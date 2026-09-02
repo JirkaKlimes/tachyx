@@ -583,17 +583,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Encoding dco_decode_encoding(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 8)
-      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
+    if (arr.length != 9)
+      throw Exception('unexpected arr length: expect 9 but see ${arr.length}');
     return Encoding(
-      codedWidth: dco_decode_u_16(arr[0]),
-      codedHeight: dco_decode_u_16(arr[1]),
-      visibleWidth: dco_decode_u_16(arr[2]),
-      visibleHeight: dco_decode_u_16(arr[3]),
-      aspectWidth: dco_decode_u_16(arr[4]),
-      aspectHeight: dco_decode_u_16(arr[5]),
-      framerate: dco_decode_u_16(arr[6]),
-      bitrate: dco_decode_u_32(arr[7]),
+      codec: dco_decode_String(arr[0]),
+      codedWidth: dco_decode_u_16(arr[1]),
+      codedHeight: dco_decode_u_16(arr[2]),
+      visibleWidth: dco_decode_u_16(arr[3]),
+      visibleHeight: dco_decode_u_16(arr[4]),
+      aspectWidth: dco_decode_u_16(arr[5]),
+      aspectHeight: dco_decode_u_16(arr[6]),
+      framerate: dco_decode_u_16(arr[7]),
+      bitrate: dco_decode_u_32(arr[8]),
     );
   }
 
@@ -1021,6 +1022,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   Encoding sse_decode_encoding(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_codec = sse_decode_String(deserializer);
     var var_codedWidth = sse_decode_u_16(deserializer);
     var var_codedHeight = sse_decode_u_16(deserializer);
     var var_visibleWidth = sse_decode_u_16(deserializer);
@@ -1030,6 +1032,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_framerate = sse_decode_u_16(deserializer);
     var var_bitrate = sse_decode_u_32(deserializer);
     return Encoding(
+      codec: var_codec,
       codedWidth: var_codedWidth,
       codedHeight: var_codedHeight,
       visibleWidth: var_visibleWidth,
@@ -1527,6 +1530,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_encoding(Encoding self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.codec, serializer);
     sse_encode_u_16(self.codedWidth, serializer);
     sse_encode_u_16(self.codedHeight, serializer);
     sse_encode_u_16(self.visibleWidth, serializer);
