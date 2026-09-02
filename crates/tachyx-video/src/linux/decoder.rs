@@ -3,6 +3,7 @@ use gstreamer_app::{AppSink, AppSrc};
 use gstreamer_gl::GL_DISPLAY_CONTEXT_TYPE;
 use gstreamer_gl::prelude::ContextGLExt;
 use tachyx_glctx::AdoptedContext;
+use tachyx_proto::control::{Codec, Codecs};
 
 use super::Error;
 
@@ -10,21 +11,101 @@ use super::Error;
 /// application already owns. GStreamer names no constant for it.
 const APP_CONTEXT_TYPE: &str = "gst.gl.app_context";
 
-/// Every caps filter here is load-bearing; see the crate documentation.
-const DESCRIPTION: &str = concat!(
-    // The caps say every buffer is one whole access unit. Without them the
-    // parser cannot tell where a unit ends until the next one arrives, and holds
-    // every frame for exactly one frame period.
-    "appsrc name=source is-live=true format=time do-timestamp=false ",
-    "caps=video/x-h264,stream-format=byte-stream,alignment=au ",
-    "! h264parse ",
-    "! vah264dec ",
-    "! video/x-raw(memory:DMABuf) ",
-    "! glupload ",
-    "! glcolorconvert ",
-    "! appsink name=sink sync=false max-buffers=1 drop=true ",
-    "caps=video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D",
-);
+/// What one codec is decoded with.
+///
+/// The elements are named rather than left to `decodebin`, so a machine that
+/// cannot honour the caps below fails to negotiate and says so, instead of
+/// quietly assembling a chain that copies every frame through main memory.
+#[derive(Debug, Clone, Copy)]
+struct Chain {
+    /// The caps the source declares, which say that every buffer handed over is
+    /// one whole access unit. Without them the parser cannot tell where a unit
+    /// ends until the next one arrives, and holds every frame for exactly one
+    /// frame period.
+    source: &'static str,
+    /// The parser between the source and the decoder.
+    parser: &'static str,
+    /// Decoders to try, best first.
+    ///
+    /// VA only, and for the same reason the encoder is: the caps below demand a
+    /// shared buffer out of the decoder, and a decoder that cannot export one
+    /// has nothing to link to.
+    decoders: &'static [&'static str],
+}
+
+/// Every codec this client knows how to decode, and what it takes to do it.
+const CHAINS: [(Codec, Chain); 2] = [
+    (
+        Codec::H264,
+        Chain {
+            source: "video/x-h264,stream-format=byte-stream,alignment=au",
+            parser: "h264parse",
+            decoders: &["vah264dec"],
+        },
+    ),
+    (
+        Codec::Av1,
+        Chain {
+            source: "video/x-av1,stream-format=obu-stream,alignment=tu",
+            parser: "av1parse",
+            decoders: &["vaav1dec"],
+        },
+    ),
+];
+
+impl Chain {
+    /// The decoder element this machine really has, best first.
+    fn decoder(self) -> Option<&'static str> {
+        self.decoders
+            .iter()
+            .copied()
+            .find(|name| gstreamer::ElementFactory::find(name).is_some())
+    }
+
+    /// Whether every element this chain names is installed.
+    fn present(self) -> bool {
+        gstreamer::ElementFactory::find(self.parser).is_some() && self.decoder().is_some()
+    }
+}
+
+fn chain(codec: Codec) -> Chain {
+    CHAINS
+        .into_iter()
+        .find_map(|(known, chain)| (known == codec).then_some(chain))
+        .expect("every codec the protocol names has a chain")
+}
+
+/// The codecs this machine can decode.
+///
+/// # Errors
+/// If GStreamer will not start, in which case nothing can be decoded at all.
+pub fn decoders() -> Result<Codecs, Error> {
+    gstreamer::init().map_err(Error::Gstreamer)?;
+    Ok(CHAINS
+        .into_iter()
+        .filter(|(_, chain)| chain.present())
+        .fold(Codecs::NONE, |found, (codec, _)| found.with(codec)))
+}
+
+/// The pipeline for one codec. Every caps filter in it is load-bearing; see the
+/// crate documentation.
+fn description(codec: Codec) -> Result<String, Error> {
+    let chain = chain(codec);
+    let decoder = chain.decoder().ok_or(Error::NoDecoder(codec))?;
+    Ok(format!(
+        "appsrc name=source is-live=true format=time do-timestamp=false \
+         caps={source} \
+         ! {parser} \
+         ! {decoder} \
+         ! video/x-raw(memory:DMABuf) \
+         ! glupload \
+         ! glcolorconvert \
+         ! appsink name=sink sync=false max-buffers=1 drop=true \
+         caps=video/x-raw(memory:GLMemory),format=RGBA,texture-target=2D",
+        source = chain.source,
+        parser = chain.parser,
+    ))
+}
 
 /// The decode pipeline, from encoded bytes to a texture in Flutter's share
 /// group.
@@ -36,13 +117,13 @@ pub(super) struct Decoder {
 }
 
 impl Decoder {
-    /// Builds the pipeline. It stays in the null state until [`Decoder::play`],
-    /// because the OpenGL elements cannot negotiate before the embedder's
-    /// context has been adopted, and that only happens once Flutter asks for a
-    /// texture.
-    pub(super) fn build() -> Result<Self, Error> {
+    /// Builds the pipeline for the codec the host chose. It stays in the null
+    /// state until [`Decoder::play`], because the OpenGL elements cannot
+    /// negotiate before the embedder's context has been adopted, and that only
+    /// happens once Flutter asks for a texture.
+    pub(super) fn build(codec: Codec) -> Result<Self, Error> {
         gstreamer::init().map_err(Error::Gstreamer)?;
-        let pipeline = gstreamer::parse::launch(DESCRIPTION)
+        let pipeline = gstreamer::parse::launch(&description(codec)?)
             .map_err(Error::Build)?
             .downcast::<gstreamer::Pipeline>()
             .expect("a parsed pipeline description is a pipeline");

@@ -5,10 +5,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ndk::media_error::MediaError;
+use tachyx_proto::control::{Codec, Codecs};
 use tachyx_surface::Producer;
 
 use super::bitstream::{AccessUnit, Coded};
 use super::decoder::{Decoder, Fed};
+use super::hints;
 use crate::stats::{Stats, Window};
 
 /// How many access units may wait for the decoder.
@@ -76,9 +78,21 @@ pub enum Error {
         /// How much room the decoder offered.
         room: usize,
     },
+    /// The host chose a codec this client never said it could decode.
+    #[error("the host is encoding {0}, which this client does not decode")]
+    UnexpectedCodec(Codec),
     /// The decode thread would not start.
     #[error("the decode thread would not start")]
     Thread(#[source] std::io::Error),
+}
+
+/// The codecs this client decodes on Android. See [`hints::DECODES`].
+///
+/// # Errors
+/// Never. Nothing is probed: the limit is this client's own bitstream reader
+/// rather than the device.
+pub fn decoders() -> Result<Codecs, Error> {
+    Ok(hints::DECODES)
 }
 
 /// A decoded video stream, drawn by Flutter from the decoder's own buffers.
@@ -127,6 +141,26 @@ impl VideoTexture {
             shared,
             worker: Some(worker),
         })
+    }
+
+    /// Checks that the codec the host chose is one this client decodes.
+    ///
+    /// Nothing else to do with it: the platform decoder is configured from the
+    /// bitstream rather than from here, and it is opened when the first
+    /// sequence parameter set arrives.
+    ///
+    /// # Errors
+    /// If it is not in [`decoders`]. The host picks from that set, so a codec
+    /// that reaches here is a negotiation that went wrong rather than a device
+    /// that could not keep up, and it is reported as such instead of decoding
+    /// into a black rectangle.
+    pub fn decode(&self, codec: Codec) -> Result<(), Error> {
+        if hints::DECODES.contains(codec) {
+            return Ok(());
+        }
+        let refused = Error::UnexpectedCodec(codec);
+        self.shared.fail(&refused);
+        Err(refused)
     }
 
     /// The identifier a Flutter `Texture` widget draws.

@@ -1,6 +1,21 @@
 //! What a decoder is told beyond the bitstream itself.
 
-/// The only codec the host encodes with.
+use tachyx_proto::control::{Codec, Codecs};
+
+/// The codecs this client advertises on Android.
+///
+/// H.264 and nothing else, and that is this client's decision rather than the
+/// device's limit: many Android parts decode AV1 in hardware. What stops it is
+/// [`super::bitstream`]. `MediaCodec` cannot be configured without the coded
+/// picture size, and this path takes that size out of the bitstream rather than
+/// out of the control stream, so that a decoder survives a reconnection and a
+/// resolution change with nothing said to it. That parser reads an H.264
+/// sequence parameter set. AV1 would need its own reader for a sequence header,
+/// and until one is written this set is what makes the absence safe rather than
+/// silent: the host is told exactly this and encodes something in it.
+pub(super) const DECODES: Codecs = Codecs::of(Codec::H264);
+
+/// The codec [`DECODES`] names, as `MediaCodec` spells it.
 pub(super) const MIME: &str = "video/avc";
 
 /// What the decoder is asked for in the way of latency, from everything down to
@@ -30,7 +45,9 @@ pub(super) const LOW_LATENCY: [&[&str]; 3] = [
 
 #[cfg(test)]
 mod tests {
-    use super::{LOW_LATENCY, MIME};
+    use tachyx_proto::control::Codec;
+
+    use super::{DECODES, LOW_LATENCY, MIME};
 
     #[test]
     fn every_rung_asks_for_less_than_the_one_above_it() {
@@ -76,7 +93,12 @@ mod tests {
     }
 
     #[test]
-    fn the_codec_is_the_one_the_host_encodes() {
+    fn the_mime_type_is_the_codec_this_client_advertises() {
         assert_eq!(MIME, "video/avc");
+        assert!(DECODES.contains(Codec::H264));
+        assert!(
+            !DECODES.contains(Codec::Av1),
+            "nothing here reads an AV1 sequence header, so nothing may claim to"
+        );
     }
 }

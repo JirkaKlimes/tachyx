@@ -2428,6 +2428,7 @@ dependencies = [
  "irondash_texture",
  "ndk",
  "tachyx-glctx",
+ "tachyx-proto",
  "tachyx-surface",
  "thiserror 2.0.20",
  "tracing",

@@ -27,4 +27,4 @@ mod decoder;
 mod present;
 
 #[cfg(target_os = "android")]
-pub use present::{Error, VideoTexture};
+pub use present::{Error, VideoTexture, decoders};

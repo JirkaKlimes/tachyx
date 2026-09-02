@@ -1,9 +1,14 @@
 //! The client's decode and present path.
 //!
-//! An encoded H.264 access unit goes in; a Flutter texture identifier comes out,
-//! and no frame byte is ever read by the CPU. The mechanism is different on each
+//! An encoded access unit goes in; a Flutter texture identifier comes out, and
+//! no frame byte is ever read by the CPU. The mechanism is different on each
 //! platform because the embedder's is, and the two share only their shape:
-//! [`VideoTexture::new`], [`VideoTexture::push`], and the counters in [`Stats`].
+//! [`decoders`], [`VideoTexture::new`], [`VideoTexture::decode`],
+//! [`VideoTexture::push`], and the counters in [`Stats`].
+//!
+//! Which codec is negotiated, not assumed. [`decoders`] is what the client
+//! advertises in its hello; the host answers with the best codec that set and
+//! its own encoders share, and [`VideoTexture::decode`] is told which.
 //!
 //! # Linux
 //!
@@ -52,8 +57,8 @@ mod linux;
 mod unsupported;
 
 #[cfg(target_os = "android")]
-pub use android::{Error, VideoTexture};
+pub use android::{Error, VideoTexture, decoders};
 #[cfg(target_os = "linux")]
-pub use linux::{Error, VideoTexture};
+pub use linux::{Error, VideoTexture, decoders};
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
-pub use unsupported::{Error, VideoTexture};
+pub use unsupported::{Error, VideoTexture, decoders};

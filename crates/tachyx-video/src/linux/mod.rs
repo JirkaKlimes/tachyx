@@ -13,9 +13,11 @@ use irondash_texture::{
     BoxedGLTexture, GLTexture, GLTextureProvider, PayloadProvider, SendableTexture, Texture,
 };
 use tachyx_glctx::AdoptedContext;
+use tachyx_proto::control::Codec;
 
 use crate::stats::{Stats, Window};
 use decoder::Decoder;
+pub use decoder::decoders;
 
 /// `GL_TEXTURE_2D`. Flutter's Impeller renderer ignores the target a callback
 /// returns and samples every external texture as this one, so returning any
@@ -32,12 +34,29 @@ const TEXTURE_2D: u32 = 0x0DE1;
 /// texture.
 const HELD_FRAMES: usize = 3;
 
+/// How many access units may wait for a pipeline that does not exist yet.
+///
+/// It waits on two things it cannot hurry: the codec the host chose, which
+/// arrives on the control stream, and the first time Flutter draws the widget,
+/// which is the only moment the embedder's OpenGL context is reachable. Both
+/// happen inside a second on a working session. This is what stops a queue that
+/// will never drain from growing for the life of a broken one, where at
+/// 20 Mbit/s it would cost two and a half megabytes a second.
+const WAITING_UNITS: usize = 64;
+
 /// Why the present path could not be built or run.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// GStreamer itself would not start.
     #[error("GStreamer would not start: {0}")]
     Gstreamer(#[source] gstreamer::glib::Error),
+    /// This machine has no decoder for the codec the host chose.
+    ///
+    /// A host picks from the set the client's hello advertises, which is this
+    /// machine's own answer to the same question, so reaching here means the
+    /// registry changed under a running session.
+    #[error("this machine has no {0} decoder")]
+    NoDecoder(Codec),
     /// An element is missing, or two of them will not link.
     #[error("the decode pipeline would not build: {0}")]
     Build(#[source] gstreamer::glib::Error),
@@ -56,10 +75,11 @@ pub enum Error {
 /// A decoded video stream, drawn by Flutter as an external texture.
 ///
 /// Build one on Flutter's platform thread, put its [`VideoTexture::id`] in a
-/// `Texture` widget, and hand it access units. Nothing decodes until the widget
-/// is on screen: the pipeline needs the embedder's OpenGL context, and the only
-/// place that context is reachable is inside the callback Flutter makes when it
-/// first draws the widget.
+/// `Texture` widget, name the codec with [`VideoTexture::decode`], and hand it
+/// access units. Nothing decodes until the widget is on screen: the pipeline
+/// needs the embedder's OpenGL context, and the only place that context is
+/// reachable is inside the callback Flutter makes when it first draws the
+/// widget.
 pub struct VideoTexture {
     shared: Arc<Shared>,
     texture: Arc<SendableTexture<BoxedGLTexture>>,
@@ -67,41 +87,29 @@ pub struct VideoTexture {
 }
 
 impl VideoTexture {
-    /// Registers a texture with the engine and prepares the decode pipeline.
+    /// Registers a texture with the engine.
     ///
     /// `engine_handle` comes from the `irondash_engine_context` Dart plugin.
     ///
     /// # Errors
-    /// If GStreamer will not start, an element is missing, or the engine
-    /// rejects the texture.
+    /// If GStreamer will not start or the engine rejects the texture.
     ///
     /// # Panics
     /// If called off Flutter's platform thread, where there is no run loop.
     pub fn new(engine_handle: i64) -> Result<Self, Error> {
+        gstreamer::init().map_err(Error::Gstreamer)?;
         let shared = Arc::new(Shared {
-            pipeline: Decoder::build()?,
+            pipeline: OnceLock::new(),
             start: Instant::now(),
             context: OnceLock::new(),
-            started: Once::new(),
+            adopted: Once::new(),
+            playing: Once::new(),
             failure: OnceLock::new(),
             notify: OnceLock::new(),
             state: Mutex::new(State {
                 waiting: Some(VecDeque::new()),
                 ..State::default()
             }),
-        });
-
-        let listener = Arc::downgrade(&shared);
-        shared.pipeline.on_frame(move |sample| {
-            if let Some(shared) = listener.upgrade() {
-                shared.receive(sample);
-            }
-        });
-        let reporter = Arc::downgrade(&shared);
-        shared.pipeline.on_error(move |failure| {
-            if let Some(shared) = reporter.upgrade() {
-                shared.fail(failure);
-            }
         });
 
         let texture =
@@ -118,6 +126,48 @@ impl VideoTexture {
             texture,
             id,
         })
+    }
+
+    /// Builds the pipeline for the codec the host chose.
+    ///
+    /// Separate from [`VideoTexture::new`] because the two are known at
+    /// different moments: the texture must be registered on Flutter's platform
+    /// thread, which can reach it before the host's first stream configuration
+    /// does, and the codec decides which elements are in the pipeline. Access
+    /// units pushed before this queue, so nothing is lost by the wait.
+    ///
+    /// The first call decides. The host chooses a codec once, at the handshake,
+    /// and cannot change it later: a decoder rebuilt mid-session shows nothing
+    /// until the next key frame, and every reference picture it held is gone.
+    ///
+    /// # Errors
+    /// If this machine has no decoder for that codec, or the pipeline will not
+    /// build.
+    pub fn decode(&self, codec: Codec) -> Result<(), Error> {
+        if self.shared.pipeline.get().is_some() {
+            return Ok(());
+        }
+        let pipeline = Decoder::build(codec)?;
+        let listener = Arc::downgrade(&self.shared);
+        pipeline.on_frame(move |sample| {
+            if let Some(shared) = listener.upgrade() {
+                shared.receive(sample);
+            }
+        });
+        let reporter = Arc::downgrade(&self.shared);
+        pipeline.on_error(move |failure| {
+            if let Some(shared) = reporter.upgrade() {
+                shared.fail(failure);
+            }
+        });
+        if self.shared.pipeline.set(pipeline).is_err() {
+            return Ok(());
+        }
+        self.shared.arm();
+        // Asks Flutter to draw, which is what adopts the context if the widget
+        // is already on screen and this pipeline was the half that was missing.
+        self.texture.mark_frame_available();
+        Ok(())
     }
 
     /// The identifier a Flutter `Texture` widget draws.
@@ -141,10 +191,18 @@ impl VideoTexture {
         {
             let mut state = self.shared.locked();
             state.pushed += 1;
-            match state.waiting.as_mut() {
-                Some(waiting) => waiting.push_back((access_unit, arrived)),
-                None => self.shared.pipeline.push(access_unit, arrived)?,
-            }
+            let dropped = if let Some(waiting) = state.waiting.as_mut() {
+                waiting.push_back((access_unit, arrived));
+                let over = waiting.len().saturating_sub(WAITING_UNITS);
+                waiting.drain(..over);
+                over
+            } else if let Some(pipeline) = self.shared.pipeline.get() {
+                pipeline.push(access_unit, arrived)?;
+                0
+            } else {
+                0
+            };
+            state.superseded += u64::try_from(dropped).unwrap_or(u64::MAX);
         }
         self.texture.mark_frame_available();
         Ok(())
@@ -152,7 +210,9 @@ impl VideoTexture {
 
     /// Tells the decoder the stream has ended.
     pub fn finish(&self) {
-        self.shared.pipeline.finish();
+        if let Some(pipeline) = self.shared.pipeline.get() {
+            pipeline.finish();
+        }
     }
 
     /// The first thing that went wrong, if anything has.
@@ -193,10 +253,17 @@ impl fmt::Debug for VideoTexture {
 /// Everything both threads touch: the raster thread that draws and the
 /// GStreamer thread that decodes.
 struct Shared {
-    pipeline: Decoder,
+    /// Built once the host's choice of codec is known. See
+    /// [`VideoTexture::decode`].
+    pipeline: OnceLock<Decoder>,
     start: Instant,
     context: OnceLock<AdoptedContext>,
-    started: Once,
+    /// Guards adopting the embedder's context, which happens on the raster
+    /// thread.
+    adopted: Once,
+    /// Guards starting the pipeline, which needs both the codec and the
+    /// context and is therefore reached from either thread.
+    playing: Once,
     failure: OnceLock<String>,
     notify: OnceLock<Arc<SendableTexture<BoxedGLTexture>>>,
     state: Mutex<State>,
@@ -248,10 +315,10 @@ impl Shared {
         let _ = self.failure.set(failure);
     }
 
-    /// Adopts the embedder's context and starts decoding. Runs once, on the
-    /// raster thread, inside the first texture callback.
+    /// Adopts the embedder's context. Runs once, on the raster thread, inside
+    /// the first texture callback.
     fn start(&self) {
-        self.started.call_once(|| {
+        self.adopted.call_once(|| {
             let adopted = match AdoptedContext::adopt() {
                 Ok(adopted) => adopted,
                 Err(error) => {
@@ -262,14 +329,29 @@ impl Shared {
                 }
             };
             tracing::info!(api = ?adopted.api(), "adopted the embedder's OpenGL context");
-            let adopted = self.context.get_or_init(|| adopted);
-            if let Err(error) = self.pipeline.play(adopted) {
+            self.context.get_or_init(|| adopted);
+        });
+        self.arm();
+    }
+
+    /// Starts the pipeline once both halves it waits on exist, and hands it
+    /// everything that queued in the meantime.
+    ///
+    /// The two arrive on different threads and in either order: the codec on
+    /// the receive loop, and the context on the raster thread. Whichever is
+    /// second is the one that starts decoding.
+    fn arm(&self) {
+        let (Some(pipeline), Some(context)) = (self.pipeline.get(), self.context.get()) else {
+            return;
+        };
+        self.playing.call_once(|| {
+            if let Err(error) = pipeline.play(context) {
                 self.fail(format!("the decode pipeline would not start: {error}"));
                 return;
             }
             let mut state = self.locked();
             for (access_unit, arrived) in state.waiting.take().into_iter().flatten() {
-                if let Err(error) = self.pipeline.push(access_unit, arrived) {
+                if let Err(error) = pipeline.push(access_unit, arrived) {
                     self.fail(format!(
                         "the decoder rejected a buffered access unit: {error}"
                     ));
