@@ -681,11 +681,12 @@ impl Control {
     /// scaler does not convert frame rate: a filter asking it for another rate
     /// fails to link.
     fn apply_rate(&self, rate: Rate) -> Result<(), Error> {
-        // Written before the caps, because the caps are what make the element
-        // read it. `key-int-max` is not one of the properties marked changeable
-        // while playing: the element stores the value and only builds a group
-        // of pictures out of it when it reconfigures, and the frame rate about
-        // to reach it through the source caps is what forces that.
+        // Written first, and it has to be. `key-int-max` is not among the
+        // properties the element marks changeable while playing: it stores the
+        // value and only builds a group of pictures out of it when it
+        // reconfigures. Everything below forces a reconfiguration, the frame
+        // rate in the source caps and the `bitrate` write alike, so a value
+        // written after any of them arrives a group of pictures late.
         self.encoder
             .set_property("key-int-max", key_interval(rate.framerate));
         self.source.set_caps(Some(&self.source_caps(rate)?));
