@@ -5,15 +5,15 @@
 //! for actually runs.
 
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tachyx_congestion::{Controller, MIN_TARGET, START_TARGET};
 use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Idle, Rate};
 use tachyx_proto::control::{
-    Aspect, ClientMessage, Codec, CodedSize, Feedback, HEARTBEAT_INTERVAL, Heartbeat, HostMessage,
-    Size as WireSize, StreamConfig,
+    Aspect, ClientMessage, Codec, CodedSize, Feedback, Heartbeat, HostMessage, Size as WireSize,
+    StreamConfig, HEARTBEAT_INTERVAL,
 };
 use tachyx_proto::media::Timestamp;
 use tachyx_proto::packet::{AccessUnit as WireUnit, Parity};
@@ -294,6 +294,14 @@ impl Live {
         self.budget.retarget(want.bitrate);
         self.ladder.acknowledge(want, now);
         self.last_key = now;
+        tracing::info!(
+            width = want.size.width,
+            height = want.size.height,
+            millihertz = want.millihertz,
+            bitrate = want.bitrate,
+            estimate = self.controller.estimate().get(),
+            "moved the operating point"
+        );
         to_client
             .send(&HostMessage::Stream(stream_config(
                 &self.encoder,
@@ -890,7 +898,7 @@ fn narrow(value: u32) -> u16 {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Budget, Reason, Verdict, answer, halving_for};
+    use super::{answer, halving_for, Budget, Reason, Verdict};
 
     /// The session measured on the phone: 1720x720 at the 2 Mbit/s opening
     /// target, a break in the reference chain, and a client repeating its
