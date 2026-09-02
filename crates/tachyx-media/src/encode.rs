@@ -316,9 +316,7 @@ impl Bucket {
 struct Cadence(Option<Instant>);
 
 impl Cadence {
-    fn admits(&mut self, declared: crate::Framerate, now: Instant) -> bool {
-        let interval =
-            Duration::from_nanos(1_000_000_000_000 / u64::from(declared.millihertz().max(1)));
+    fn admits(&mut self, interval: Duration, now: Instant) -> bool {
         if self
             .0
             .is_some_and(|last| now.saturating_duration_since(last) + SLACK < interval)
@@ -328,6 +326,11 @@ impl Cadence {
         self.0 = Some(now);
         true
     }
+}
+
+/// Nanoseconds between the frames a declared rate asks for.
+fn frame_nanos(declared: crate::Framerate) -> u64 {
+    1_000_000_000_000 / u64::from(declared.millihertz())
 }
 
 /// How early a capture frame may arrive and still count for its slot.
@@ -550,6 +553,13 @@ struct Control {
     encoder: gst::Element,
     sink: AppSink,
     settings: Mutex<Settings>,
+    /// Nanoseconds between the frames the source caps declare.
+    ///
+    /// The same fact as `settings.rate.framerate` and derived from it, held
+    /// apart because the pump reads it for every capture frame and must not
+    /// queue behind a controller that is changing the rate. [`Control::apply_rate`]
+    /// is the only writer, and writes it with the caps that carry it.
+    interval: AtomicU64,
     capture: Size,
     fourcc: u32,
     modifier: u64,
@@ -603,6 +613,7 @@ impl Control {
                 size: config.size,
                 rate: config.rate,
             }),
+            interval: AtomicU64::new(frame_nanos(config.rate.framerate)),
             capture: format.size,
             fourcc: format.fourcc,
             modifier: format.modifier,
@@ -624,8 +635,19 @@ impl Control {
         Ok(control)
     }
 
+    /// A poisoned lock means a control call panicked part way through a change.
+    /// What is behind it is still a whole setting, so reading it beats killing
+    /// every later call over it, which is also what the setters do.
     fn settings(&self) -> Settings {
-        *self.settings.lock().expect("settings mutex")
+        *self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How far apart the frames the source caps declare are.
+    fn interval(&self) -> Duration {
+        Duration::from_nanos(self.interval.load(Ordering::Relaxed))
     }
 
     /// States the geometry the scaler must produce, and that it must stay on
@@ -667,6 +689,8 @@ impl Control {
         self.encoder
             .set_property("key-int-max", key_interval(rate.framerate));
         self.source.set_caps(Some(&self.source_caps(rate)?));
+        self.interval
+            .store(frame_nanos(rate.framerate), Ordering::Relaxed);
         self.encoder.set_property("bitrate", rate.bitrate.kbps());
         // Half the bitrate is the floor. A smaller value is silently replaced
         // by twice the bitrate, which is also the default.
@@ -849,7 +873,7 @@ fn pump(
         // carries. The gate is a safety interlock against the transport's own
         // eviction path, and should never fire while the pacer is keeping that
         // queue shallow.
-        let refusal = if !cadence.admits(control.settings().rate.framerate, now) {
+        let refusal = if !cadence.admits(control.interval(), now) {
             Some(&counters.paced)
         } else if !bucket.admits(budget.load(Ordering::Relaxed), key_frame_bits, now) {
             Some(&counters.refused)
@@ -1105,13 +1129,14 @@ mod tests {
         // declaring 25 while capture delivers 75 is three times the bitrate
         // that was asked for.
         let declared = crate::Framerate::from_millihertz(74_983 / 3).expect("nonzero");
+        let interval = Duration::from_nanos(frame_nanos(declared));
         let mut cadence = Cadence::default();
         let start = Instant::now();
         let mut admitted = 0;
         // Three hundred capture frames at the output's own refresh.
         for slot in 0..300u32 {
             let now = start + Duration::from_nanos(u64::from(slot) * 13_336_000);
-            if cadence.admits(declared, now) {
+            if cadence.admits(interval, now) {
                 admitted += 1;
             }
         }
@@ -1127,12 +1152,13 @@ mod tests {
         // second. Counting every nth frame would drop two of every three of
         // those, and the screen that has just started moving would look broken.
         let declared = crate::Framerate::from_millihertz(74_983 / 3).expect("nonzero");
+        let interval = Duration::from_nanos(frame_nanos(declared));
         let mut cadence = Cadence::default();
         let start = Instant::now();
         for slot in 0..10u32 {
             assert!(
                 cadence.admits(
-                    declared,
+                    interval,
                     start + Duration::from_millis(u64::from(slot) * 900)
                 ),
                 "a frame a second must always be delivered"
