@@ -310,7 +310,6 @@ async fn video_moves_over_a_real_socket_at_the_measured_frame_sizes() {
            capture->delivery  median {:?}, p99 {:?}, worst {:?}\n  \
            round trip         {:?} (quinn path estimate)\n  \
            pacing rate        {:?} bit/s\n  \
-           target bitrate     {:?} bit/s\n  \
            quinn path         {} udp datagrams sent, {} lost packets, {} congestion events\n  \
            reassembly         {:?}\n",
         report.frames,
@@ -322,7 +321,6 @@ async fn video_moves_over_a_real_socket_at_the_measured_frame_sizes() {
         latency.last().expect("frames arrived"),
         host.connection.rtt(),
         host.video.pacing_rate(),
-        host.video.target_bitrate(),
         quinn.udp_tx.datagrams,
         quinn.path.lost_packets,
         quinn.path.congestion_events,

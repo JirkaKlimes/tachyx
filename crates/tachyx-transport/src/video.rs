@@ -412,18 +412,6 @@ impl VideoSender {
         self.can_send_frame(data + parity, payload.get())
     }
 
-    /// Bytes to expect the next key frame to occupy.
-    ///
-    /// What the encoder should put through [`VideoSender::can_send_bytes`]
-    /// before it is asked for a key frame. It follows a rise at once and a fall
-    /// slowly, because an estimate that is too low lets through a frame the
-    /// transport then shreds, which is the failure this path exists to prevent,
-    /// while one that is too high costs a frame nobody would have seen anyway.
-    #[must_use]
-    pub const fn key_frame_estimate(&self) -> usize {
-        self.key_frame_bytes
-    }
-
     /// Bytes to expect the next ordinary picture to occupy.
     ///
     /// This, not the key frame, is what a caller should gate on. Almost every
@@ -467,16 +455,6 @@ impl VideoSender {
     #[must_use]
     pub fn pacing_rate(&self) -> Option<u64> {
         self.connection.congestion_state().metrics().pacing_rate
-    }
-
-    /// The bitrate to aim the encoder at, in bits per second.
-    ///
-    /// Below the estimate, because the estimate is what the path carries with
-    /// nothing to spare, and a key frame is several times the size of the
-    /// frames the estimate was taken over.
-    #[must_use]
-    pub fn target_bitrate(&self) -> Option<u64> {
-        self.pacing_rate().map(|rate| rate * 85 / 100)
     }
 
     /// Sends one picture, or refuses it whole.

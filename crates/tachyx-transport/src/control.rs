@@ -57,14 +57,6 @@ impl ControlWriter {
         self.stream.write_all(&self.buffer).await?;
         Ok(())
     }
-
-    /// Closes the stream, letting the peer see the session end cleanly.
-    ///
-    /// # Errors
-    /// If the stream has already ended.
-    pub fn finish(&mut self) -> Result<(), ControlError> {
-        self.stream.finish().map_err(|_| ControlError::Closed)
-    }
 }
 
 /// Bytes of length prefix in front of each message.
@@ -189,9 +181,6 @@ pub enum ControlError {
     /// The stream would not take a write.
     #[error("the control stream would not take a write")]
     Write(#[from] quinn::WriteError),
-    /// The stream is already closed.
-    #[error("the control stream is closed")]
-    Closed,
     /// A message that will not fit the framing.
     #[error("a control message of {len} bytes exceeds the {MAX_MESSAGE}-byte limit")]
     TooLong {

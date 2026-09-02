@@ -167,12 +167,6 @@ impl Pacer {
         self.burst = burst_for(rate);
     }
 
-    /// Bytes the pacer releases at once out of an idle bucket.
-    #[must_use]
-    pub fn burst(&self) -> usize {
-        bytes_in(self.burst, self.rate)
-    }
-
     /// How long to wait before putting `bytes` on the wire.
     ///
     /// The bytes are charged whether the caller waits or not, so a caller that
@@ -201,11 +195,6 @@ fn cost(bytes: usize, rate: NonZeroU32) -> Duration {
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
-/// Bytes `rate` carries in `span`.
-fn bytes_in(span: Duration, rate: NonZeroU32) -> usize {
-    usize::try_from(span.as_nanos() * u128::from(rate.get()) / 8_000_000_000).unwrap_or(usize::MAX)
-}
-
 /// The rate that carries `bytes` in `span`, in bits a second.
 fn rate_over(bytes: usize, span: Duration) -> u32 {
     let bits = u128::try_from(bytes).unwrap_or(u128::MAX).saturating_mul(8);
@@ -225,6 +214,13 @@ mod tests {
 
     const fn rate(bits: u32) -> NonZeroU32 {
         NonZeroU32::new(bits).expect("a rate")
+    }
+
+    /// Bytes `rate` carries in `span`, which is what a burst allowance held as
+    /// a duration is worth.
+    fn bytes_in(span: Duration, rate: NonZeroU32) -> usize {
+        usize::try_from(span.as_nanos() * u128::from(rate.get()) / 8_000_000_000)
+            .unwrap_or(usize::MAX)
     }
 
     /// Offers `bytes` a datagram at a time, all at `now`, and returns how long
@@ -249,7 +245,7 @@ mod tests {
         // Everything but the burst allowance and the last datagram leaves at
         // the rate: 131,899 bytes less 25,000 less 1,405 is 105,494, which is
         // 42.2 ms of a twenty megabit link.
-        assert_eq!(pacer.burst(), 25_000);
+        assert_eq!(bytes_in(pacer.burst, pacer.rate), 25_000);
         assert!(
             (Duration::from_millis(41)..Duration::from_millis(44)).contains(&waited),
             "a key frame at 20 Mbit/s spreads over about 42 ms, not {waited:?}"
@@ -306,8 +302,8 @@ mod tests {
              time, and took {quickly:?} against {slowly:?}"
         );
         // Above 13 Mbit/s the burst is bounded by bytes and below it by time.
-        assert_eq!(slow.burst(), bytes_in(BURST_SPAN, rate(10_000_000)));
-        assert_eq!(fast.burst(), MAX_BURST);
+        assert_eq!(slow.burst, BURST_SPAN);
+        assert_eq!(bytes_in(fast.burst, fast.rate), MAX_BURST);
     }
 
     #[test]
