@@ -135,6 +135,7 @@ pub struct Injector {
     layout: Rect,
     held: u32,
     locked: u32,
+    detents: Detents,
     epoch: Instant,
 }
 
@@ -207,6 +208,7 @@ impl Injector {
             layout: Rect::default(),
             held: 0,
             locked: 0,
+            detents: Detents::default(),
             epoch: Instant::now(),
         })
     }
@@ -220,11 +222,11 @@ impl Injector {
     /// If the connection to the compositor fails.
     pub fn apply(&mut self, events: &[InputEvent]) -> Result<(), Error> {
         self.layout = self.state.layout_bounds();
-        let mut touched_pointer = false;
+        let mut owes_frame = false;
         for event in events {
-            touched_pointer |= self.apply_one(event);
+            owes_frame |= self.apply_one(event);
         }
-        if touched_pointer {
+        if owes_frame {
             self.pointer.frame();
         }
         self.connection.flush()?;
@@ -232,6 +234,11 @@ impl Injector {
         Ok(())
     }
 
+    /// Applies one event, reporting whether it still needs a frame to close it.
+    ///
+    /// Motion and buttons ride the one frame the batch ends with. Scrolling
+    /// closes its own, because a frame is what makes a compositor deliver an
+    /// axis rather than overwrite it with the next one.
     fn apply_one(&mut self, event: &InputEvent) -> bool {
         #[expect(
             clippy::cast_possible_truncation,
@@ -265,19 +272,22 @@ impl Injector {
             }
             InputEvent::Wheel { dx, dy } => {
                 self.scroll(time, dx, dy, wl_pointer::AxisSource::Wheel);
-                true
+                false
             }
             InputEvent::FingerScroll { dx, dy } => {
                 self.scroll(time, dx, dy, wl_pointer::AxisSource::Finger);
-                true
+                false
             }
             InputEvent::FingerScrollEnd => {
-                self.pointer.axis_source(wl_pointer::AxisSource::Finger);
-                self.pointer
-                    .axis_stop(time, wl_pointer::Axis::VerticalScroll);
-                self.pointer
-                    .axis_stop(time, wl_pointer::Axis::HorizontalScroll);
-                true
+                for axis in [
+                    wl_pointer::Axis::VerticalScroll,
+                    wl_pointer::Axis::HorizontalScroll,
+                ] {
+                    self.pointer.axis_stop(time, axis);
+                    self.pointer.axis_source(wl_pointer::AxisSource::Finger);
+                }
+                self.pointer.frame();
+                false
             }
             InputEvent::Key { usage, press } => {
                 self.key(time, usage, press);
@@ -290,29 +300,41 @@ impl Injector {
         }
     }
 
-    fn scroll(&self, time: u32, dx: f32, dy: f32, source: wl_pointer::AxisSource) {
+    /// Sends one scroll step and closes the frame it belongs to.
+    ///
+    /// Its own frame, because a compositor keeps at most one axis event per
+    /// axis until the frame that delivers it, and the last one it is given
+    /// wins. Two scroll steps sharing a frame deliver one, so a batch that
+    /// scrolled twice would scroll once, and the stop at the end of a gesture
+    /// would swallow the step before it.
+    fn scroll(&mut self, time: u32, dx: f32, dy: f32, source: wl_pointer::AxisSource) {
+        let wheel = source == wl_pointer::AxisSource::Wheel;
+        let (steps_x, steps_y) = if wheel {
+            self.detents.take(dx, dy)
+        } else {
+            (0, 0)
+        };
+        // The protocol does not say whether the source describes the axis
+        // request before it or the one after it, and implementations disagree.
+        // Sent on both sides, so that a finger is not delivered as a wheel
+        // either way: an application told a finger scrolled it does so
+        // smoothly and settles on its own, and one told a wheel did steps.
         self.pointer.axis_source(source);
-        for (axis, delta) in [
-            (wl_pointer::Axis::HorizontalScroll, dx),
-            (wl_pointer::Axis::VerticalScroll, dy),
+        for (axis, delta, steps) in [
+            (wl_pointer::Axis::HorizontalScroll, dx, steps_x),
+            (wl_pointer::Axis::VerticalScroll, dy, steps_y),
         ] {
             if delta == 0.0 {
                 continue;
             }
             self.pointer.axis(time, axis, f64::from(delta));
-            if source == wl_pointer::AxisSource::Wheel {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "a detent count is small by construction"
-                )]
-                self.pointer.axis_discrete(
-                    time,
-                    axis,
-                    f64::from(delta),
-                    (delta / WHEEL_DETENT).trunc() as i32,
-                );
+            if wheel {
+                self.pointer
+                    .axis_discrete(time, axis, f64::from(delta), steps);
             }
+            self.pointer.axis_source(source);
         }
+        self.pointer.frame();
     }
 
     fn key(&mut self, time: u32, usage: HidUsage, press: Press) {
@@ -454,7 +476,46 @@ impl Injection {
 }
 
 /// Distance in scroll units that makes up one wheel detent.
+///
+/// Fifteen is the convention every Wayland compositor counts a notch in, and it
+/// is what one is worth against the high-resolution scale a modern application
+/// reads, where a notch is a hundred and twenty.
 const WHEEL_DETENT: f32 = 15.0;
+
+/// The part of a detent a wheel has turned without completing one, per axis.
+///
+/// A wheel says how far it turned, and the compositor also wants how many
+/// notches that was. Every high-resolution wheel reports a fraction of a notch
+/// at a time, so a count taken from one report on its own is always zero and
+/// the wheel never clicks however far it is turned. Kept here instead, where
+/// the fractions add up into notches.
+#[derive(Debug, Default, Clone, Copy)]
+struct Detents {
+    horizontal: f32,
+    vertical: f32,
+}
+
+impl Detents {
+    /// The whole notches `dx` and `dy` complete, keeping what is left over.
+    fn take(&mut self, dx: f32, dy: f32) -> (i32, i32) {
+        (
+            Self::whole(&mut self.horizontal, dx),
+            Self::whole(&mut self.vertical, dy),
+        )
+    }
+
+    fn whole(residue: &mut f32, delta: f32) -> i32 {
+        let turned = (*residue + delta) / WHEEL_DETENT;
+        let notches = turned.trunc();
+        *residue = (turned - notches) * WHEEL_DETENT;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a wheel cannot turn more notches in one report than an integer counts"
+        )]
+        let count = notches as i32;
+        count
+    }
+}
 
 const fn press_value(press: Press) -> u32 {
     match press {
@@ -666,5 +727,52 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         }
         keymap.truncate(filled);
         state.host_keymap = Some(keymap);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Detents, WHEEL_DETENT};
+
+    #[test]
+    fn a_notch_of_the_wheel_is_one_notch() {
+        let mut detents = Detents::default();
+        assert_eq!(detents.take(0.0, WHEEL_DETENT), (0, 1));
+    }
+
+    #[test]
+    fn a_wheel_that_reports_fractions_still_clicks() {
+        // A high-resolution wheel: eight reports to the notch. Counting each
+        // one on its own rounds every single one down to nothing.
+        let mut detents = Detents::default();
+        let step = WHEEL_DETENT / 8.0;
+        let counted: i32 = (0..16).map(|_| detents.take(0.0, step).1).sum();
+        assert_eq!(counted, 2, "sixteen eighths of a notch are two notches");
+    }
+
+    #[test]
+    fn the_two_axes_are_counted_apart() {
+        let mut detents = Detents::default();
+        assert_eq!(
+            detents.take(WHEEL_DETENT * 0.75, WHEEL_DETENT * 0.75),
+            (0, 0)
+        );
+        assert_eq!(
+            detents.take(WHEEL_DETENT * 0.75, 0.0),
+            (1, 0),
+            "the sideways fraction must not be spent downwards"
+        );
+    }
+
+    #[test]
+    fn turning_back_takes_back_the_fraction() {
+        let mut detents = Detents::default();
+        assert_eq!(detents.take(0.0, WHEEL_DETENT * 0.9), (0, 0));
+        assert_eq!(
+            detents.take(0.0, -WHEEL_DETENT * 0.9),
+            (0, 0),
+            "a fraction owed one way must not click the other"
+        );
+        assert_eq!(detents.take(0.0, -WHEEL_DETENT), (0, -1));
     }
 }

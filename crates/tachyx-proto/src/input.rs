@@ -53,6 +53,17 @@ impl HidUsage {
 }
 
 /// One thing the user did.
+///
+/// Scrolling of either kind moves the view over its content, not the content
+/// under the view: positive `dy` scrolls down, which carries the content
+/// upwards, and positive `dx` scrolls right. That is what a positive
+/// `wl_pointer.axis` value means and what every toolkit means by a positive
+/// wheel delta, so the host injects these numbers as they arrive and negates
+/// nothing.
+///
+/// A touch surface where the content follows the finger therefore sends the
+/// opposite of what the finger did. That is the client's business, and the one
+/// that does it says so where it does it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InputEvent {
     /// The pointer moved by this much, measured in pixels of the streamed image.
@@ -84,21 +95,30 @@ pub enum InputEvent {
         /// Its new state.
         press: Press,
     },
-    /// A wheel turned, in pixels of the streamed image.
+    /// A wheel turned, in scroll pixels of the client's own screen.
     ///
     /// Separate from finger scrolling because a wheel moves in detents and has no
     /// end: there is no moment at which the user stops touching it.
+    ///
+    /// The one thing here that is not measured in pixels of the streamed image.
+    /// A detent is a notch of a physical wheel, not a distance on the host's
+    /// screen, so scaling it by the picture would make one notch scroll further
+    /// on a small window than on a large one and would change what it does
+    /// every time the resolution ladder steps.
     Wheel {
-        /// Horizontal distance, positive to the right.
+        /// Rightwards.
         dx: f32,
-        /// Vertical distance, positive downwards.
+        /// Downwards, which is towards the end of the content.
         dy: f32,
     },
     /// Fingers dragged across a touch surface, in pixels of the streamed image.
+    ///
+    /// Pixels of the image, so that the content keeps up with the finger on
+    /// whatever rung of the ladder the stream is.
     FingerScroll {
-        /// Horizontal distance, positive to the right.
+        /// Rightwards.
         dx: f32,
-        /// Vertical distance, positive downwards.
+        /// Downwards, which is towards the end of the content.
         dy: f32,
     },
     /// The fingers left the touch surface.

@@ -246,9 +246,15 @@ class Touchpad {
   void hover(PointerHoverEvent event) => _motion(event.timeStamp, event.delta);
 
   /// A wheel turned.
+  ///
+  /// Passed through with its sign and without [scale]. Flutter reports a wheel
+  /// the way the wire carries scrolling, positive downwards, and a detent is a
+  /// notch of a wheel rather than a distance on the glass: a window half the
+  /// size must not scroll half as far, and a step of the host's resolution
+  /// ladder must not change it at all.
   void signal(PointerSignalEvent event) {
     if (event is! PointerScrollEvent) return;
-    final Offset delta = scale.apply(event.scrollDelta);
+    final Offset delta = event.scrollDelta;
     if (delta == Offset.zero) return;
     emit(
       event.timeStamp,
@@ -319,8 +325,15 @@ class Touchpad {
     emit(at, InputEvent.pointerMotion(dx: moved.dx, dy: moved.dy));
   }
 
+  /// Turns [delta], the travel of the fingers, into a scroll of the view.
+  ///
+  /// Negated, and this is the only place in the client that negates anything.
+  /// The content follows the fingers, as it does on every touch surface made
+  /// since the trackpad stopped being a mouse: fingers pushed down carry the
+  /// content down, which is the view moving up towards the start of it. The
+  /// wire carries the movement of the view. See [InputEvent].
   void _scroll(Duration at, Offset delta) {
-    final Offset moved = scale.apply(delta);
+    final Offset moved = scale.apply(-delta);
     if (moved == Offset.zero) return;
     _scrolled = true;
     emit(at, InputEvent.fingerScroll(dx: moved.dx, dy: moved.dy));

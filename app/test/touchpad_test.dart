@@ -175,8 +175,8 @@ void main() {
       expect(log.motions, isEmpty, reason: 'two fingers do not move a pointer');
       expect(
         log.scrolled,
-        const Offset(0, -60),
-        reason: 'the pair scrolls by what one finger travelled',
+        const Offset(0, 60),
+        reason: 'the pair scrolls by what one finger travelled, against it',
       );
 
       await left.up();
@@ -427,7 +427,7 @@ void main() {
       await pairRight.up();
       expect(
         log.scrolled,
-        const Offset(0, 40),
+        const Offset(0, -40),
         reason: 'two fingers still scroll, downwards included',
       );
 
@@ -512,6 +512,88 @@ void main() {
       );
 
       expect(log.events, <InputEvent>[const InputEvent.wheel(dx: 0, dy: 53)]);
+    });
+
+    testWidgets('a notch of the wheel is a notch whatever size the window is', (
+      WidgetTester tester,
+    ) async {
+      // The same wheel over an image drawn at three image pixels to the logical
+      // pixel. A notch is a notch of a wheel, not a distance on the glass.
+      final (Touchpad pad, _Recorder log) = await _surface(
+        tester,
+        scale: ImageScale.of(
+          image: const Size(2400, 1080),
+          box: const Size(800, 360),
+        ),
+      );
+      pad.signal(
+        const PointerScrollEvent(
+          position: Offset(100, 100),
+          scrollDelta: Offset(0, 53),
+        ),
+      );
+
+      expect(log.events, <InputEvent>[const InputEvent.wheel(dx: 0, dy: 53)]);
+    });
+  });
+
+  // The wire carries the movement of the view over its content, positive
+  // downwards, which is what a positive `wl_pointer.axis` value means and what
+  // the host injects unchanged. Two fingers are the one thing that inverts it,
+  // because the content follows them. Getting either sign wrong scrolls
+  // backwards, so both are pinned here.
+  group('which way scrolling goes', () {
+    /// Drags a pair of fingers by [by] and reports what reached the wire.
+    Future<Offset> paired(WidgetTester tester, Offset by) async {
+      final (_, _Recorder log) = await _surface(tester);
+      final TestGesture left = await tester.startGesture(
+        const Offset(100, 300),
+        pointer: 1,
+      );
+      final TestGesture right = await tester.startGesture(
+        const Offset(160, 300),
+        pointer: 2,
+      );
+      await left.moveBy(by);
+      await right.moveBy(by);
+      await left.up();
+      await right.up();
+      return log.scrolled;
+    }
+
+    testWidgets('fingers pushed up scroll down, and the content up', (
+      WidgetTester tester,
+    ) async {
+      expect(await paired(tester, const Offset(0, -40)), const Offset(0, 40));
+    });
+
+    testWidgets('fingers pulled down scroll up, and the content down', (
+      WidgetTester tester,
+    ) async {
+      expect(await paired(tester, const Offset(0, 40)), const Offset(0, -40));
+    });
+
+    testWidgets('fingers pushed left scroll right', (
+      WidgetTester tester,
+    ) async {
+      expect(await paired(tester, const Offset(-40, 0)), const Offset(40, 0));
+    });
+
+    testWidgets('a wheel rolled towards the user scrolls down', (
+      WidgetTester tester,
+    ) async {
+      // Flutter reports a wheel the way the wire carries it, so this one is
+      // pinned to make sure nothing ever "corrects" it to match the fingers.
+      final (Touchpad pad, _Recorder log) = await _surface(tester);
+      pad.signal(
+        const PointerScrollEvent(
+          position: Offset(100, 100),
+          scrollDelta: Offset(0, 53),
+        ),
+      );
+
+      final InputEvent_Wheel wheel = log.events.single as InputEvent_Wheel;
+      expect(wheel.dy, greaterThan(0));
     });
   });
 }
