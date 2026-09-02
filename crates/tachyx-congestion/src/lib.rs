@@ -297,7 +297,7 @@ impl Controller {
 }
 
 /// A rate as the rest of the system takes it, saturating rather than wrapping.
-fn as_rate(bits: f64) -> NonZeroU32 {
+pub(crate) fn as_rate(bits: f64) -> NonZeroU32 {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,

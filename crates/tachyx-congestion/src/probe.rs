@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use crate::as_rate;
 use crate::delay::Signal;
 use crate::history::{Acked, ClusterId, micros_of};
 use crate::rate::bits_per_second;
@@ -358,17 +359,6 @@ pub fn cluster_datagrams(rate: NonZeroU32, datagram_bytes: usize) -> usize {
         .unwrap_or(usize::MAX)
         .div_ceil(bytes)
         .max(CLUSTER_MIN)
-}
-
-/// A rate as the transport takes it, saturating rather than wrapping.
-fn as_rate(bits: f64) -> NonZeroU32 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "clamped into the range immediately before the cast"
-    )]
-    let bits = bits.clamp(1.0, f64::from(u32::MAX)) as u32;
-    NonZeroU32::new(bits).unwrap_or(NonZeroU32::MIN)
 }
 
 #[cfg(test)]
