@@ -99,10 +99,96 @@ impl Aspect {
 }
 
 /// A video codec.
+///
+/// The order of the variants is the wire encoding: `postcard` writes the
+/// discriminant as a varint, so a codec appended here leaves the number of every
+/// codec before it alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Codec {
-    /// H.264. The only codec the host's hardware encoder is driven with.
+    /// H.264. The floor of every negotiation: it is what a host with no
+    /// hardware newer than 2010 encodes and what a client with no hardware
+    /// newer than 2010 decodes, so a session that agrees on nothing else agrees
+    /// on this.
     H264,
+    /// AV1. A better picture for the same bits, and hardware for it is recent
+    /// enough that neither end may assume the other has any. Which is the whole
+    /// reason [`Capabilities::decode`] exists.
+    Av1,
+}
+
+impl Codec {
+    /// Every codec this build knows, best first.
+    ///
+    /// The preference order, and it lives beside the codecs rather than in the
+    /// host so that both ends can work out the same answer from the same list.
+    /// See [`Codecs::best`].
+    pub const PREFERENCE: [Self; 2] = [Self::Av1, Self::H264];
+
+    /// Where this codec sits in a [`Codecs`].
+    const fn bit(self) -> u8 {
+        match self {
+            Self::H264 => 1,
+            Self::Av1 => 1 << 1,
+        }
+    }
+}
+
+impl core::fmt::Display for Codec {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::H264 => "H.264",
+            Self::Av1 => "AV1",
+        })
+    }
+}
+
+/// A set of codecs.
+///
+/// A bit set rather than a list of [`Codec`], because `postcard` refuses a
+/// discriminant it does not know: a list carrying a codec added in a later
+/// version fails to decode as a list, and the whole message it travels in fails
+/// with it. A bit nobody knows is simply never in an intersection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Codecs(u8);
+
+impl Codecs {
+    /// The empty set, which shares nothing with anything.
+    pub const NONE: Self = Self(0);
+
+    /// The set holding one codec.
+    #[must_use]
+    pub const fn of(codec: Codec) -> Self {
+        Self(codec.bit())
+    }
+
+    /// This set, and `codec` as well.
+    #[must_use]
+    pub const fn with(self, codec: Codec) -> Self {
+        Self(self.0 | codec.bit())
+    }
+
+    /// Whether `codec` is in the set.
+    #[must_use]
+    pub const fn contains(self, codec: Codec) -> bool {
+        self.0 & codec.bit() != 0
+    }
+
+    /// What both sets hold.
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The best codec in the set, in [`Codec::PREFERENCE`] order.
+    ///
+    /// `None` for a set holding nothing this build knows, which is what a host
+    /// and a client with no codec in common come to.
+    #[must_use]
+    pub fn best(self) -> Option<Codec> {
+        Codec::PREFERENCE
+            .into_iter()
+            .find(|codec| self.contains(*codec))
+    }
 }
 
 /// What a client can decode, and how much of it it wants.
@@ -119,6 +205,30 @@ pub struct Capabilities {
     pub requested_fps: NonZeroU16,
     /// The most the client will let the stream cost, in bits per second.
     pub bitrate_ceiling: NonZeroU32,
+    /// The codecs this client has a decoder for, probed on the machine it is
+    /// running on rather than assumed from the platform.
+    ///
+    /// The host encodes the best codec this set and its own share, and says
+    /// which in [`StreamConfig::codec`]. A set with nothing in common with the
+    /// host's ends the session, which is the honest answer: there is no
+    /// picture to send.
+    ///
+    /// Acted on at the hello and only there. A client builds its decoder once
+    /// and cannot rebuild it, so the same set travels in every later
+    /// [`ClientMessage::ViewportChanged`] and the host must not read a change
+    /// into it.
+    pub decode: Codecs,
+}
+
+impl Capabilities {
+    /// The same capabilities, decoding this set.
+    ///
+    /// What the platform layer that probed the machine's decoders calls, over
+    /// capabilities built by a layer that does no I/O and cannot probe.
+    #[must_use]
+    pub const fn decoding(self, decode: Codecs) -> Self {
+        Self { decode, ..self }
+    }
 }
 
 /// A first message, which carries the protocol version ahead of everything
@@ -581,7 +691,49 @@ mod tests {
             max_decode_fps: NonZeroU16::new(60).unwrap(),
             requested_fps: NonZeroU16::new(60).unwrap(),
             bitrate_ceiling: NonZeroU32::new(20_000_000).unwrap(),
+            decode: Codecs::of(Codec::H264).with(Codec::Av1),
         }
+    }
+
+    #[test]
+    fn a_codec_set_answers_what_both_ends_can_drive() {
+        let client = Codecs::of(Codec::H264).with(Codec::Av1);
+        let host = Codecs::of(Codec::H264);
+        assert_eq!(client.intersection(host).best(), Some(Codec::H264));
+        assert_eq!(client.intersection(client).best(), Some(Codec::Av1));
+        assert_eq!(
+            Codecs::of(Codec::Av1)
+                .intersection(Codecs::of(Codec::H264))
+                .best(),
+            None,
+            "no codec in common is a session that cannot start, not a fallback"
+        );
+        assert_eq!(Codecs::NONE.best(), None);
+        assert!(client.contains(Codec::Av1));
+        assert!(!host.contains(Codec::Av1));
+    }
+
+    #[test]
+    fn a_codec_a_peer_knows_and_this_build_does_not_is_ignored_rather_than_fatal() {
+        // The reason the set is a bit set. A later version advertising a third
+        // codec must still be understood about the two this one has, and the
+        // message it travels in must still parse.
+        let later = postcard::to_stdvec(&Capabilities {
+            decode: Codecs(0b111),
+            ..capabilities()
+        })
+        .unwrap();
+        let read: Capabilities = postcard::from_bytes(&later).unwrap();
+        assert_eq!(read.decode.best(), Some(Codec::Av1));
+        assert!(read.decode.contains(Codec::H264));
+    }
+
+    #[test]
+    fn adding_a_codec_leaves_the_ones_before_it_where_they_were() {
+        // A `StreamConfig` written by a build that only knew H.264 has to keep
+        // reading as H.264 here, which is what appending to the enum buys.
+        assert_eq!(postcard::to_stdvec(&Codec::H264).unwrap(), [0]);
+        assert_eq!(postcard::to_stdvec(&Codec::Av1).unwrap(), [1]);
     }
 
     #[test]

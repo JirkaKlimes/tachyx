@@ -33,4 +33,9 @@ pub mod report;
 /// draft 0 client reads one as a slice of the picture, waits for a slice 255
 /// that never fills, and completes no frame at all. That is exactly the failure
 /// this field exists to turn into a named refusal.
-pub const VERSION: u16 = 1;
+///
+/// Raised to 2 by codec negotiation. [`control::Capabilities`] gained the set of
+/// codecs the client decodes, and `postcard` writes no field names: a version 1
+/// hello read as a version 2 one ends a field short, and a version 2 hello read
+/// as a version 1 one leaves a byte over. Neither fails to parse on its own.
+pub const VERSION: u16 = 2;
