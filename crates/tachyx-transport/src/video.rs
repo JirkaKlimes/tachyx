@@ -100,6 +100,52 @@ const WAIT_SLICE: Duration = Duration::from_millis(2);
 /// pacer's own burst allowance already permits.
 const PACE_QUANTUM: Duration = Duration::from_millis(1);
 
+/// How far behind quinn's outgoing queue the send path is willing to be, as
+/// time at the rate the session is configured to send.
+///
+/// The pacer decides when a datagram should leave, and quinn's outgoing queue
+/// is a second queue in series with it that nothing decides at all: it drains
+/// at whatever the congestion window allows, and everything the pacer released
+/// above that rate stands in it. Measured on the shaped link, the tail of a key
+/// frame sat there for 113 ms while the release loop believed it had sent the
+/// whole picture 26 ms after starting.
+///
+/// Two costs follow, and the second is why this bound exists. The picture
+/// arrives that much later than the pacer was set to deliver it. And the time
+/// [`VideoSender::record`] takes for a datagram is the time it entered that
+/// queue, so a queue that fills over a picture makes the recorded send times
+/// closer together than the departures they stand for, which is the signature
+/// the delay estimator reads as a queue filling on the path.
+///
+/// Two milliseconds because the estimator groups datagrams over five
+/// milliseconds of send time and takes the difference between groups: residence
+/// that never varies by more than one group span cannot move the signal. It is
+/// also the shortest the send path can act on, being [`WAIT_SLICE`].
+///
+/// Held as time rather than bytes because a byte count is a different wait at
+/// every rate this runs at, and against the configured rate rather than a
+/// measurement of the drain because that rate is the one figure the whole
+/// system already agrees on. It bounds how long a datagram waits, not how fast
+/// the picture leaves: what leaves the queue is whatever the path takes, so a
+/// link with headroom never waits here at all and a probe cluster still
+/// measures the path rather than this.
+const QUEUE_RESIDENCE: Duration = Duration::from_millis(2);
+
+/// The longest one picture waits on that queue before it is handed over
+/// regardless.
+///
+/// Waiting past this buys the picture nothing: the receiver abandons a frame
+/// 50 ms after its first datagram, so one still being released then is already
+/// lost, and holding the rest back only keeps it from the queue it would have
+/// stood in anyway.
+///
+/// What the cap is really for is the path that is open and carrying nothing, on
+/// which the wait would otherwise never end. The host's stall watchdog reads a
+/// pump that never returns as a pump that is working, so the send path must
+/// always return, and 50 ms a picture is far inside the second that watchdog
+/// gives it.
+const DRAIN_DEADLINE: Duration = Duration::from_millis(50);
+
 /// Bytes of queued video the transport should be allowed to hold at `coded`.
 ///
 /// Sizing this by "two frames" is ambiguous in a way that decides whether the
@@ -376,7 +422,7 @@ impl VideoSender {
     /// it. The count is then unknown, the gate refuses everything, and the
     /// record squares itself again the moment the queue drains.
     fn queued(&self, space: usize) -> Option<usize> {
-        let held = self.buffer.saturating_sub(space + QUEUE_OVERHEAD);
+        let held = self.held(space);
         let mut bytes = 0;
         let mut entries = 0;
         for size in self.outstanding.iter().rev() {
@@ -395,6 +441,32 @@ impl VideoSender {
         if let Some(queued) = self.queued(space) {
             self.outstanding.drain(..self.outstanding.len() - queued);
         }
+    }
+
+    /// Payload bytes quinn's outgoing queue holds, from the space it reports
+    /// free.
+    ///
+    /// The report is the buffer less those bytes less one entry's accounting,
+    /// so adding that entry back leaves the bytes themselves.
+    const fn held(&self, space: usize) -> usize {
+        self.buffer.saturating_sub(space + QUEUE_OVERHEAD)
+    }
+
+    /// Waits for quinn to take what it holds down to [`QUEUE_RESIDENCE`], so
+    /// that the next datagram handed over leaves about when it is handed over.
+    ///
+    /// Gives up at `deadline` and lets the datagram through anyway. See
+    /// [`DRAIN_DEADLINE`].
+    fn drain_queue(&mut self, deadline: Instant) -> Result<(), VideoError> {
+        let bound = queue_bound(self.target());
+        while self.held(self.connection.datagram_send_buffer_space()) > bound {
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            self.wait(PACE_QUANTUM)?;
+        }
+        self.forget_sent();
+        Ok(())
     }
 
     /// Whether the queue has room for a single-slice picture of `bytes`.
@@ -538,6 +610,11 @@ impl VideoSender {
     /// which is not the length of `queue`: the queue also carries whatever
     /// parity the packetiser added.
     fn release(&mut self, queue: &mut Vec<Vec<u8>>, datagrams: usize) -> Result<Sent, VideoError> {
+        let deadline = Instant::now() + DRAIN_DEADLINE;
+        // Never onto a queue the picture before it left standing: a picture
+        // that starts behind one is late by the whole of it, and every send
+        // time it records is short by the whole of it too.
+        self.drain_queue(deadline)?;
         for datagram in queue.drain(..) {
             let queued = datagram.len();
             let seq = seq_of(&datagram);
@@ -548,6 +625,11 @@ impl VideoSender {
                 // record of what quinn still holds is stale by now. Squaring it
                 // is what keeps the gate exact for the next frame.
                 self.forget_sent();
+                // The pacer's schedule is a schedule for leaving, not one for
+                // entering a second queue. Only where it already waits: a
+                // picture small enough to leave inside the pacer's burst
+                // allowance is one quinn was never going to hold.
+                self.drain_queue(deadline)?;
             }
             let at = Instant::now();
             match self.connection.send_datagram(Bytes::from(datagram)) {
@@ -577,11 +659,19 @@ impl VideoSender {
     /// Records one release for the controller, and counts it against whatever
     /// cluster is going out.
     ///
-    /// The time is taken after the datagram was handed over rather than before
-    /// the pacer's wait, because what the delay estimator needs is when the
-    /// datagram actually left. A send time taken at queue entry is a queue
-    /// entry time, and a delay estimate built on wrong send times is worse than
-    /// none.
+    /// The time is taken at the moment the datagram is handed over, which is
+    /// after the pacer's wait rather than before it, because what the delay
+    /// estimator needs is when the datagram actually left. A send time taken at
+    /// queue entry is a queue entry time, and a delay estimate built on wrong
+    /// send times is worse than none.
+    ///
+    /// Handing over is not leaving, so this is only a departure time while
+    /// quinn's own queue is short. That is what [`QUEUE_RESIDENCE`] is for:
+    /// measured on the shaped link, the median datagram left 109 microseconds
+    /// after it was handed over and nine in ten within 2.3 ms, but the tail of
+    /// a key frame released faster than the path carried it stood in that queue
+    /// for 113 ms. The release loop now waits that queue down before it hands
+    /// anything over, so the two times are the same to within a group span.
     fn record(&mut self, seq: Option<Seq>, at: Instant, wire: usize) {
         let cluster = self.armed.and_then(|probe| {
             let armed = self.armed.as_mut()?;
@@ -700,6 +790,13 @@ impl VideoSender {
     }
 }
 
+/// Bytes quinn's outgoing queue may hold and still hand a datagram over
+/// promptly, which is what `rate` carries in [`QUEUE_RESIDENCE`].
+fn queue_bound(rate: NonZeroU32) -> usize {
+    let micros = u64::try_from(QUEUE_RESIDENCE.as_micros()).unwrap_or(u64::MAX);
+    usize::try_from(u64::from(rate.get()) * micros / 8_000_000).unwrap_or(usize::MAX)
+}
+
 /// The sequence number a built datagram carries.
 ///
 /// Read back out of the bytes rather than threaded alongside them, because the
@@ -793,6 +890,35 @@ mod tests {
             sleeps <= DATAGRAMS / 2,
             "{sleeps} sleeps for {DATAGRAMS} datagrams"
         );
+    }
+
+    /// The bound the release loop waits quinn's queue down to, at the two ends
+    /// of the range a session runs over.
+    ///
+    /// What it must not be is a byte count that means a different wait at
+    /// different rates, because the whole point of it is a bound on the wait.
+    #[test]
+    fn the_queue_bound_is_the_same_wait_at_every_rate() {
+        for rate in [300_000, 2_000_000, 8_000_000, 20_000_000, u32::MAX] {
+            let rate = NonZeroU32::new(rate).expect("a rate");
+            let bytes = u64::try_from(queue_bound(rate)).expect("a small count");
+            let micros = bytes * 8 * 1_000_000 / u64::from(rate.get());
+            let wanted = u64::try_from(QUEUE_RESIDENCE.as_micros()).expect("a short span");
+            assert!(
+                wanted.abs_diff(micros) <= 1,
+                "{rate} bit/s carries {bytes} bytes in {micros} microseconds"
+            );
+        }
+
+        // At twenty megabits that is three datagrams of a 1500-byte path, and
+        // at the floor it is under one. Under one is right rather than a
+        // rounding fault: one datagram is 38 ms of a 300 kbit/s link, so a
+        // queue holding even one is already deeper than two milliseconds.
+        assert_eq!(
+            queue_bound(NonZeroU32::new(20_000_000).expect("a rate")),
+            5_000
+        );
+        assert!(queue_bound(NonZeroU32::new(300_000).expect("a rate")) < NOMINAL_PAYLOAD.get());
     }
 
     #[test]
