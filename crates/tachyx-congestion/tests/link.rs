@@ -24,7 +24,9 @@ use goog_cc::transport::{
 };
 use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
-use tachyx_congestion::{CONTROL_RESERVE, Controller, MIN_TARGET, START_TARGET, cluster_datagrams};
+use tachyx_congestion::{
+    CONTROL_RESERVE, Controller, MIN_TARGET, Release, START_TARGET, cluster_datagrams,
+};
 use tachyx_proto::control::{FEEDBACK_INTERVAL, Feedback, PacketArrival};
 use tachyx_proto::media::Seq;
 
@@ -244,12 +246,27 @@ impl Trace {
     }
 }
 
-/// Runs `driver` against `link` for `seconds`.
+/// Runs `driver` against `link` for `seconds`, delivering every report.
+fn simulate(schedule: &[(i64, u64)], seconds: i64, driver: Driver) -> Trace {
+    run(schedule, seconds, driver, None)
+}
+
+/// Runs `driver` against `link` for `seconds`, with the return path dead over
+/// `outage` if one is given.
+///
+/// An outage drops the reports the client writes rather than the datagrams the
+/// host sends, because that is what a starved uplink does: the downlink still
+/// carries video, and the feedback that would answer it never arrives.
 #[expect(
     clippy::too_many_lines,
     reason = "a simulation is one procedure; splitting it would hide the schedule"
 )]
-fn simulate(schedule: &[(i64, u64)], seconds: i64, mut driver: Driver) -> Trace {
+fn run(
+    schedule: &[(i64, u64)],
+    seconds: i64,
+    mut driver: Driver,
+    outage: Option<(i64, i64)>,
+) -> Trace {
     let epoch = Instant::now();
     let mut link = Link::new(schedule);
     let mut receiver = Receiver::default();
@@ -330,8 +347,12 @@ fn simulate(schedule: &[(i64, u64)], seconds: i64, mut driver: Driver) -> Trace 
         if now >= next_report {
             next_report += i64::try_from(FEEDBACK_INTERVAL.as_micros()).unwrap();
             if let Some((report, covered)) = receiver.report(now) {
-                // The report travels the return path before the host reads it.
-                reports.push((now + DELAY, report, covered));
+                // The report travels the return path before the host reads it,
+                // and never arrives while that path is dead.
+                let dead = outage.is_some_and(|(from, to)| (from..to).contains(&now));
+                if !dead {
+                    reports.push((now + DELAY, report, covered));
+                }
             }
         }
 
@@ -589,5 +610,128 @@ fn recovery_on_a_busy_sender_is_where_ours_leaves_the_reference() {
     assert!(
         back >= reference.at(29_000_000),
         "ours must recover at least as fast as the reference"
+    );
+}
+
+/// Drives one usable report at `recv_us` covering `count` datagrams released
+/// from sequence `base`, so a controller can be exercised without the full link.
+fn feed(controller: &mut Controller, epoch: Instant, base: u16, count: u16, sent_us: i64, recv_us: i64) {
+    for offset in 0..count {
+        controller.released(&Release {
+            seq: Seq(base.wrapping_add(offset)),
+            at: epoch + Duration::from_micros((sent_us + i64::from(offset) * 120).unsigned_abs()),
+            wire: u16::try_from(DATAGRAM).unwrap(),
+            cluster: None,
+        });
+    }
+    let report = Feedback {
+        base: Seq(base),
+        reference: u32::try_from(recv_us / 250).unwrap_or(u32::MAX),
+        packets: (0..count)
+            .map(|index| PacketArrival::Received(if index == 0 { 0 } else { 4 }))
+            .collect(),
+        lost: 0,
+        received: u64::from(base) + u64::from(count),
+    };
+    controller.feedback(&report, epoch + Duration::from_micros(recv_us.unsigned_abs()));
+}
+
+#[test]
+fn feedback_going_silent_decays_the_target_to_the_floor() {
+    // The session climbs into a ten megabit link, then the return path dies at
+    // eight seconds and never speaks again.
+    let trace = run(
+        &[(0, 10_000_000)],
+        22,
+        Driver::ours(Instant::now()),
+        Some((8_000_000, i64::MAX)),
+    );
+
+    // One second into the silence, before the threshold, the link is still held.
+    let held = trace.at(9_000_000);
+    assert!(
+        held > 6_000_000,
+        "the estimate must not decay before the threshold, and was {held}"
+    );
+
+    // And it reaches the floor within a bounded time once the threshold passes.
+    let floored = trace
+        .first(8_000_000, |rate| rate <= MIN_TARGET + 50_000)
+        .expect("a dead return path must decay the target to the floor");
+    assert!(
+        floored - 8_000_000 < 16_000_000,
+        "the decay took {}ms after the path died",
+        (floored - 8_000_000) / 1000
+    );
+}
+
+#[test]
+fn a_return_path_that_recovers_takes_the_link_back() {
+    // Dead from eight to sixteen seconds, then feedback resumes on the same
+    // ten megabit link.
+    let trace = run(
+        &[(0, 10_000_000)],
+        30,
+        Driver::ours(Instant::now()),
+        Some((8_000_000, 16_000_000)),
+    );
+
+    let low = trace.at(15_500_000);
+    assert!(
+        low < 4_000_000,
+        "the silence must have pulled the target down, and it was {low}"
+    );
+
+    let back = trace
+        .first(16_000_000, |rate| rate > 6_000_000)
+        .expect("a link whose feedback resumed must be taken back");
+    assert!(
+        back - 16_000_000 < 10_000_000,
+        "recovery took {}ms after feedback resumed",
+        (back - 16_000_000) / 1000
+    );
+}
+
+#[test]
+fn a_tick_with_feedback_flowing_never_decays_the_estimate() {
+    // The regression guard: while reports arrive, a tick is exactly the no-op it
+    // was before the silence backstop existed.
+    let epoch = Instant::now();
+    let mut controller = Controller::new(NonZeroU32::new(CEILING).unwrap(), epoch);
+    let mut next_tick = 250_000i64;
+    let mut base = 0u16;
+    let mut now = 0i64;
+    while now < 8_000_000 {
+        now += 50_000;
+        feed(&mut controller, epoch, base, 12, now, now);
+        base = base.wrapping_add(12);
+        while now >= next_tick {
+            let before = controller.estimate();
+            controller.tick(epoch + Duration::from_micros(next_tick.unsigned_abs()));
+            next_tick += 250_000;
+            assert_eq!(
+                before,
+                controller.estimate(),
+                "a tick moved the estimate while reports were flowing"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stall_drops_the_estimate_to_the_floor_in_one_call() {
+    let epoch = Instant::now();
+    let mut controller = Controller::new(NonZeroU32::new(CEILING).unwrap(), epoch);
+    feed(&mut controller, epoch, 0, 12, 0, 100_000);
+    assert!(
+        controller.estimate().get() > MIN_TARGET,
+        "the session must open above the floor"
+    );
+
+    controller.stalled();
+    assert_eq!(
+        controller.estimate().get(),
+        MIN_TARGET,
+        "a stall must collapse the estimate to the floor at once"
     );
 }

@@ -35,7 +35,7 @@ pub use crate::history::{ClusterId, Release};
 pub use crate::loss::Losses;
 pub use crate::probe::{Probe, cluster_datagrams};
 
-use crate::history::History;
+use crate::history::{History, micros_of};
 use crate::loss::LossControl;
 use crate::probe::Probes;
 use crate::rate::{Acknowledged, Aimd};
@@ -56,6 +56,40 @@ pub const MIN_TARGET: u32 = 300_000;
 /// sustained drag is the dominant term. That is 7.5% of a 2 Mbit/s link and
 /// 0.75% of a 20 Mbit/s one, and both are the right answer.
 pub const CONTROL_RESERVE: u32 = 150_000;
+
+/// How long the estimate is held blind before a silent return path starts to
+/// decay it.
+///
+/// The controller learns nothing except from receiver reports, and on a healthy
+/// 60 fps link a report rides on every frame, so one arrives about every 50 ms.
+/// A gap of six seconds is more than a hundred consecutive missed reports. It is
+/// far past a single dropped or reordered report, so the healthy path never
+/// crosses it.
+///
+/// The bound that sets this figure is the still desktop, not the busy one. A
+/// still screen produces no frames, so its only proof that the return path still
+/// lives is the padding probe the controller releases when nothing has tested
+/// the link for five seconds, whose result comes back up to one report interval
+/// later. A quiet but living link therefore delivers usable feedback at least
+/// every five seconds and a little. Six seconds sits just above that, so a still
+/// desktop is never mistaken for a dead path, and only a return path that failed
+/// to deliver even its own padding probe is decayed. The acute case, a link
+/// flooded until its window fills, is caught far sooner by the host's stall
+/// watchdog through [`Controller::stalled`]; this is the slower backstop for
+/// silence without that back pressure.
+const SILENCE_THRESHOLD: i64 = micros_of(Duration::from_secs(6));
+
+/// What the estimate is multiplied by, each tick, once the return path is judged
+/// dead.
+///
+/// The same figure the delay and loss controls back off by on overuse, for the
+/// same reason: a geometric fall is proportional to what is at stake and reaches
+/// a safe rate in a bounded number of steps whatever it starts from. At one tick
+/// every 250 ms it walks the widest span this runs at, twenty megabits down to
+/// the floor, in under seven seconds, and a start rate down in under three. That
+/// is the small number of seconds the recovery needs, not the tens the plain
+/// multiplicative climb would take to undo.
+const SILENCE_DECAY: f64 = 0.85;
 
 /// Where a session starts, before anything has been measured.
 ///
@@ -92,6 +126,9 @@ pub struct Controller {
     ceiling: f64,
     estimate: f64,
     signal: Signal,
+    /// History clock, in microseconds, of the last report that could be placed
+    /// against what was sent. A tick this far past it is a silent return path.
+    last_usable: i64,
 }
 
 impl Controller {
@@ -101,8 +138,14 @@ impl Controller {
     pub fn new(ceiling: NonZeroU32, now: Instant) -> Self {
         let ceiling = f64::from(ceiling.get()).max(f64::from(MIN_TARGET));
         let start = f64::from(START_TARGET).min(ceiling);
+        let history = History::new(now);
+        // Seeded at the epoch rather than left empty, so a return path that is
+        // dead from the first frame decays instead of holding the start rate for
+        // ever. The opening probe normally lands well inside the threshold, so
+        // this never fires on a link that answers at all.
+        let last_usable = history.micros(now);
         Self {
-            history: History::new(now),
+            history,
             delay: delay::Delay::default(),
             acknowledged: Acknowledged::default(),
             aimd: Aimd::new(start, f64::from(MIN_TARGET), ceiling),
@@ -111,6 +154,7 @@ impl Controller {
             ceiling,
             estimate: start,
             signal: Signal::Normal,
+            last_usable,
         }
     }
 
@@ -166,6 +210,10 @@ impl Controller {
             self.history.clear();
             return self.update(Losses::default(), None);
         };
+        // The report was placed against what was sent, so the return path is
+        // alive. This is what a silent tick measures its gap from, and an empty
+        // set of packets still counts: a report that parsed proves the path.
+        self.last_usable = at;
 
         for packet in &packets {
             self.signal = self.delay.observe(packet.sent, packet.arrived);
@@ -195,7 +243,46 @@ impl Controller {
     /// that silence.
     pub fn tick(&mut self, now: Instant) -> Update {
         let at = self.history.micros(now);
+        if at - self.last_usable > SILENCE_THRESHOLD {
+            self.decay();
+        }
         self.update(Losses::default(), Some(at))
+    }
+
+    /// Backs the estimate off one step because the return path has said nothing
+    /// for longer than any living link goes quiet.
+    ///
+    /// The delay and loss controls are pulled down with it, not only the exposed
+    /// figure, so that a report which resumes the moment after cannot be read
+    /// against a stale high rate the controls still held. The probe history is
+    /// kept: if the link recovers, the fall away from the recent high water mark
+    /// is exactly what asks for the probe that takes it back at once.
+    fn decay(&mut self) {
+        self.collapse_to(self.estimate * SILENCE_DECAY);
+    }
+
+    /// Collapses the estimate to the floor at once, for the host's path stall
+    /// watchdog to call when the send buffer has stood full with no progress.
+    ///
+    /// The watchdog fires only on a path that is confirmed dead, so this drops
+    /// to the floor rather than to the start rate: the link has just proven it
+    /// cannot carry the load, the floor is the least rate that still shows a
+    /// picture, and the fresh key frame the reset sends is the first probe that
+    /// walks the estimate back up. The probe history is cleared so that walk
+    /// starts gently from the floor rather than aiming a cluster at the rate the
+    /// link just failed to carry.
+    pub fn stalled(&mut self) {
+        self.collapse_to(f64::from(MIN_TARGET));
+        self.probes.reset();
+    }
+
+    /// Lowers the estimate and both rate controls to `rate`, never raising them,
+    /// and floors the result. The single path every backward jump takes.
+    fn collapse_to(&mut self, rate: f64) {
+        let rate = rate.max(f64::from(MIN_TARGET));
+        self.aimd.lower_to(rate);
+        self.loss.lower_to(rate);
+        self.estimate = self.loss.rate();
     }
 
     fn update(&mut self, losses: Losses, at: Option<i64>) -> Update {

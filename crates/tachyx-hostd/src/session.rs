@@ -5,15 +5,15 @@
 //! for actually runs.
 
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use tachyx_congestion::{Controller, MIN_TARGET, START_TARGET};
 use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Idle, Rate};
 use tachyx_proto::control::{
-    Aspect, ClientMessage, Codec, CodedSize, Feedback, HEARTBEAT_INTERVAL, Heartbeat, HostMessage,
-    Size as WireSize, StreamConfig,
+    Aspect, ClientMessage, Codec, CodedSize, Feedback, Heartbeat, HostMessage, Size as WireSize,
+    StreamConfig, HEARTBEAT_INTERVAL,
 };
 use tachyx_proto::media::Timestamp;
 use tachyx_proto::packet::{AccessUnit as WireUnit, Parity};
@@ -247,11 +247,16 @@ impl Live {
     /// bucket decides how many the encoder is allowed to make. Nothing written
     /// into the encoder itself bounds either.
     fn spend(&mut self, update: tachyx_congestion::Update) {
-        self.control.set_target_bitrate(update.video);
-        self.spending.store(update.video.get(), Ordering::Relaxed);
+        self.set_target(update.video);
         if let Some(probe) = update.probe {
             self.control.probe(probe);
         }
+    }
+
+    /// Tells the pacer and the encoder's rate limiter what the link will carry.
+    fn set_target(&self, target: NonZeroU32) {
+        self.control.set_target_bitrate(target);
+        self.spending.store(target.get(), Ordering::Relaxed);
     }
 
     /// Applies a rung, spending the key frame it costs from the shared budget.
@@ -391,6 +396,13 @@ impl Live {
             gated = stats.gated,
             "the video path is carrying nothing while the connection is up"
         );
+        // The path is confirmed dead: pictures were offered and none reached the
+        // wire. Collapse the operating point to the floor before the recovery
+        // key frame, so the key frame is small enough to fit a congestion window
+        // no acknowledgement has grown, and so the host stops flooding a link
+        // whose return path cannot get a word in until it does.
+        self.controller.stalled();
+        self.set_target(self.controller.video_target());
         // Not through the budget. It rations key frames against what the link
         // can carry, and this fires only when nothing is reaching the link at
         // all, so there is nothing to ration against and the client is holding a
@@ -811,7 +823,7 @@ fn narrow(value: u32) -> u16 {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Budget, Reason, Verdict, answer, halving_for};
+    use super::{answer, halving_for, Budget, Reason, Verdict};
 
     /// The session measured on the phone: 1720x720 at the 2 Mbit/s opening
     /// target, a break in the reference chain, and a client repeating its

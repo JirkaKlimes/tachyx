@@ -194,6 +194,17 @@ impl Probes {
         self.ceiling = ceiling;
     }
 
+    /// Forgets every probe and high water mark, after the estimate was collapsed
+    /// for a stall. Recovery then probes from the floor upward, rather than
+    /// aiming a cluster at the rate the link just failed to carry.
+    pub(crate) fn reset(&mut self) {
+        self.open.clear();
+        self.outstanding = None;
+        self.last_probe_rate = None;
+        self.high_water.clear();
+        self.last_probe_at = None;
+    }
+
     /// Files one report's packets against the clusters they belonged to, and
     /// returns the rate any completed cluster measured.
     pub(crate) fn read(&mut self, packets: &[Acked], now: i64) -> Option<f64> {

@@ -209,6 +209,18 @@ impl Aimd {
         self.rate = self.rate.clamp(self.floor, self.ceiling);
     }
 
+    /// Lowers the rate to at most `rate`, never raising it, and holds.
+    ///
+    /// For the controller decaying a blind estimate: the control has proven
+    /// nothing, so it may only give ground. Holding, rather than keeping the old
+    /// phase, means the first report to resume takes the ordinary hold to
+    /// increase transition and dates its climb from that report, not from a
+    /// change made while the link was silent.
+    pub(crate) fn lower_to(&mut self, rate: f64) {
+        self.rate = self.rate.min(rate).clamp(self.floor, self.ceiling);
+        self.phase = Phase::Hold;
+    }
+
     /// Takes a probe result, which sets the rate outright instead of waiting
     /// for the increase to walk there.
     pub(crate) fn probed(&mut self, rate: f64, now: i64) {
