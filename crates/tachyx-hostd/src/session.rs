@@ -66,9 +66,6 @@ pub enum SessionError {
     /// The control stream failed.
     #[error(transparent)]
     Control(#[from] tachyx_transport::control::ControlError),
-    /// Input could not be injected.
-    #[error(transparent)]
-    Input(#[from] tachyx_input::Error),
     /// The screen could not be kept awake.
     #[error(transparent)]
     Idle(#[from] crate::idle::Error),
@@ -85,13 +82,13 @@ pub enum SessionError {
 pub async fn serve(
     config: &Config,
     session: HostSession,
-    injector: &mut tachyx_input::Injector,
+    injection: &tachyx_input::Injection,
 ) -> Result<(), SessionError> {
     // Held for the whole session. A blanked screen stops producing frames, and
     // the one person who wants the machine awake cannot reach it.
     let _awake = crate::idle::Inhibitor::new()?;
     let pipeline = start(config, &session)?;
-    run(session, injector, pipeline).await
+    run(session, injection, pipeline).await
 }
 
 /// What bringing the pipeline up produces.
@@ -437,7 +434,7 @@ impl Live {
 /// Runs the session until the client goes away.
 async fn run(
     session: HostSession,
-    injector: &mut tachyx_input::Injector,
+    injection: &tachyx_input::Injection,
     pipeline: Pipeline,
 ) -> Result<(), SessionError> {
     let Pipeline {
@@ -508,14 +505,11 @@ async fn run(
         tokio::select! {
             message = from_client.recv::<ClientMessage>() => match message {
                 Ok(ClientMessage::Input(batch)) => {
-                    let events: Vec<_> =
-                        batch.events.into_iter().map(|timed| timed.event).collect();
-                    // A batch that cannot be injected is one batch lost. Ending
-                    // the session over it would take the picture away as well,
-                    // which is a far worse answer to a dropped click.
-                    if let Err(error) = injector.apply(&events) {
-                        tracing::warn!(%error, count = events.len(), "cannot inject input");
-                    }
+                    // Handed over rather than applied here. Injection flushes a
+                    // Wayland connection and sometimes waits on a full round
+                    // trip to the compositor, and this loop also carries the
+                    // video feedback, the cursor and the heartbeats.
+                    injection.send(batch.events.into_iter().map(|timed| timed.event).collect());
                 }
                 Ok(ClientMessage::Feedback(report)) => live.feedback(&report, Instant::now()),
                 Ok(ClientMessage::KeyframeRequest { .. }) => {

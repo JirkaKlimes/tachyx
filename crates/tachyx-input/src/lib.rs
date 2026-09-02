@@ -7,10 +7,16 @@
 //! An [`Injector`] owns a Wayland connection and is driven from a single thread.
 //! It is deliberately synchronous: injection is a trickle of tiny messages, and
 //! an async runtime behind it would buy nothing.
+//!
+//! Synchronous is not the same as quick. Every batch flushes the connection, and
+//! a batch carrying a character the text keymap has not seen waits on a full
+//! round trip to the compositor. A caller with anything else to do meanwhile
+//! takes an [`Injection`], which owns the injector and a thread to drive it.
 
 mod keymap;
 
 use std::os::fd::AsFd as _;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Instant;
 
 use keycode::{KeyMap, KeyMapping};
@@ -52,6 +58,9 @@ pub enum Error {
     /// The compositor's own keymap could not be read back from it.
     #[error("cannot read the compositor's keymap")]
     Keymap(#[source] std::io::Error),
+    /// The thread that drives injection could not be started.
+    #[error("cannot start the injection thread")]
+    Thread(#[source] std::io::Error),
 }
 
 /// A monitor's place in the layout, in logical pixels.
@@ -359,6 +368,87 @@ impl Injector {
             };
             self.text_keyboard.key(time, code, 1);
             self.text_keyboard.key(time, code, 0);
+        }
+    }
+}
+
+/// How many batches may wait for the compositor.
+///
+/// The queue needs a bound because the events in it come off the network: a
+/// client that sends faster than the compositor accepts would otherwise grow it
+/// without limit. A hundred and twenty-eight batches is about a second of a
+/// client's own batching tick, and a queue that deep already means the
+/// compositor has stopped answering, where the newest batch is worth more than
+/// the whole backlog behind it.
+const QUEUED_BATCHES: usize = 128;
+
+/// An [`Injector`] on a thread of its own.
+///
+/// [`Injector::apply`] flushes the Wayland connection, and a batch carrying a
+/// character the text keymap has not seen waits on a full round trip to the
+/// compositor. On a task that also carries video, the cursor and heartbeats,
+/// that round trip stops all three. Here the caller hands over a batch and
+/// returns, and the thread pays the round trip alone.
+///
+/// The thread ends when the last handle is dropped.
+#[derive(Debug)]
+pub struct Injection {
+    batches: SyncSender<Vec<InputEvent>>,
+}
+
+impl Injection {
+    /// Starts the thread and waits for it to reach the compositor.
+    ///
+    /// `output` names the monitor absolute positions are measured against, as
+    /// for [`Injector::new`].
+    ///
+    /// # Errors
+    /// Whatever [`Injector::new`] fails with, or if the thread cannot start.
+    pub fn spawn(output: &str) -> Result<Self, Error> {
+        let (batches, queue) = sync_channel::<Vec<InputEvent>>(QUEUED_BATCHES);
+        let (ready, started) = sync_channel(1);
+        let output = output.to_owned();
+        std::thread::Builder::new()
+            .name("tachyx-input".to_owned())
+            .spawn(move || {
+                // Built here rather than moved in, so that every Wayland call
+                // this crate makes happens on this one thread.
+                let mut injector = match Injector::new(&output) {
+                    Ok(injector) => {
+                        let _ = ready.send(Ok(()));
+                        injector
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                while let Ok(batch) = queue.recv() {
+                    // A batch that cannot be injected is one batch lost. There
+                    // is nobody above this to report it to, and the next batch
+                    // may well go through.
+                    if let Err(error) = injector.apply(&batch) {
+                        tracing::warn!(%error, count = batch.len(), "cannot inject input");
+                    }
+                }
+            })
+            .map_err(Error::Thread)?;
+
+        match started.recv() {
+            Ok(Ok(())) => Ok(Self { batches }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(Error::Thread(std::io::Error::other(
+                "the injection thread died starting up",
+            ))),
+        }
+    }
+
+    /// Queues a batch and returns without waiting for the compositor.
+    pub fn send(&self, events: Vec<InputEvent>) {
+        if let Err(error) = self.batches.try_send(events) {
+            // Waiting for room would put the compositor's stall back on the
+            // caller, which is the whole reason the thread is here.
+            tracing::warn!(%error, "dropping a batch of input");
         }
     }
 }

@@ -50,9 +50,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // better served by a buffer that keeps its picture recent.
     let ceiling = CodedSize::new(1920, 1088).ok_or("1920x1088 is not a valid coded size")?;
 
-    // Injection owns a Wayland connection of its own, so that a stall in it
-    // cannot hold up capture.
-    let mut injector = tachyx_input::Injector::new(config.output.as_deref().unwrap_or("eDP-1"))?;
+    // Injection owns a Wayland connection and a thread of its own, so that a
+    // stall in it holds up neither capture nor the session it serves. Started
+    // once and shared by every session: reaching the compositor costs several
+    // round trips, and the keyboard modifier state it holds is the state of a
+    // real keyboard, which does not belong to any one client.
+    let injection = tachyx_input::Injection::spawn(config.output.as_deref().unwrap_or("eDP-1"))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -83,7 +86,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let peer = session.connection.remote_address();
             tracing::info!(%peer, "client connected");
-            match session::serve(&config, session, &mut injector).await {
+            match session::serve(&config, session, &injection).await {
                 Ok(()) => tracing::info!(%peer, "client disconnected"),
                 Err(error) => tracing::warn!(%peer, %error, "session ended"),
             }
