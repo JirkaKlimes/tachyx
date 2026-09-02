@@ -76,25 +76,8 @@ fn transport_config(tuning: Tuning) -> TransportConfig {
         .max_concurrent_bidi_streams(VarInt::from_u32(1))
         .max_concurrent_uni_streams(VarInt::from_u32(0));
 
-    // Every video datagram is ack-eliciting, and the default threshold of one
-    // acknowledges every other packet: 875 acknowledgements a second at 20
-    // Mbit/s, every one of them a UDP packet going back up the same air hop the
-    // input events and the receiver reports use, each needing its own slot on a
-    // half-duplex medium.
-    //
-    // Eleven packets or five milliseconds, whichever comes first, is 200 a
-    // second at that rate. Nothing this transport depends on notices. Loss
-    // still elicits an acknowledgement at once, because `reordering_threshold`
-    // stays at its default of two and the packets behind a gap are out of
-    // order, so the delay only ever applies to a run that all arrived. The rate
-    // controller reads the receiver report, which travels every 50 ms and is
-    // not an acknowledgement. quinn subtracts the peer's reported delay from
-    // its round trip samples, so the estimate is unmoved, and the only figure
-    // that does move is the probe timeout, by the three milliseconds added
-    // here.
     let mut acks = AckFrequencyConfig::default();
-    acks.ack_eliciting_threshold(VarInt::from_u32(10))
-        .max_ack_delay(Some(Duration::from_millis(5)));
+    acks.max_ack_delay(Some(Duration::from_millis(2)));
     config.ack_frequency_config(Some(acks));
     config
 }
