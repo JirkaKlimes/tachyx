@@ -83,6 +83,23 @@ const NOMINAL_PAYLOAD: NonZeroUsize = NonZeroUsize::new(1418).unwrap();
 /// and the sleep is the whole of it.
 const WAIT_SLICE: Duration = Duration::from_millis(2);
 
+/// The shortest wait the send path bothers to sleep out.
+///
+/// A thread sleeping on Linux wakes up late by the timer slack, 50 microseconds
+/// by default, and the pacer asked per datagram returns waits far shorter than
+/// that is small against. A key frame at 30 Mbit/s is 75 datagrams whose waits
+/// are 380 microseconds each, so it spends a tenth of its own span in slack and
+/// arrives that much later than the deadline the pacer was set to meet.
+///
+/// Skipping the short waits is free because the pacer charges every datagram
+/// whether the caller waits or not: a datagram released before its turn borrows
+/// against the next one rather than escaping the rate. The debt accumulates
+/// until it is worth one sleep, the long-run rate is exactly the pacer's, and
+/// the most a picture ever runs ahead of schedule is a millisecond at the rate
+/// in force. That is 2,500 bytes at 20 Mbit/s, a tenth of the 25,000 the
+/// pacer's own burst allowance already permits.
+const PACE_QUANTUM: Duration = Duration::from_millis(1);
+
 /// Bytes of queued video the transport should be allowed to hold at `coded`.
 ///
 /// Sizing this by "two frames" is ambiguous in a way that decides whether the
@@ -547,7 +564,7 @@ impl VideoSender {
             let queued = datagram.len();
             let seq = seq_of(&datagram);
             let wait = self.pacer.release(queued, Instant::now());
-            if !wait.is_zero() {
+            if wait >= PACE_QUANTUM {
                 self.wait(wait)?;
                 // The queue drained while this frame was being released, so the
                 // record of what quinn still holds is stale by now. Squaring it
@@ -758,6 +775,46 @@ mod tests {
         );
         // The reading of "two frames" that never starts the stream.
         assert!(2 * 16_673 < queued);
+    }
+
+    /// The release loop skips a wait shorter than [`PACE_QUANTUM`] and lets the
+    /// pacer carry the debt instead. That is what turns one sleep per datagram
+    /// into one per millisecond, and what it must not do is change the rate.
+    #[test]
+    fn skipping_the_short_waits_costs_sleeps_and_not_rate() {
+        const DATAGRAM: usize = 1418 + HEADER_LEN;
+        const DATAGRAMS: usize = 2_000;
+        let rate = NonZeroU32::new(20_000_000).expect("a rate");
+        let start = Instant::now();
+        let mut pacer = Pacer::new(rate, start);
+
+        let mut now = start;
+        let mut sleeps = 0;
+        for _ in 0..DATAGRAMS {
+            let wait = pacer.release(DATAGRAM, now);
+            if wait >= PACE_QUANTUM {
+                now += wait;
+                sleeps += 1;
+            }
+        }
+
+        let bits = u64::try_from(DATAGRAMS * DATAGRAM * 8).expect("a small count");
+        let micros = u64::try_from((now - start).as_micros()).expect("a short run");
+        let carried = bits * 1_000_000 / micros;
+        // Above the rate by the burst allowance, which is free and is 0.9% of
+        // what this offered, and by the millisecond of debt left unpaid at the
+        // end.
+        assert!(
+            (20_000_000..20_500_000).contains(&carried),
+            "{DATAGRAMS} datagrams left at {carried} bit/s against a rate of 20 Mbit/s"
+        );
+        // A datagram is worth 0.57 ms at this rate, so a millisecond of debt is
+        // never fewer than two of them. Every datagram past the burst allowance
+        // waited before this.
+        assert!(
+            sleeps <= DATAGRAMS / 2,
+            "{sleeps} sleeps for {DATAGRAMS} datagrams"
+        );
     }
 
     #[test]
