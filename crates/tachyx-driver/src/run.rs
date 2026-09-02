@@ -89,6 +89,15 @@ pub(crate) async fn session(
                     // made one.
                     let alone = !session.input_pending();
                     session.input(at, now, event);
+                    // The pointer this just moved, said at once rather than on
+                    // the publish tick. Whoever draws it samples on the
+                    // display's clock, and a position republished on a clock of
+                    // its own beats against that one: the drawn pointer takes a
+                    // long step on one frame and a short one on the next, which
+                    // is a drag that stutters however steady the finger was.
+                    // One lock per touch sample, not one per datagram, so the
+                    // reason PUBLISH_TICK exists is untouched.
+                    shared.state().cursor = session.cursor();
                     if alone && input.open(now) {
                         session.flush_input();
                         input.close(now);
