@@ -1011,6 +1011,16 @@ impl Counters {
     }
 
     fn snapshot(&self) -> EncodeStats {
+        // Copied out under the lock and sorted outside it. The encode thread
+        // takes this lock once per frame to record a timing, and a caller
+        // asking for stats must not hold it there for a sort of four thousand
+        // values.
+        let mut held = self
+            .latency
+            .lock()
+            .expect("the latency mutex is never held across a panic")
+            .held
+            .clone();
         EncodeStats {
             encoded: self.encoded.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
@@ -1019,12 +1029,27 @@ impl Counters {
             gated: self.gated.load(Ordering::Relaxed),
             paced: self.paced.load(Ordering::Relaxed),
             key_frame_bytes: self.key_frame_bytes.load(Ordering::Relaxed),
-            latency: self
-                .latency
-                .lock()
-                .expect("the latency mutex is never held across a panic")
-                .percentiles(),
+            latency: percentiles(&mut held),
         }
+    }
+}
+
+/// Percentiles of a timing sample, which this sorts in place.
+fn percentiles(samples: &mut [u32]) -> Percentiles {
+    samples.sort_unstable();
+    let Some(worst) = samples.last().copied() else {
+        return Percentiles::default();
+    };
+    let at = |share: usize| {
+        Duration::from_micros(u64::from(
+            samples[(samples.len() * share / 100).min(samples.len() - 1)],
+        ))
+    };
+    Percentiles {
+        p50: at(50),
+        p90: at(90),
+        p99: at(99),
+        max: Duration::from_micros(u64::from(worst)),
     }
 }
 
@@ -1044,25 +1069,6 @@ impl Samples {
         } else {
             self.held[self.next] = micros;
             self.next = (self.next + 1) % Self::CAPACITY;
-        }
-    }
-
-    fn percentiles(&self) -> Percentiles {
-        if self.held.is_empty() {
-            return Percentiles::default();
-        }
-        let mut sorted = self.held.clone();
-        sorted.sort_unstable();
-        let at = |share: usize| {
-            Duration::from_micros(u64::from(
-                sorted[(sorted.len() * share / 100).min(sorted.len() - 1)],
-            ))
-        };
-        Percentiles {
-            p50: at(50),
-            p90: at(90),
-            p99: at(99),
-            max: Duration::from_micros(u64::from(sorted[sorted.len() - 1])),
         }
     }
 }
@@ -1263,8 +1269,9 @@ mod tests {
         for micros in 1..=100 {
             samples.push(micros);
         }
-        let stats = samples.percentiles();
+        let stats = percentiles(&mut samples.held);
         assert_eq!(stats.p50, Duration::from_micros(51));
         assert_eq!(stats.max, Duration::from_micros(100));
+        assert_eq!(percentiles(&mut []), Percentiles::default());
     }
 }
