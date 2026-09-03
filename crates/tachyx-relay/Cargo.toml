@@ -1,0 +1,23 @@
+[package]
+name = "tachyx-relay"
+description = "tachyx relay protocol and the client half of it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+postcard.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+serde.workspace = true
+tachyx-crypto.workspace = true
+tachyx-proto.workspace = true
+tachyx-transport.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

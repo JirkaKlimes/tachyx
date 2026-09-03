@@ -16,7 +16,7 @@ thiserror.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni.workspace = true
-ndk.workspace = true
+ndk = { workspace = true, features = ["audio"] }
 
 # This crate cannot take the workspace lints, because they forbid unsafe and a
 # `forbid` cannot be lifted from inside the crate it applies to. The set below is

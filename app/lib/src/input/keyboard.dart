@@ -13,6 +13,28 @@ import 'package:tachyx/src/rust/api/input.dart';
 /// key nobody pressed.
 const int keyboardPage = 0x0007;
 
+/// The USB HID usage page the volume keys arrive on.
+///
+/// Nothing on this page is forwarded to the host: it is a page of media keys
+/// belonging to the machine the user is holding, not to the one on the screen.
+/// Two of them are borrowed all the same, because a client that is playing the
+/// host's sound and cannot turn it down is a client with the wrong volume keys.
+const int consumerPage = 0x000C;
+
+/// The HID usage of the volume up key.
+const int _volumeUpUsage = 0xE9;
+
+/// The HID usage of the volume down key.
+const int _volumeDownUsage = 0xEA;
+
+/// How much of the host's volume one press of a volume key is worth, in
+/// permille.
+///
+/// Twenty presses cross the whole range, which is close enough to what a
+/// phone's own volume keys give that the keys do not feel different for
+/// pointing somewhere else.
+const int _volumeStep = 50;
+
 /// The HID usage of the return key.
 const int _returnUsage = 0x28;
 
@@ -27,15 +49,28 @@ const int _backspaceUsage = 0x2A;
 /// session and keeps tab and the arrows from moving focus instead of reaching
 /// the remote desktop.
 class HardwareKeys {
-  /// A forwarder that sends what it reads to [emit].
-  HardwareKeys(this.emit);
+  /// A forwarder that sends what it reads to [emit], and the volume keys to
+  /// [stepVolume].
+  HardwareKeys(this.emit, {required this.stepVolume});
 
   /// Where key events go, with the event clock reading at which the client saw
   /// the key change state.
   final void Function(Duration at, InputEvent event) emit;
 
+  /// Moves the host's volume by a step in permille, reporting whether it did.
+  ///
+  /// A session that is playing nothing does not, and the key is then left to
+  /// the platform, so that a client which is silent has the volume keys the
+  /// phone came with.
+  final bool Function(int step) stepVolume;
+
   /// HID usages currently held, so that they can all be released at once.
   final Set<int> _held = <int>{};
+
+  /// Volume keys whose press this client took. The release is claimed only
+  /// when the press was, so that a key still belonging to the platform reaches
+  /// it whole rather than as an orphaned release.
+  final Set<int> _volumeHeld = <int>{};
 
   /// Starts reading keys.
   void attach() => HardwareKeyboard.instance.addHandler(handle);
@@ -52,14 +87,17 @@ class HardwareKeys {
   /// has to install a global handler to reach it is testing Flutter rather than
   /// this.
   bool handle(KeyEvent event) {
+    final int packed = event.physicalKey.usbHidUsage;
+    final int page = packed >> 16;
+    final int id = packed & 0xFFFF;
+    // Read before the repeat is dropped: a held volume key is meant to keep
+    // moving the volume, where a held letter is repeated by the host itself.
+    if (page == consumerPage) return _volume(event, id);
+    if (page != keyboardPage) return false;
+
     // The host repeats a held key itself, so forwarding the platform's repeat
     // would double it. Still claimed, so that the platform does not act on it.
     if (event is KeyRepeatEvent) return true;
-
-    final int packed = event.physicalKey.usbHidUsage;
-    final int page = packed >> 16;
-    if (page != keyboardPage) return false;
-    final int id = packed & 0xFFFF;
 
     final Press press = event is KeyUpEvent ? Press.up : Press.down;
     if (press == Press.down) {
@@ -74,6 +112,24 @@ class HardwareKeys {
         press: press,
       ),
     );
+    return true;
+  }
+
+  /// Takes one of the two volume keys, if this session is playing anything.
+  ///
+  /// The press and the repeat both move the volume: holding a volume key is
+  /// how a range is crossed quickly, and there is nothing at the far end to
+  /// repeat it. Every other key on this page is the platform's own.
+  bool _volume(KeyEvent event, int id) {
+    final int step = switch (id) {
+      _volumeUpUsage => _volumeStep,
+      _volumeDownUsage => -_volumeStep,
+      _ => 0,
+    };
+    if (step == 0) return false;
+    if (event is KeyUpEvent) return _volumeHeld.remove(id);
+    if (!stepVolume(step)) return false;
+    _volumeHeld.add(id);
     return true;
   }
 
@@ -93,6 +149,9 @@ class HardwareKeys {
       );
     }
     _held.clear();
+    // A volume key held at the moment the application went away is released
+    // where the client cannot see it, so nothing is waited for.
+    _volumeHeld.clear();
   }
 }
 

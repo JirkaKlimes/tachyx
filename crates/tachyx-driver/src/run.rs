@@ -9,13 +9,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tachyx_client::{Liveness, Session};
+use tachyx_client::{AudioEvent, Liveness, Session};
 use tachyx_proto::control::{ClientMessage, HostMessage};
-use tachyx_transport::{Client, ClientSession, ControlError, ControlReader, ControlWriter};
+use tachyx_transport::{ClientSession, ControlError, ControlReader, ControlWriter};
 use tokio::sync::mpsc;
 use tokio::time::sleep_until;
 
-use crate::{Command, GOODBYE, Shared};
+use crate::{Command, GOODBYE, Held, Shared};
 
 /// The shortest time between two input batches.
 ///
@@ -39,18 +39,23 @@ const PUBLISH_TICK: Duration = Duration::from_millis(4);
 pub(crate) async fn session(
     mut session: Session,
     opened: ClientSession,
-    // The endpoint outlives the connection it dialled, so it is held here rather
-    // than in the handle, where a caller would have to know why it was there.
-    _client: Client,
+    // What the connection runs on: the endpoint, and the relay connection when
+    // there is one. Both outlive the connection, and both are held here rather
+    // than in the handle, where a caller would have to know why they were there.
+    _held: Held,
     shared: Arc<Shared>,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
     let ClientSession {
         connection,
+        greeting,
         to_host,
         from_host,
         ..
     } = opened;
+    // What the host said about itself before it had read a word from this
+    // client. Only the session may act on it, and only it knows what for.
+    session.greeted(greeting);
     let (messages, mut from_reader) = mpsc::unbounded_channel();
     tokio::spawn(read_control(from_host, messages));
 
@@ -66,9 +71,10 @@ pub(crate) async fn session(
             datagram = connection.read_datagram() => match datagram {
                 Ok(datagram) => {
                     if let Err(malformed) = session.datagram(&datagram, Instant::now()) {
-                        tracing::debug!(%malformed, "a datagram that is not a video packet");
+                        tracing::debug!(%malformed, "a datagram that is not a media packet");
                     }
                     present(&mut session, &shared, &mut unshown);
+                    listen(&mut session, &shared);
                     None
                 }
                 Err(gone) => Some(gone.to_string()),
@@ -82,37 +88,8 @@ pub(crate) async fn session(
                 None => Some("the host stopped speaking".to_owned()),
             },
             command = commands.recv() => match command {
-                Some(Command::Input(at, event)) => {
-                    let now = Instant::now();
-                    // Asked before the push, because what decides this is
-                    // whether the event has a batch to join, not whether it
-                    // made one.
-                    let alone = !session.input_pending();
-                    session.input(at, now, event);
-                    // The pointer this just moved, said at once rather than on
-                    // the publish tick. Whoever draws it samples on the
-                    // display's clock, and a position republished on a clock of
-                    // its own beats against that one: the drawn pointer takes a
-                    // long step on one frame and a short one on the next, which
-                    // is a drag that stutters however steady the finger was.
-                    // One lock per touch sample, not one per datagram, so the
-                    // reason PUBLISH_TICK exists is untouched.
-                    shared.state().cursor = session.cursor();
-                    if alone && input.open(now) {
-                        session.flush_input();
-                        input.close(now);
-                    }
-                    None
-                }
-                Some(Command::Viewport(capabilities)) => {
-                    session.capabilities_changed(capabilities);
-                    None
-                }
-                Some(Command::Present(sink)) => {
-                    shared.state().sink = Some(sink);
-                    if std::mem::take(&mut unshown) {
-                        session.decoder_started_late(Instant::now());
-                    }
+                Some(command) => {
+                    asked(command, &mut session, &shared, &mut input, &mut unshown);
                     None
                 }
                 // The handle is gone, so the user has left.
@@ -129,7 +106,7 @@ pub(crate) async fn session(
                 None
             },
             _ = reports.tick() => {
-                report(&session, connection.rtt());
+                report(&session, connection.rtt(), &shared);
                 None
             },
         };
@@ -163,10 +140,18 @@ pub(crate) async fn session(
 const REPORT_EVERY: Duration = Duration::from_millis(500);
 
 /// Writes one line about what the video path has done since the session opened.
-fn report(session: &Session, round_trip: Duration) {
+fn report(session: &Session, round_trip: Duration, shared: &Arc<Shared>) {
     let stats = session.video_stats();
     let live = Liveness::at(Instant::now(), session.heard_at(), session.saw_at());
+    let (host_audio, audio_packets, audio_lost, audio) = {
+        let state = shared.state();
+        (state.host_audio, state.audio_packets, state.audio_lost, state.audio)
+    };
     tracing::info!(
+        host_audio,
+        audio_packets,
+        audio_lost,
+        audio_mode = ?audio.map(|a| a.mode),
         ?live,
         recv = stats.packets_received,
         lost = stats.packets_lost,
@@ -220,6 +205,50 @@ impl Ticker {
     }
 }
 
+/// Does what the handle asked for.
+///
+/// Everything here changes the session or what it publishes and none of it can
+/// end the session, which is why the loop above keeps only the one case that
+/// can: the handle itself going away.
+fn asked(
+    command: Command,
+    session: &mut Session,
+    shared: &Arc<Shared>,
+    input: &mut Ticker,
+    unshown: &mut bool,
+) {
+    match command {
+        Command::Input(at, event) => {
+            let now = Instant::now();
+            // Asked before the push, because what decides this is whether the
+            // event has a batch to join, not whether it made one.
+            let alone = !session.input_pending();
+            session.input(at, now, event);
+            // The pointer this just moved, said at once rather than on the
+            // publish tick. Whoever draws it samples on the display's clock, and
+            // a position republished on a clock of its own beats against that
+            // one: the drawn pointer takes a long step on one frame and a short
+            // one on the next, which is a drag that stutters however steady the
+            // finger was. One lock per touch sample, not one per datagram, so
+            // the reason PUBLISH_TICK exists is untouched.
+            shared.state().cursor = session.cursor();
+            if alone && input.open(now) {
+                session.flush_input();
+                input.close(now);
+            }
+        }
+        Command::Viewport(capabilities) => session.capabilities_changed(capabilities),
+        Command::Present(sink) => {
+            shared.state().sink = Some(sink);
+            if std::mem::take(unshown) {
+                session.decoder_started_late(Instant::now());
+            }
+        }
+        Command::Listen(speaker) => shared.state().speaker = Some(speaker),
+        Command::Audio(command) => session.audio_command(command),
+    }
+}
+
 /// Hands every picture the session has finished to the decoder.
 ///
 /// One datagram can finish more than one: the datagram that completes a frame
@@ -240,6 +269,35 @@ fn present(session: &mut Session, shared: &Arc<Shared>, unshown: &mut bool) {
             // this loop knows: reassembly saw the picture arrive whole.
             None => *unshown = true,
         }
+    }
+}
+
+/// Hands everything the session has decided about sound to the speakers.
+///
+/// The counters are the loop's own and are kept whether or not anything is
+/// playing, so a session that lost its sound device still says how much sound
+/// arrived. The sink is read once a batch and only when there is sound, for the
+/// reason [`present`] gives: this is the lock the drawing thread wants.
+fn listen(session: &mut Session, shared: &Arc<Shared>) {
+    let mut speaker = None;
+    let mut packets = 0;
+    let mut lost = 0;
+    while let Some(event) = session.pop_audio() {
+        match &event {
+            AudioEvent::Packet { .. } => packets += 1,
+            AudioEvent::Lost(missing) => lost += u64::from(*missing),
+        }
+        // Nothing is playing yet, so this sound is gone. It is a moment of a
+        // live stream: held back and played later it would be behind the
+        // picture for the rest of the session.
+        if let Some(speaker) = speaker.get_or_insert_with(|| shared.state().speaker.clone()) {
+            speaker.push(event);
+        }
+    }
+    if packets > 0 || lost > 0 {
+        let mut state = shared.state();
+        state.audio_packets += packets;
+        state.audio_lost += lost;
     }
 }
 
@@ -265,6 +323,8 @@ async fn write_out(
 fn publish(shared: &Arc<Shared>, session: &Session) {
     let mut state = shared.state();
     state.video = session.video_stats();
+    state.host_audio = session.host_has_audio();
+    state.audio = session.audio_status();
     state.stream = session.stream();
     state.beat = session.heartbeat();
     state.heard = session.heard_at();
@@ -299,7 +359,7 @@ fn at(deadline: Option<Instant>) -> tokio::time::Instant {
 
 #[cfg(test)]
 mod tests {
-    use super::{INPUT_TICK, Ticker};
+    use super::{Ticker, INPUT_TICK};
     use std::time::{Duration, Instant};
 
     #[test]

@@ -1,279 +1,102 @@
-//! Who the host is, and how a client comes to believe it.
+//! Who is at each end of the handshake, and how each end decides.
 //!
-//! There is no certificate authority and there will not be one: a host on a
-//! local network has no name a public authority would sign. What identifies a
-//! host is its key, so a client remembers the key it saw the first time and
-//! refuses anything else afterwards. That is trust on first use, and it is the
-//! same verifier that pairing will use once pairing exists. Only the moment of
-//! first acceptance changes: today it is automatic, later it is a code the user
-//! confirms.
+//! [`spec/pairing.md`](../../../spec/pairing.md) is the document. The short
+//! version: a device is one Ed25519 key pair, the public half **is** the
+//! identifier, and there is no certificate authority. **Both ends present a
+//! certificate and both ends check one.** The host requires a client certificate
+//! and refuses a device it has not paired with; the client accepts exactly the
+//! host it was told to expect, and nothing else.
+//!
+//! Neither verifier looks at a validity date or a subject name. The certificate
+//! is self-signed, so a forger writes whatever it likes into both, and the key is
+//! the only thing an attacker has to break.
+//!
+//! There is no trust on first use here and there is no first-sight write. That
+//! was the hole [`spec/protocol.md`](../../../spec/protocol.md) named, and
+//! pairing is what closes it: a device this host has never paired with is
+//! refused inside the handshake, before it can say anything at all.
 
-use std::fmt::{self, Write as _};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use quinn::Connection;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme};
+use tachyx_crypto::{DeviceId, PairedClients};
 
-/// The subject name the host puts in its certificate.
+/// The name that goes in the TLS handshake, and that nothing reads.
 ///
-/// It is not checked by anything: the pin identifies the host, and a name that
-/// resolves is exactly what a host on a local network does not have.
-pub const SUBJECT: &str = "tachyx-host";
+/// A host on a local network has no name a public authority would sign, and
+/// neither verifier examines one. It is here because rustls requires a server
+/// name to be supplied, not because anything decides on it.
+pub const SERVER_NAME: &str = "tachyx";
 
-/// SHA-256 of a peer's subject public key info.
+/// The cryptographic provider, named rather than defaulted.
 ///
-/// The public key rather than the whole certificate, so that a host which
-/// regenerates its certificate around the same key keeps its identity.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Fingerprint([u8; 32]);
-
-impl Fingerprint {
-    /// Takes the fingerprint of a certificate.
-    ///
-    /// # Errors
-    /// If the bytes are not a certificate this build can parse.
-    pub fn of(certificate: &CertificateDer<'_>) -> Result<Self, IdentityError> {
-        let parsed = webpki::EndEntityCert::try_from(certificate)
-            .map_err(|_| IdentityError::UnreadableCertificate)?;
-        let spki = parsed.subject_public_key_info();
-        let digest = ring::digest::digest(&ring::digest::SHA256, spki.as_ref());
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(digest.as_ref());
-        Ok(Self(bytes))
-    }
-
-    /// The fingerprint in full, as lowercase hexadecimal.
-    #[must_use]
-    pub fn to_hex(self) -> String {
-        self.0
-            .iter()
-            .fold(String::with_capacity(64), |mut out, byte| {
-                let _ = write!(out, "{byte:02x}");
-                out
-            })
-    }
-
-    /// Reads a fingerprint back from [`Fingerprint::to_hex`].
-    fn from_hex(text: &str) -> Option<Self> {
-        if text.len() != 64 {
-            return None;
-        }
-        let mut bytes = [0u8; 32];
-        let (pairs, _) = text.as_bytes().as_chunks::<2>();
-        for (byte, pair) in bytes.iter_mut().zip(pairs) {
-            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-        }
-        Some(Self(bytes))
-    }
+/// quinn defaults to one provider and rustls to another, so taking both
+/// defaults compiles both. Ring is the one named here: the other has an open
+/// link failure on `aarch64-linux-android`, which is the client's main target.
+/// Ring also carries Ed25519 for both signing and verification, which is the
+/// only algorithm any tachyx device presents.
+#[must_use]
+pub fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// The first eight bytes, grouped for someone to read aloud.
-///
-/// Sixty-four bits is short enough to compare across a room and long enough
-/// that nobody will collide with it on a local network. Comparison always uses
-/// the whole digest.
-impl fmt::Display for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, byte) in self.0[..8].iter().enumerate() {
-            if index > 0 && index % 2 == 0 {
-                write!(f, "-")?;
-            }
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
+/// A certificate that is not one this build reads, or does not carry an Ed25519
+/// key.
+fn unreadable() -> TlsError {
+    TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding)
 }
 
-impl fmt::Debug for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Fingerprint({self})")
-    }
+/// A certificate that reads cleanly and names the wrong device.
+fn wrong_device() -> TlsError {
+    TlsError::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)
 }
 
-/// The host's own certificate and the key that signs it.
+/// The host's verifier: a client this host has paired with, and nobody else.
 ///
-/// The key is persisted, so a restart does not look like a different host to
-/// every client that has already pinned it.
+/// The list is read inside the handshake, so revoking a device takes effect on
+/// the next connection rather than on a restart.
 #[derive(Debug)]
-pub struct HostIdentity {
-    certificate: CertificateDer<'static>,
-    key: PrivateKeyDer<'static>,
-    fingerprint: Fingerprint,
-}
-
-impl HostIdentity {
-    /// Loads the identity from `directory`, creating one on first run.
-    ///
-    /// # Errors
-    /// If the directory cannot be read or written, or the stored key is not a
-    /// key.
-    pub fn load_or_create(directory: &Path) -> Result<Self, IdentityError> {
-        fs::create_dir_all(directory)?;
-        let key_path = directory.join("host.key.pem");
-        let signing_key = match fs::read_to_string(&key_path) {
-            Ok(pem) => rcgen::KeyPair::from_pem(&pem)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let generated = rcgen::KeyPair::generate()?;
-                fs::write(&key_path, generated.serialize_pem())?;
-                generated
-            }
-            Err(error) => return Err(error.into()),
-        };
-        // The certificate is derived rather than stored. It carries no
-        // information the key does not, and deriving it means one file to keep
-        // rather than two that can disagree.
-        let certificate = rcgen::CertificateParams::new(vec![SUBJECT.to_owned()])?
-            .self_signed(&signing_key)?
-            .der()
-            .clone();
-        let fingerprint = Fingerprint::of(&certificate)?;
-        Ok(Self {
-            certificate,
-            key: PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
-            fingerprint,
-        })
-    }
-
-    /// What a client pins.
-    #[must_use]
-    pub const fn fingerprint(&self) -> Fingerprint {
-        self.fingerprint
-    }
-
-    /// The certificate chain to present, which is one self-signed certificate.
-    #[must_use]
-    pub fn chain(&self) -> Vec<CertificateDer<'static>> {
-        vec![self.certificate.clone()]
-    }
-
-    /// The key that signs the handshake.
-    #[must_use]
-    pub fn key(&self) -> PrivateKeyDer<'static> {
-        self.key.clone_key()
-    }
-}
-
-/// The hosts a client has accepted, one line of `name fingerprint` each.
-///
-/// A file rather than a database, because a client that streams from more than
-/// a handful of hosts does not exist.
-#[derive(Debug)]
-pub struct PinStore {
-    path: PathBuf,
-    pins: Mutex<Vec<(String, Fingerprint)>>,
-}
-
-impl PinStore {
-    /// Opens the store at `path`, treating a missing file as an empty one.
-    ///
-    /// # Errors
-    /// If the file exists and cannot be read.
-    pub fn open(path: PathBuf) -> Result<Self, IdentityError> {
-        let pins = match fs::read_to_string(&path) {
-            Ok(text) => text
-                .lines()
-                .filter_map(|line| {
-                    let (name, digest) = line.split_once(' ')?;
-                    Some((name.to_owned(), Fingerprint::from_hex(digest)?))
-                })
-                .collect(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        Ok(Self {
-            path,
-            pins: Mutex::new(pins),
-        })
-    }
-
-    /// What is pinned for `host`, if anything.
-    #[must_use]
-    pub fn get(&self, host: &str) -> Option<Fingerprint> {
-        let pins = self
-            .pins
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pins.iter()
-            .find(|(name, _)| name == host)
-            .map(|(_, print)| *print)
-    }
-
-    /// Records `fingerprint` as the identity of `host`, replacing any earlier
-    /// one.
-    ///
-    /// # Errors
-    /// If the file cannot be written.
-    pub fn set(&self, host: &str, fingerprint: Fingerprint) -> Result<(), IdentityError> {
-        let text = {
-            let mut pins = self
-                .pins
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pins.retain(|(name, _)| name != host);
-            pins.push((host.to_owned(), fingerprint));
-            pins.iter().fold(String::new(), |mut out, (name, print)| {
-                let _ = writeln!(out, "{name} {}", print.to_hex());
-                out
-            })
-        };
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&self.path, text)?;
-        Ok(())
-    }
-}
-
-/// Accepts a host whose key matches the one already pinned for it, and pins the
-/// key of a host that has none.
-///
-/// The certificate's own validity dates and subject name are not examined.
-/// Neither says anything: the certificate is self-signed, so a forger writes
-/// whatever they like into both, and the pin is what an attacker would have to
-/// break.
-#[derive(Debug)]
-pub struct PinnedServer {
-    pins: Arc<PinStore>,
+pub struct Paired {
+    clients: Arc<PairedClients>,
     provider: Arc<CryptoProvider>,
 }
 
-impl PinnedServer {
-    /// Verifies against `pins`, using `provider` for the handshake signatures.
+impl Paired {
+    /// Accepts the devices in `clients`, using `provider` for the handshake
+    /// signatures.
     #[must_use]
-    pub const fn new(pins: Arc<PinStore>, provider: Arc<CryptoProvider>) -> Self {
-        Self { pins, provider }
+    pub const fn new(clients: Arc<PairedClients>, provider: Arc<CryptoProvider>) -> Self {
+        Self { clients, provider }
     }
 }
 
-impl ServerCertVerifier for PinnedServer {
-    fn verify_server_cert(
+impl ClientCertVerifier for Paired {
+    /// No hints. The client has exactly one certificate and no choice to make,
+    /// and a hint list would name every paired device to anybody who asked.
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
         _now: UnixTime,
-    ) -> Result<ServerCertVerified, TlsError> {
-        let presented = Fingerprint::of(end_entity)
-            .map_err(|_| TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
-        let host = pin_key(server_name);
-        match self.pins.get(&host) {
-            Some(pinned) if pinned == presented => Ok(ServerCertVerified::assertion()),
-            Some(_) => Err(TlsError::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            )),
-            None => {
-                self.pins.set(&host, presented).map_err(|error| {
-                    TlsError::General(format!("cannot record the host's identity: {error}"))
-                })?;
-                tracing::info!(%host, fingerprint = %presented, "pinned a new host");
-                Ok(ServerCertVerified::assertion())
-            }
+    ) -> Result<ClientCertVerified, TlsError> {
+        let device = DeviceId::of_certificate(end_entity).map_err(|_| unreadable())?;
+        if self.clients.get(device).is_some() {
+            return Ok(ClientCertVerified::assertion());
         }
+        // Loud on purpose. A paired phone that stops connecting is the fault an
+        // operator will look for in this log, and a refusal that only appeared
+        // at debug level would be an hour of looking in the wrong place.
+        tracing::warn!(%device, "refused a device this host has not paired with");
+        Err(wrong_device())
     }
 
     fn verify_tls12_signature(
@@ -311,85 +134,274 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
-/// The name a pin is filed under.
+/// The dialling end's verifier for a peer the operator chose not to pin.
 ///
-/// A domain name and an address are both taken as written, which is what the
-/// user typed and what the file is worth reading for. The two can never be
-/// confused: a name that parses as an address is an address.
-fn pin_key(server_name: &ServerName<'_>) -> String {
-    match server_name {
-        ServerName::DnsName(name) => name.as_ref().to_owned(),
-        ServerName::IpAddress(address) => std::net::IpAddr::from(*address).to_string(),
-        other => format!("{other:?}"),
+/// Any device with a well-formed Ed25519 certificate is accepted, and the
+/// handshake signature still proves it holds the key it presents. What is given
+/// up is knowing **which** device answered: anyone who can intercept the
+/// address can be it. That is tolerable for exactly one peer, a relay written
+/// without its key, because a session through a relay is end to end between two
+/// pinned device keys whoever carries it; what an interceptor gains is the
+/// metadata, who this device reaches and when, and the power to force the
+/// relayed path. `spec/relay.md` is where that trade is weighed. Nothing else
+/// may use this: a host is its key, and dialling one unpinned would be dialling
+/// nobody in particular.
+#[derive(Debug)]
+pub struct AnyDevice {
+    provider: Arc<CryptoProvider>,
+}
+
+impl AnyDevice {
+    /// Accepts any device that proves it holds an Ed25519 key.
+    #[must_use]
+    pub const fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self { provider }
     }
 }
 
-/// Why an identity could not be established.
-#[derive(Debug, thiserror::Error)]
-pub enum IdentityError {
-    /// The key or pin file could not be read or written.
-    #[error("cannot reach the identity on disk")]
-    Storage(#[from] std::io::Error),
-    /// The certificate machinery refused.
-    #[error("cannot build the host's certificate")]
-    Certificate(#[from] rcgen::Error),
-    /// A certificate arrived that this build cannot parse.
-    #[error("the peer presented something that is not a certificate")]
-    UnreadableCertificate,
+impl ServerCertVerifier for AnyDevice {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        let _ = DeviceId::of_certificate(end_entity).map_err(|_| unreadable())?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// The dialling end's verifier: exactly one device, named before the connection
+/// was made.
+///
+/// Used by a client for a host it has paired with, and by a peer for a relay
+/// whose key travelled in its address. Both are the same decision: the expected
+/// key, byte for byte, or nothing.
+#[derive(Debug)]
+pub struct Pinned {
+    expected: DeviceId,
+    provider: Arc<CryptoProvider>,
+}
+
+impl Pinned {
+    /// Accepts `expected` and no other device.
+    #[must_use]
+    pub const fn new(expected: DeviceId, provider: Arc<CryptoProvider>) -> Self {
+        Self { expected, provider }
+    }
+}
+
+impl ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        let device = DeviceId::of_certificate(end_entity).map_err(|_| unreadable())?;
+        if device == self.expected {
+            return Ok(ServerCertVerified::assertion());
+        }
+        tracing::warn!(
+            %device,
+            expected = %self.expected,
+            "the peer at that address is a different device"
+        );
+        Err(wrong_device())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Which device is at the far end of `connection`.
+///
+/// The certificate has already been through one of the verifiers above by the
+/// time this can be called, so this reads a decision that has been made rather
+/// than making one. It is what lets a session look up the peer's
+/// [`Permissions`](tachyx_crypto::Permissions).
+///
+/// `None` only where no certificate was presented, which for these two
+/// configurations means the handshake did not complete.
+#[must_use]
+pub fn peer_device(connection: &Connection) -> Option<DeviceId> {
+    let chain = connection
+        .peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?;
+    DeviceId::of_certificate(chain.first()?).ok()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use rustls::pki_types::UnixTime;
+    use tachyx_crypto::store::PairedClient;
+    use tachyx_crypto::{DeviceKey, Permissions};
+
     use super::*;
 
+    fn key(seed: u8) -> DeviceKey {
+        DeviceKey::from_seed(&[seed; 32]).expect("a key")
+    }
+
     fn scratch(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("tachyx-identity-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
+        let path = std::env::temp_dir().join(format!(
+            "tachyx-verifier-{name}-{}/clients.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().expect("a directory"));
         path
     }
 
-    #[test]
-    fn a_host_keeps_its_identity_across_a_restart() {
-        let directory = scratch("restart");
-        let first = HostIdentity::load_or_create(&directory).unwrap();
-        let second = HostIdentity::load_or_create(&directory).unwrap();
-        assert_eq!(first.fingerprint(), second.fingerprint());
-        fs::remove_dir_all(&directory).unwrap();
+    fn now() -> UnixTime {
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000))
     }
 
     #[test]
-    fn a_fresh_key_is_a_different_host() {
-        let one = HostIdentity::load_or_create(&scratch("one")).unwrap();
-        let two = HostIdentity::load_or_create(&scratch("two")).unwrap();
-        assert_ne!(one.fingerprint(), two.fingerprint());
-    }
+    fn a_paired_device_is_accepted_and_a_stranger_is_not() {
+        let paired = key(1);
+        let stranger = key(2);
+        let clients = PairedClients::open(scratch("paired")).expect("a list");
+        clients
+            .add(PairedClient {
+                device: paired.id(),
+                name: "phone".to_owned(),
+                permissions: Permissions::default(),
+                paired: 0,
+            })
+            .expect("the list is writable");
 
-    #[test]
-    fn a_pin_survives_a_round_trip_through_the_file() {
-        let directory = scratch("pins");
-        let identity = HostIdentity::load_or_create(&directory).unwrap();
-        let path = directory.join("pins");
-        let store = PinStore::open(path.clone()).unwrap();
-        assert_eq!(store.get("desk"), None);
-        store.set("desk", identity.fingerprint()).unwrap();
-
-        let reopened = PinStore::open(path).unwrap();
-        assert_eq!(reopened.get("desk"), Some(identity.fingerprint()));
-        assert_eq!(reopened.get("laptop"), None);
-        fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    fn a_short_fingerprint_is_readable_and_stable() {
-        let identity = HostIdentity::load_or_create(&scratch("display")).unwrap();
-        let short = identity.fingerprint().to_string();
-        assert_eq!(short.len(), 19, "eight bytes in four groups");
+        let verifier = Paired::new(Arc::new(clients), provider());
+        assert!(verifier
+            .verify_client_cert(&paired.certificate().unwrap(), &[], now())
+            .is_ok());
         assert!(
-            identity
-                .fingerprint()
-                .to_hex()
-                .starts_with(&short.replace('-', ""))
+            verifier
+                .verify_client_cert(&stranger.certificate().unwrap(), &[], now())
+                .is_err(),
+            "a device that has never paired must not reach the session at all"
         );
+    }
+
+    #[test]
+    fn a_revoked_device_is_refused_by_the_next_handshake() {
+        let device = key(3);
+        let clients = Arc::new(PairedClients::open(scratch("revoke")).expect("a list"));
+        clients
+            .add(PairedClient {
+                device: device.id(),
+                name: "phone".to_owned(),
+                permissions: Permissions::default(),
+                paired: 0,
+            })
+            .expect("the list is writable");
+        let verifier = Paired::new(Arc::clone(&clients), provider());
+        let certificate = device.certificate().unwrap();
+        assert!(verifier
+            .verify_client_cert(&certificate, &[], now())
+            .is_ok());
+
+        assert!(clients.remove(device.id()).expect("the list is writable"));
+        assert!(
+            verifier
+                .verify_client_cert(&certificate, &[], now())
+                .is_err(),
+            "the list is read inside the handshake, so revoking takes effect at once"
+        );
+    }
+
+    #[test]
+    fn the_pinned_verifier_takes_one_device_and_refuses_every_other() {
+        let host = key(4);
+        let impostor = key(5);
+        let verifier = Pinned::new(host.id(), provider());
+        let name = ServerName::try_from(SERVER_NAME).expect("a usable name");
+        assert!(verifier
+            .verify_server_cert(&host.certificate().unwrap(), &[], &name, &[], now())
+            .is_ok());
+        assert!(verifier
+            .verify_server_cert(&impostor.certificate().unwrap(), &[], &name, &[], now())
+            .is_err());
+    }
+
+    #[test]
+    fn something_that_is_not_a_certificate_is_refused_rather_than_parsed() {
+        let verifier = Pinned::new(key(6).id(), provider());
+        let name = ServerName::try_from(SERVER_NAME).expect("a usable name");
+        let rubbish = CertificateDer::from(vec![0u8; 32]);
+        assert!(verifier
+            .verify_server_cert(&rubbish, &[], &name, &[], now())
+            .is_err());
     }
 }

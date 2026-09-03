@@ -16,17 +16,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tachyx_proto::VERSION;
+use tachyx_crypto::store::PairedClient;
+use tachyx_crypto::{DeviceId, DeviceKey, PairedClients, Permissions};
 use tachyx_proto::control::{
     Aspect, Capabilities, ClientHello, ClientMessage, Codec, Codecs, CodedSize, HandshakeError,
     Heartbeat, HostMessage, InputBatch, Size, StreamConfig, TimedInput,
 };
 use tachyx_proto::input::{InputEvent, PointerButton, Press};
-use tachyx_proto::media::{FrameId, FrameKind, HEADER_LEN, Timestamp};
+use tachyx_proto::media::{FrameId, FrameKind, Seq, Timestamp, HEADER_LEN};
 use tachyx_proto::packet::{AccessUnit, Frame, Reassembler, ReassemblyStats};
+use tachyx_proto::VERSION;
 use tachyx_transport::{
-    Client, ClientSession, ControlError, ControlReader, ControlWriter, Host, HostIdentity,
-    HostSession, PinStore, Sent, TransportError, Tuning, VideoSender, video_send_buffer,
+    client_config, video_send_buffer, Client, ClientSession, ControlError, ControlReader,
+    ControlWriter, Host, HostSession, Sent, TransportError, Tuning, VideoSender, LAN_MTU,
+    SERVER_NAME,
 };
 
 /// How long the receiver waits for a frame that nothing follows.
@@ -103,9 +106,6 @@ impl Video {
     }
 }
 
-/// The name the host is pinned under. Not resolved, and it need not resolve.
-const HOST_NAME: &str = "tachyx-host";
-
 /// A 1080p60 key frame out of `vah264enc`, measured on the target machine.
 const KEY_FRAME: usize = 130_427;
 
@@ -115,13 +115,17 @@ const DELTA_FRAME: usize = 16_673;
 /// One frame period at 60 Hz.
 const PERIOD: Duration = Duration::from_micros(16_667);
 
-/// A host and a client bound on the loopback interface, with the host's key and
-/// the client's pins in a directory of their own.
+/// A host and a client bound on the loopback interface, each with a device key
+/// of its own and the client already paired with the host.
 struct Link {
     host: Host,
+    host_device: DeviceId,
     client: Client,
+    client_key: Arc<DeviceKey>,
+    clients: Arc<PairedClients>,
     address: SocketAddr,
     directory: PathBuf,
+    tuning: Tuning,
 }
 
 impl Link {
@@ -129,15 +133,36 @@ impl Link {
         let directory =
             std::env::temp_dir().join(format!("tachyx-loopback-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
-        let identity = HostIdentity::load_or_create(&directory).expect("an identity on disk");
-        let bound = Host::bind((Ipv4Addr::LOCALHOST, 0).into(), &identity, host).expect("a host");
+        let host_key = DeviceKey::load_or_create(&directory.join("host")).expect("a host key");
+        let client_key =
+            Arc::new(DeviceKey::load_or_create(&directory.join("client")).expect("a client key"));
+        let clients =
+            Arc::new(PairedClients::open(directory.join("clients.toml")).expect("a paired list"));
+        clients
+            .add(PairedClient {
+                device: client_key.id(),
+                name: "the test client".to_owned(),
+                permissions: Permissions::default(),
+                paired: 0,
+            })
+            .expect("the list is writable");
+        let bound = Host::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            &host_key,
+            Arc::clone(&clients),
+            host,
+        )
+        .expect("a host");
         let address = bound.local_address().expect("a bound address");
-        let pins = Arc::new(PinStore::open(directory.join("pins")).expect("a pin file"));
         Self {
             host: bound,
-            client: Client::new(pins, client).expect("a client endpoint"),
+            host_device: host_key.id(),
+            client: Client::bind(Arc::clone(&client_key), client).expect("a client endpoint"),
+            client_key,
+            clients,
             address,
             directory,
+            tuning: client,
         }
     }
 
@@ -150,12 +175,23 @@ impl Link {
         let hello = ClientHello::new(capabilities());
         let (host, client) = tokio::join!(
             self.host.accept(),
-            self.client.connect(self.address, HOST_NAME, &hello)
+            self.client.connect(self.address, self.host_device, &hello)
         );
         (
             host.expect("the host accepts"),
             client.expect("the client connects"),
         )
+    }
+
+    /// A raw quinn connection to the host, with the handshake this client would
+    /// make and nothing above it.
+    fn dial(&self) -> quinn::Connecting {
+        let config = client_config(&self.client_key, self.host_device, self.tuning)
+            .expect("a client configuration");
+        self.client
+            .endpoint()
+            .connect_with(config, self.address, SERVER_NAME)
+            .expect("a dialable address")
     }
 }
 
@@ -272,7 +308,19 @@ fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn video_moves_over_a_real_socket_at_the_measured_frame_sizes() {
     const FRAMES: u32 = 180;
-    const KEY_INTERVAL: u32 = 60;
+    // The shape the host really sends: one key frame to open the session and
+    // nothing scheduled after it. The encoder's group of pictures is the
+    // element's own ceiling and the host forces a key frame only when somebody
+    // asks, so a run of 180 frames carries exactly one.
+    //
+    // Measured here, which is why the host stopped scheduling them. With a key
+    // frame every 60 frames instead, three runs gave a 99th percentile of
+    // 18.36, 17.96 and 18.38 ms; with one at the start, 5.50, 5.09 and 5.86 ms.
+    // The median is 1.3 to 1.5 ms either way and the worst case is the opening
+    // key frame, which both shapes pay. The spike is not the key frame's own
+    // 26 ms span: it is the two delta frames behind it, which the pacer charges
+    // for what the key frame borrowed.
+    const KEY_INTERVAL: u32 = 1024;
 
     let coded = CodedSize::new(1920, 1088).expect("a codeable size");
     let tuning = Tuning::for_stream(coded);
@@ -347,9 +395,76 @@ async fn video_moves_over_a_real_socket_at_the_measured_frame_sizes() {
     );
 }
 
+/// Sound goes out beside the picture: the same connection, the same sequence,
+/// and a record the congestion controller can match a receiver report against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_leaves_beside_the_picture_and_shares_its_sequence() {
+    const OPUS: usize = 240;
+
+    let coded = CodedSize::new(1920, 1088).expect("a codeable size");
+    let tuning = Tuning::for_stream(coded);
+    let link = Link::open("audio", tuning, tuning);
+    let (mut host, client) = link.sessions().await;
+
+    // A picture first, so the counter has already moved when the sound is
+    // stamped. A counter of its own would repeat every one of these numbers.
+    let Sent::Queued { datagrams } = send_frame(&mut host.video, 1, 60) else {
+        panic!("a delta frame was refused on an idle loopback link");
+    };
+
+    let opus = vec![0x5A; OPUS];
+    let captured = Timestamp::from_session_micros(1_000_000);
+    host.audio
+        .send(FrameId(7), captured, &opus)
+        .expect("the connection is live");
+
+    let mut reassembler = Reassembler::new(FRAME_DEADLINE);
+    let (seq, id, at, packet) = loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), client.connection.read_datagram());
+        let datagram = read
+            .await
+            .expect("the sound arrives")
+            .expect("the connection is live");
+        let received = reassembler
+            .push(&datagram, Instant::now())
+            .expect("a media datagram");
+        if let Some(sound) = received.audio {
+            break (received.seq, sound.id, sound.capture, sound.opus.to_vec());
+        }
+    };
+
+    assert_eq!(id, FrameId(7));
+    assert_eq!(at, captured);
+    assert_eq!(packet, opus, "the Opus packet arrives byte for byte");
+    assert_eq!(
+        seq,
+        Seq(u16::try_from(datagrams).expect("a small count")),
+        "sound continues the picture's sequence instead of starting one of its own"
+    );
+    assert_eq!(
+        reassembler.stats().packets_lost,
+        0,
+        "a shared counter leaves no hole for the receiver to read as loss"
+    );
+
+    let records: Vec<_> = host.control.released().collect();
+    assert_eq!(
+        records.len(),
+        datagrams + 1,
+        "one record per datagram, from both paths"
+    );
+    let sound = records.last().expect("every datagram is recorded");
+    assert_eq!(sound.seq, seq);
+    assert_eq!(usize::from(sound.wire), HEADER_LEN + OPUS);
+    assert!(
+        sound.cluster.is_none(),
+        "sound leaves when it is encoded, so it measures no cluster"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saturated_link_reports_what_it_carried() {
-    const KEY_INTERVAL: u32 = 60;
+    const KEY_INTERVAL: u32 = 1024;
     const RUN: Duration = Duration::from_millis(1500);
 
     let coded = CodedSize::new(1920, 1088).expect("a codeable size");
@@ -422,6 +537,7 @@ async fn a_saturated_link_reports_what_it_carried() {
 fn cramped() -> Tuning {
     Tuning {
         video_buffer: video_send_buffer(CodedSize::new(640, 480).expect("a codeable size")),
+        initial_mtu: LAN_MTU,
     }
 }
 
@@ -485,6 +601,70 @@ async fn the_gate_charges_the_queue_accounting_once_per_queued_datagram() {
         !host.video.can_send_frame(real + 1, payload.get()),
         "one datagram past what the queue holds is refused, though the report \
          alone would have allowed {reported}"
+    );
+}
+
+/// The gate reconstructs quinn's queue from a record of what was pushed onto
+/// it, and sound pushes onto the same queue. Kept apart, the two records
+/// disagree: the bytes quinn reports include the sound, the picture path's own
+/// record does not, the sum never squares, and the gate answers "no room" to
+/// everything. That refusal lands **after** the encoder has produced a frame,
+/// which breaks the reference chain and costs a key frame, and it lasts for as
+/// long as any sound is in flight.
+#[tokio::test]
+async fn the_gate_stays_exact_while_sound_shares_the_queue() {
+    const OPUS: usize = 240;
+    const PACKETS: u32 = 5;
+
+    let tuning = Tuning::for_stream(hd());
+    let link = Link::open("audio-gate", tuning, tuning);
+    let (mut host, _client) = link.sessions().await;
+    let payload = host.video.payload_len().expect("the handshake has settled");
+    let overhead = size_of::<bytes::Bytes>();
+    let charged = payload.get() + HEADER_LEN + overhead;
+
+    // A single-threaded runtime and nothing awaited from here on, so nothing
+    // drains the queue while it is being measured. A key frame first, then
+    // sound beside it: the queue now holds datagrams of two sizes from two
+    // paths, which is the state a session in `AudioMode::Shared` is in for as
+    // long as it lasts.
+    let Sent::Queued { datagrams } = send_frame(&mut host.video, 0, 1) else {
+        panic!("the queue holds a key frame")
+    };
+    let opus = vec![0x5A; OPUS];
+    for id in 0..PACKETS {
+        host.audio
+            .send(
+                FrameId(id),
+                Timestamp::from_session_micros(u64::from(id) * 10_000),
+                &opus,
+            )
+            .expect("the connection is live");
+    }
+
+    let queued = datagrams + PACKETS as usize;
+    let space = host.connection.datagram_send_buffer_space();
+    // Every datagram on the queue charges its own accounting, whichever path
+    // put it there.
+    let real = (space + overhead - queued * overhead) / charged;
+    println!(
+        "\n  queued             {datagrams} picture and {PACKETS} sound datagrams\n  \
+           reported free      {space} bytes\n  \
+           gate allows        {real} more pictures\n"
+    );
+
+    assert!(
+        host.video.can_send_frame(real, payload.get()),
+        "the gate must still answer, with {PACKETS} sound datagrams on the queue"
+    );
+    assert!(
+        !host.video.can_send_frame(real + 1, payload.get()),
+        "one datagram past what the queue holds is still refused"
+    );
+    assert_eq!(
+        host.video.frames_refused(),
+        0,
+        "no frame was refused while the two paths shared the queue"
     );
 }
 
@@ -658,10 +838,7 @@ async fn a_client_of_another_version_is_refused_by_name() {
     let link = Link::open("mismatch", tuning, tuning);
     let stranger = async {
         let connection = link
-            .client
-            .endpoint()
-            .connect(link.address, HOST_NAME)
-            .expect("a dialable address")
+            .dial()
             .await
             .expect("the handshake succeeds: the version is not a TLS matter");
         let (send, recv) = connection.open_bi().await.expect("the stream opens");
@@ -725,13 +902,7 @@ async fn raw_session(
     quinn::RecvStream,
 ) {
     let dial = async {
-        let connection = link
-            .client
-            .endpoint()
-            .connect(link.address, HOST_NAME)
-            .expect("a dialable address")
-            .await
-            .expect("the handshake succeeds");
+        let connection = link.dial().await.expect("the handshake succeeds");
         let (mut send, recv) = connection.open_bi().await.expect("the stream opens");
         let (header, body) = framed(&ClientHello::new(capabilities()));
         send.write_all(&header).await.expect("the write lands");
@@ -918,5 +1089,67 @@ async fn a_key_frame_leaves_paced_and_a_delta_frame_leaves_at_once() {
          out as a burst: {:?} against {:?}",
         span(burst),
         span(key)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_this_host_has_not_paired_with_never_reaches_a_session() {
+    let tuning = Tuning::for_stream(hd());
+    let link = Link::open("unpaired", tuning, tuning);
+    // A second device with a key of its own, which nothing has ever paired.
+    let stranger = Arc::new(
+        DeviceKey::load_or_create(&link.directory.join("stranger")).expect("a stranger's key"),
+    );
+    let dialling = Client::bind(Arc::clone(&stranger), tuning).expect("a client endpoint");
+    let hello = ClientHello::new(capabilities());
+
+    // The host's own accept is driven alongside, because a refused handshake is
+    // still an `Incoming` the daemon's loop has to consume and report.
+    let (refused_by_host, refused_at_client) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), link.host.accept()),
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            dialling.connect(link.address, link.host_device, &hello)
+        )
+    );
+    let refused_by_host = refused_by_host
+        .expect("the host answers rather than hanging")
+        .expect_err("an unpaired device is not a session");
+    let refused_at_client = refused_at_client
+        .expect("the client is answered rather than hanging")
+        .expect_err("an unpaired device is not a session");
+    println!(
+        "\n  stranger           {}\n  the host said      {refused_by_host}\n  \
+           the client saw     {refused_at_client}\n",
+        stranger.id()
+    );
+    assert!(
+        matches!(refused_at_client, TransportError::Connection(_)),
+        "the refusal is a closed connection and not a protocol answer: {refused_at_client}"
+    );
+
+    // The same device, once the host has it in its list, connects.
+    link.clients
+        .add(PairedClient {
+            device: stranger.id(),
+            name: "no longer a stranger".to_owned(),
+            permissions: Permissions::default(),
+            paired: 1,
+        })
+        .expect("the list is writable");
+    let (host, client) = tokio::join!(
+        link.host.accept(),
+        dialling.connect(link.address, link.host_device, &hello)
+    );
+    let host = host.expect("the host accepts a paired device");
+    let client = client.expect("the client connects once it is paired");
+    assert_eq!(
+        host.peer,
+        stranger.id(),
+        "the host knows which device it took"
+    );
+    assert_eq!(
+        client.peer, link.host_device,
+        "the client knows which device answered"
     );
 }

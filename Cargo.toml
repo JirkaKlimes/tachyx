@@ -12,13 +12,18 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/JirkaKlimes/tachyx"
 
 [workspace.dependencies]
+tachyx-audio = { path = "crates/tachyx-audio" }
 tachyx-client = { path = "crates/tachyx-client" }
 tachyx-congestion = { path = "crates/tachyx-congestion" }
+tachyx-crypto = { path = "crates/tachyx-crypto" }
 tachyx-driver = { path = "crates/tachyx-driver" }
 tachyx-hostd = { path = "crates/tachyx-hostd" }
 tachyx-input = { path = "crates/tachyx-input" }
 tachyx-media = { path = "crates/tachyx-media" }
 tachyx-proto = { path = "crates/tachyx-proto" }
+tachyx-relay = { path = "crates/tachyx-relay" }
+tachyx-relayd = { path = "crates/tachyx-relayd" }
+tachyx-sched = { path = "crates/tachyx-sched" }
 tachyx-transport = { path = "crates/tachyx-transport" }
 tachyx-unsafe = { path = "crates/tachyx-unsafe" }
 tachyx-video = { path = "crates/tachyx-video" }
@@ -26,8 +31,44 @@ tachyx-video = { path = "crates/tachyx-video" }
 anyhow = "1.0"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
+# Base32 for everything a person reads or retypes: device identifiers, pairing
+# codes, the body of a pairing QR. `BASE32_NOPAD_NOCASE` writes upper case, which
+# QR encodes in alphanumeric mode at 5.5 bits a character instead of byte mode's
+# 8, and reads either case back, because it is a thing people type. Zero
+# dependencies of its own.
+data-encoding = "2.11"
+# The relay's rate limiting. A generic cell rate algorithm, so one atomic word a
+# key and no timer wheel, and a keyed limiter whose map is itself a denial of
+# service unless `retain_recent` is called on a timer, which `relayd` does.
+# Keyed on the IPv6 /64 rather than the address, because a single subscriber is
+# handed a whole one.
+governor = { version = "0.10", default-features = false, features = ["std", "quanta", "dashmap"] }
 keycode = "1.0"
+# The host's own volume and mute, and the name of the sink they belong to.
+# It speaks the PulseAudio protocol, which the pipewire-pulse server answers as
+# well as a real PulseAudio one does, so this is one client for both. Its own
+# `unsafe` stays inside it and the workspace stays `forbid(unsafe_code)`.
+libpulse-binding = { version = "2.30", default-features = false, features = ["pa_v8"] }
+# The client's Opus decoder, and the encoder its tests measure against. Taken
+# over `audiopus`, whose newest release is a release candidate from 2021. This
+# one builds libopus itself through `opusic-sys`, with cmake and the NDK's own
+# toolchain file, so the phone build links no system library and the desktop
+# build does not depend on which one a distribution shipped.
+opus = "0.4"
+# The pairing key exchange. CPace over Ristretto255: 197 lines, `no_std`,
+# `forbid(unsafe_code)`, by the author of libsodium, and read in full before it
+# was taken. Ristretto is the reason it is this and not SPAKE2 over Ed25519 --
+# there is no cofactor and no non-canonical encoding to reason about, so the
+# whole class of small-subgroup mistakes is unrepresentable. RustCrypto's
+# `spake2` is also a pre-release, and CPace is what the CFRG selected for the
+# balanced case. See `spec/pairing.md`.
+pake-cpace = "0.1"
 postcard = { version = "1.1", features = ["use-std"] }
+# The pairing code, drawn in a terminal. Zero dependencies with the defaults off,
+# and the only one of the four QR crates that splits the input into segments, so
+# the upper-case base32 body is encoded in alphanumeric mode and the lower-case
+# scheme in front of it in byte mode. That is a whole QR version smaller.
+qrcode = { version = "0.14", default-features = false }
 quinn = { version = "0.11", default-features = false, features = [
   "runtime-tokio",
   "rustls-ring",
@@ -45,20 +86,60 @@ reed-solomon-simd = { version = "3.1", default-features = false, features = ["st
 # through rustls, whose hash implementations are reachable only through a
 # cipher suite.
 ring = "0.17"
+# The RealtimeKit client, which is the only unprivileged way to raise a thread's
+# priority on Linux: `RLIMIT_NICE` and `RLIMIT_RTPRIO` are both zero for an
+# ordinary login, so `setpriority` and `sched_setscheduler` are not answers.
+# Three hundred lines over `zbus`, read in full before it was taken, by the
+# consultancy that maintains PipeWire. It keeps its one `unsafe` -- the `gettid`
+# call -- inside itself, so the workspace stays `forbid(unsafe_code)`. The
+# interface it wraps was last changed in 2009 and the alternative is writing the
+# same D-Bus calls here. See `crates/tachyx-sched`.
+rtkit-rs = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The certificate and private key types rustls, quinn and rcgen all speak, named
+# here so `tachyx-crypto` can hand them out without depending on rustls itself.
+rustls-pki-types = "1.15"
 # Reads the subject public key info out of a peer certificate, which is what a
 # pin is taken over. Already in the tree as rustls' own certificate parser.
 rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
-rustix = { version = "1.1", features = ["event", "fs", "time"] }
+rustix = { version = "1.1", features = ["event", "fs", "process", "time"] }
 serde = { version = "1.0", features = ["derive"] }
+# `relayd --json` and `tachyx-hostd --json`, and nothing else. A line a script
+# reads has to be escaped by something that knows the rules, rather than by a
+# format string that is only safe until somebody names a relay or a device
+# oddly.
+serde_json = "1.0"
 # The UDP socket the transport binds itself, to raise its receive and send
 # buffers. quinn pulls socket2 in transitively but does not re-export it.
 socket2 = "0.6"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1.47", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "net",
+  # The control socket frames its own messages, so it reads bytes rather than
+  # values. `read_buf` is also the only read in tokio's set that is cancel-safe
+  # in the way that framing needs.
+  "io-util",
+] }
 toml = "0.9"
+# `tachyx-hostd relay add` edits a file a person wrote by hand. This keeps the
+# comments, the spacing and the key order that re-serialising the whole
+# structure would throw away. Already in the tree underneath `toml`.
+toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# How many columns a string takes on a terminal. `chars().count()` is not that
+# number: one CJK character is two columns and a combining mark is none, so a
+# name counted in characters is a name that overruns the column it was given.
+# Zero dependencies, and the same tables `rustc` itself draws diagnostics with.
+unicode-width = "0.2"
+# Clears the device seed out of the buffer it was read into. The key that is
+# derived from it stays, so this narrows the window rather than closing it, which
+# is the honest description of what it buys.
+zeroize = "1.9"
 
 # The GStreamer crates must move in lockstep; a mismatched pair fails to link.
 gstreamer = { version = "0.25", features = ["v1_26"] }

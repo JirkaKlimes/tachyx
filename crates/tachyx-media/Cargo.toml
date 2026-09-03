@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 tachyx-proto.workspace = true
+tachyx-sched.workspace = true
 tachyx-unsafe.workspace = true
 
 gbm.workspace = true

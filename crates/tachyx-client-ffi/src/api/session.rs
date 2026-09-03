@@ -2,14 +2,18 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use flutter_rust_bridge::frb;
-use tachyx_driver::{FrameSink, Link};
-use tachyx_proto::control::Size;
+use tachyx_client::AudioEvent;
+use tachyx_crypto::{DeviceId, RelayAddress};
+use tachyx_driver::{AudioSink, FrameSink, Link};
+use tachyx_proto::control::{AudioMode, AudioStatus, Size};
 pub use tachyx_proto::input::InputEvent;
 use tachyx_proto::media::Timestamp;
 
+use crate::api::audio::AudioStats;
 use crate::api::video::PresentStats;
 
 /// Prepares the bridge, before Dart calls anything else.
@@ -169,6 +173,8 @@ pub struct SessionStats {
     pub batches: u64,
     /// What reassembly saw.
     pub video: VideoStats,
+    /// What the session is doing about sound, and what the play path counted.
+    pub audio: AudioStats,
     /// How the host is encoding, once it has said.
     pub encoding: Option<Encoding>,
     /// What the host last said about itself.
@@ -179,6 +185,12 @@ pub struct SessionStats {
     pub ended: Option<String>,
     /// The first thing the decode path complained about, if it has.
     pub video_fault: Option<String>,
+    /// The first thing the play path complained about, if it has.
+    ///
+    /// A machine with no sound server says so here. The session goes on: a
+    /// remote desktop with no sound is a working remote desktop, and the user is
+    /// told rather than left wondering.
+    pub audio_fault: Option<String>,
 }
 
 /// The decoder the driver pushes pictures into.
@@ -236,6 +248,97 @@ impl Present {
         if let Err(error) = self.texture.decode(codec) {
             let _ = self.refused.set(error.to_string());
         }
+    }
+}
+
+/// The speakers the driver pushes sound into.
+///
+/// The player is built on the first packet rather than at connect, for the same
+/// reason [`Present`] builds its pipeline there: opening a sound device takes as
+/// long as the machine's sound server takes to answer, and a session should be
+/// running before that is discovered. Nothing is lost by the wait either, since
+/// there is nothing to play until there is a packet.
+#[derive(Debug)]
+struct Listen {
+    player: OnceLock<tachyx_audio::AudioPlayer>,
+    /// Where the host's reported volume is read from. Weak, because the link
+    /// owns this sink and an owning handle back would be a cycle neither end
+    /// escaped.
+    link: Weak<Link>,
+    /// Set once the device has refused, so a machine with no sound server is
+    /// asked once rather than a hundred times a second.
+    refused: OnceLock<String>,
+    /// The gain last handed to the player, as the bits of an `f32`. It starts
+    /// where the player starts, so a host reporting full volume changes nothing.
+    gain: AtomicU32,
+}
+
+impl AudioSink for Listen {
+    fn push(&self, event: AudioEvent) {
+        let Some(player) = self.player() else {
+            return;
+        };
+        self.follow_the_host(player);
+        player.push(event);
+    }
+}
+
+impl Listen {
+    /// The player, built on the first thing there is to play.
+    fn player(&self) -> Option<&tachyx_audio::AudioPlayer> {
+        if let Some(player) = self.player.get() {
+            return Some(player);
+        }
+        if self.refused.get().is_some() {
+            return None;
+        }
+        match tachyx_audio::AudioPlayer::new() {
+            Ok(player) => {
+                let _ = self.player.set(player);
+                self.player.get()
+            }
+            Err(error) => {
+                let _ = self.refused.set(error.to_string());
+                None
+            }
+        }
+    }
+
+    /// Plays at whatever volume the host last reported.
+    ///
+    /// The host's sink volume is the session's only volume: the capture tap is
+    /// ahead of it, so the stream carries full scale sound and this is where the
+    /// setting is applied. Read on every packet and handed on only when it has
+    /// changed, because the player ramps to a new gain and a gain set again is
+    /// a ramp to where it already is.
+    fn follow_the_host(&self, player: &tachyx_audio::AudioPlayer) {
+        let Some(gain) = self
+            .link
+            .upgrade()
+            .and_then(|link| link.audio_status())
+            .map(AudioStatus::gain)
+        else {
+            return;
+        };
+        if self.gain.swap(gain.to_bits(), Ordering::Relaxed) != gain.to_bits() {
+            player.set_gain(gain);
+        }
+    }
+
+    /// What the play path has counted, if there is one yet.
+    fn stats(&self) -> tachyx_audio::Stats {
+        self.player
+            .get()
+            .map(tachyx_audio::AudioPlayer::stats)
+            .unwrap_or_default()
+    }
+
+    /// The first thing the play path complained about.
+    fn failure(&self) -> Option<String> {
+        self.player
+            .get()
+            .and_then(tachyx_audio::AudioPlayer::failure)
+            .or_else(|| self.refused.get().cloned())
     }
 }
 
@@ -316,6 +419,10 @@ pub struct Session {
     /// choice of codec back out of it. See [`Present::start_decoding`].
     link: Arc<Link>,
     present: Mutex<Option<Arc<Present>>>,
+    /// Attached the moment the session opens. Sound needs nothing from the
+    /// platform side to start, unlike a texture, so there is nothing for it to
+    /// wait for.
+    listen: Arc<Listen>,
 }
 
 impl Session {
@@ -356,6 +463,7 @@ impl Session {
     pub fn stats(&self) -> SessionStats {
         let stats = self.link.stats();
         let present = self.present().clone();
+        let playing = self.listen.stats();
         SessionStats {
             liveness: stats.liveness.into(),
             rtt_us: u32::try_from(stats.rtt.as_micros()).unwrap_or(u32::MAX),
@@ -368,6 +476,21 @@ impl Session {
                 frames_dropped: stats.video.frames_dropped,
                 frames_missing: stats.video.frames_missing,
                 frames_undecodable: stats.video.frames_undecodable,
+            },
+            audio: AudioStats {
+                host_has_audio: stats.host_audio,
+                // Off until the host has said otherwise, which is what a client
+                // that has heard nothing about sound is doing about it.
+                mode: stats.audio.map(|sound| sound.mode).unwrap_or_default(),
+                volume: stats.audio.map_or(0, |sound| sound.volume),
+                muted: stats.audio.is_some_and(|sound| sound.muted),
+                packets: stats.audio_packets,
+                lost: stats.audio_lost,
+                played: playing.played,
+                concealed: playing.concealed,
+                recovered: playing.recovered,
+                dropped: playing.dropped,
+                buffered: playing.buffered,
             },
             encoding: stats.stream.map(|stream| Encoding {
                 codec: stream.codec.to_string(),
@@ -396,6 +519,7 @@ impl Session {
                     .failure()
                     .or_else(|| present.refused.get().cloned())
             }),
+            audio_fault: self.listen.failure(),
         }
     }
 
@@ -457,6 +581,47 @@ impl Session {
             .input(Timestamp::from_session_micros(at_micros), event);
     }
 
+    /// Asks the host to start streaming its sound, stop, or change what it does
+    /// with its own output meanwhile.
+    ///
+    /// Nothing happens on a host whose hello said it has no audio, which
+    /// [`AudioStats::host_has_audio`] reports and the application reads before
+    /// it offers the control. What the host is really doing comes back in
+    /// [`AudioStats::mode`], because a host may refuse.
+    ///
+    /// Synchronous: it is a toolbar tap, and the answer arrives on the next
+    /// statistics poll rather than out of this call.
+    #[frb(sync)]
+    pub fn set_audio_mode(&self, mode: AudioMode) {
+        self.link.set_audio_mode(mode);
+    }
+
+    /// Sets the **host's** sink volume, in permille of its own hundred percent.
+    ///
+    /// There is one volume in the session and it is the host's. The capture tap
+    /// sits ahead of it, so the stream carries the same samples whatever this is
+    /// set to and the client applies the reported value as playback gain. One
+    /// knob, and it works the same in every mode.
+    ///
+    /// A value above a thousand is bounded on the way out. What reads it cubes
+    /// it, so four times the maximum would be a sixty-fourfold gain in
+    /// somebody's ears.
+    #[frb(sync)]
+    pub fn set_host_volume(&self, permille: u16) {
+        self.link.set_host_volume(permille);
+    }
+
+    /// Mutes or unmutes the **host's** own sink.
+    ///
+    /// The host's silence, not the client's: the tap is ahead of the mute, so a
+    /// muted host still streams everything it is playing. A client that read
+    /// [`AudioStats::muted`] as its own silence would hear nothing in the one
+    /// mode chosen to make it hear everything.
+    #[frb(sync)]
+    pub fn set_host_muted(&self, muted: bool) {
+        self.link.set_host_muted(muted);
+    }
+
     /// Tells the host the client can take something different now, after a
     /// rotation, a resize, or a change of resolution mode.
     ///
@@ -492,39 +657,92 @@ impl Session {
 /// Opens a session with the host at `address`, for a video surface of this size
 /// in physical pixels on a display that refreshes this often.
 ///
-/// `state_directory` is where the host's fingerprint is remembered, so that a
-/// host presenting a different key on a later connection is refused rather than
-/// silently accepted.
+/// `device` is the host's identifier in base32, as [`known_hosts`] reports it.
+/// Not an address: a host is reached by trying the addresses it gave at pairing
+/// and then by asking a relay, and either way the identifier is the only half
+/// that is checked. There is no trust on first use, so a host this client has
+/// not paired with cannot be reached at all.
+///
+/// `state_directory` is this client's own directory. Its device key lives there,
+/// and that key is what a host pairs with.
+///
+/// `relays` are the relays to ask when none of the host's own addresses answer,
+/// each written `address:port#KEY`. The host's own relay is tried first
+/// whatever this says.
 ///
 /// `bitrate_ceiling` caps what the stream may cost, in bits per second. `None`
 /// keeps the client's default.
 ///
 /// # Errors
-/// If the address names nothing, the viewport has no area, the host presents a
-/// key other than the one already pinned for it, or the host refuses the
-/// session. A refusal carries the host's own words, so a version mismatch reads
-/// as one.
+/// If `device` is not an identifier, this client has not paired with it, the
+/// viewport has no area, a relay is not written the way a relay is written,
+/// nothing answered, or the host refused. A refusal carries the host's own
+/// words, so a version mismatch reads as one.
+///
+/// A host that has revoked this client refuses **after** the handshake looks
+/// complete: TLS 1.3 sends the client's certificate in its own second flight,
+/// so the dialling end learns it on the first read. That failure names
+/// re-pairing rather than reading as a lost connection.
+///
+/// [`known_hosts`]: crate::api::pairing::known_hosts
 #[expect(
     clippy::needless_pass_by_value,
     reason = "flutter_rust_bridge decodes an owned string out of the Dart side"
 )]
 pub fn connect(
-    address: String,
+    device: String,
     viewport_width: u16,
     viewport_height: u16,
     refresh_hz: u16,
     state_directory: String,
+    relays: Vec<String>,
     bitrate_ceiling: Option<u32>,
 ) -> anyhow::Result<Session> {
     let capabilities = asked_for(viewport_width, viewport_height, refresh_hz, bitrate_ceiling)?;
+    let asked = relay_list(&relays)?;
+    let link = Arc::new(Link::connect(
+        DeviceId::parse(&device)?,
+        Path::new(&state_directory),
+        &asked,
+        capabilities,
+    )?);
+    // The speakers are attached here rather than on a call of their own. Sound
+    // needs no handle from the platform side, so there is nothing for the
+    // application to hand over and nothing for it to remember to do.
+    let listen = Arc::new(Listen {
+        player: OnceLock::new(),
+        link: Arc::downgrade(&link),
+        refused: OnceLock::new(),
+        gain: AtomicU32::new(1.0f32.to_bits()),
+    });
+    link.listen_on(Arc::clone(&listen) as Arc<dyn AudioSink>);
     Ok(Session {
-        link: Arc::new(Link::connect(
-            &address,
-            Path::new(&state_directory),
-            capabilities,
-        )?),
+        link,
         present: Mutex::new(None),
+        listen,
     })
+}
+
+/// Reads the relay list the settings screen keeps.
+///
+/// One that will not parse is an error naming it, rather than a relay quietly
+/// dropped from the list: a user who mistyped one and is told nothing would
+/// spend the fault on the host instead.
+///
+/// # Errors
+/// If any entry is not written `address:port#KEY`.
+pub(crate) fn relay_list(written: &[String]) -> anyhow::Result<Vec<RelayAddress>> {
+    written
+        .iter()
+        .map(|relay| {
+            relay.parse::<RelayAddress>().map_err(|_| {
+                anyhow::anyhow!(
+                    "{relay} is not a relay: one is written address:port#KEY, where KEY is \
+                     the relay's identifier"
+                )
+            })
+        })
+        .collect()
 }
 
 /// What the client can drive, once the numbers Dart measured are known to be

@@ -8,18 +8,25 @@
 //! choice of how many shards to spend and the receiver's arithmetic to spend
 //! them, and putting the two anywhere but next to each other is how the two
 //! halves of an erasure code drift apart.
+//!
+//! Sound takes the same path and the same [`Sequence`], and needs none of the
+//! rest: one Opus packet is one datagram. So it is one function out
+//! ([`audio_datagram`]) and one field back ([`Received::audio`]), and it never
+//! touches the reassembler's frames.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroUsize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
 use crate::media::{
-    Fragment, FrameId, FrameKind, HEADER_LEN, MalformedPacket, PacketHeader, ParityHeader,
-    PictureHeader, Role, Seq, SliceId, Timestamp,
+    AudioHeader, Fragment, FrameId, FrameKind, HEADER_LEN, MalformedPacket, PacketHeader,
+    ParityHeader, PictureHeader, Role, Seq, SliceId, Timestamp,
 };
 
 /// Slices one access unit may hold.
@@ -364,6 +371,62 @@ impl fmt::Debug for Coder {
     }
 }
 
+/// The session-wide datagram counter.
+///
+/// One per connection, and shared rather than owned, because more than one path
+/// puts datagrams on that connection: the picture is released from a thread of
+/// its own at a paced rate, and sound is sent the moment it is encoded rather
+/// than queued behind a key frame. They have to draw their numbers from one
+/// counter. A second counter would repeat numbers the first had already spent,
+/// and the receiver report reads a repeated number as a datagram that arrived
+/// twice and a missing one as loss.
+///
+/// The ordering is relaxed because nothing is published through this counter.
+/// The only thing it has to guarantee is that no two datagrams are stamped with
+/// the same number, which is what a fetch and add gives on its own.
+#[derive(Debug, Default)]
+pub struct Sequence(AtomicU16);
+
+impl Sequence {
+    /// The next number, which no other caller receives.
+    ///
+    /// It wraps, and every reader compares circularly. See
+    /// [`Seq::distance_from`].
+    pub fn take(&self) -> Seq {
+        Seq(self.0.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Builds one audio datagram: the sixteen-byte header, then the Opus packet.
+///
+/// A free function rather than a method on [`Packetiser`], because the two
+/// paths share the counter and nothing else. Audio needs no fragmenting, no
+/// parity and no payload length: one Opus packet is one datagram, and the
+/// packet describes its own duration and channel layout.
+///
+/// The sequence number is passed in rather than drawn from a [`Sequence`] here,
+/// because the caller needs it as well: it is the key the congestion
+/// controller's record of the release is written under, and reading it back out
+/// of the bytes afterwards would be reading back something it had just spent.
+///
+/// `id` counts the session's audio packets and must skip none, for the reason
+/// [`FrameId`] gives about pictures: a packet every trace of which was lost
+/// leaves nothing but the hole in the identifiers to say it existed, and a
+/// receiver reads that hole as the sound it has to conceal.
+#[must_use]
+pub fn audio_datagram(seq: Seq, id: FrameId, capture: Timestamp, opus: &[u8]) -> Vec<u8> {
+    let header = PacketHeader {
+        frame: id,
+        seq,
+        kind: FrameKind::Delta,
+        role: Role::Audio(AudioHeader { capture }),
+    };
+    let mut datagram = Vec::with_capacity(HEADER_LEN + opus.len());
+    datagram.extend_from_slice(&header.to_bytes());
+    datagram.extend_from_slice(opus);
+    datagram
+}
+
 /// Divides access units into datagrams and stamps the session-wide counters.
 ///
 /// One per connection, on the host. The sequence number it writes is what lets
@@ -372,7 +435,7 @@ impl fmt::Debug for Coder {
 #[derive(Debug)]
 pub struct Packetiser {
     payload_len: NonZeroUsize,
-    seq: Seq,
+    seq: Arc<Sequence>,
     parity: Parity,
     coder: Coder,
     /// The frame's last shard, padded out to a whole one. The shards before it
@@ -386,11 +449,18 @@ impl Packetiser {
     pub fn new(payload_len: NonZeroUsize) -> Self {
         Self {
             payload_len: even(payload_len),
-            seq: Seq(0),
+            seq: Arc::new(Sequence::default()),
             parity: Parity::default(),
             coder: Coder::default(),
             shards: Vec::new(),
         }
+    }
+
+    /// The counter this packetiser stamps datagrams from, for another path on
+    /// the same connection to stamp its own from. See [`Sequence`].
+    #[must_use]
+    pub fn sequence(&self) -> Arc<Sequence> {
+        Arc::clone(&self.seq)
     }
 
     /// Bytes of video each datagram carries.
@@ -461,7 +531,7 @@ impl Packetiser {
             for (fragment, range) in Fragment::split(slice.len(), self.payload_len) {
                 let header = PacketHeader {
                     frame: unit.id,
-                    seq: self.seq,
+                    seq: self.seq.take(),
                     kind: unit.kind,
                     role: Role::Picture(PictureHeader {
                         capture: unit.capture,
@@ -470,7 +540,6 @@ impl Packetiser {
                         last_slice: usize::from(id.get()) == last,
                     }),
                 };
-                self.seq = self.seq.next();
                 let mut datagram = Vec::with_capacity(HEADER_LEN + range.len());
                 datagram.extend_from_slice(&header.to_bytes());
                 datagram.extend_from_slice(&slice[range]);
@@ -494,11 +563,10 @@ impl Packetiser {
     pub fn padding(&mut self, payload: usize) -> Vec<u8> {
         let header = PacketHeader {
             frame: FrameId(0),
-            seq: self.seq,
+            seq: self.seq.take(),
             kind: FrameKind::Delta,
             role: Role::Padding,
         };
-        self.seq = self.seq.next();
         let mut datagram = Vec::with_capacity(HEADER_LEN + payload);
         datagram.extend_from_slice(&header.to_bytes());
         datagram.resize(HEADER_LEN + payload.max(1), 0);
@@ -578,7 +646,7 @@ impl Packetiser {
             let index = u16::try_from(index).expect("fewer shards than the count that fit u16");
             let header = PacketHeader {
                 frame: unit.id,
-                seq: *seq,
+                seq: seq.take(),
                 kind: unit.kind,
                 role: Role::Parity(ParityHeader {
                     data_shards,
@@ -586,7 +654,6 @@ impl Packetiser {
                     shard: Fragment::checked(index, count).expect("an index of its own count"),
                 }),
             };
-            *seq = seq.next();
             let mut datagram = Vec::with_capacity(HEADER_LEN + shard.len());
             datagram.extend_from_slice(&header.to_bytes());
             datagram.extend_from_slice(shard);
@@ -625,6 +692,50 @@ pub struct Frame {
     pub kind: FrameKind,
     /// The encoded picture, slices concatenated in decode order.
     pub data: Vec<u8>,
+}
+
+/// One packet of encoded sound, as a datagram delivered it.
+///
+/// Borrowed from the datagram rather than copied out of it. Sound arrives
+/// whole in one datagram and needs no assembly, so the only thing a receiver
+/// does with it is hand it to a decoder or to a jitter buffer, and whichever of
+/// those it is knows better than this where the bytes should live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioPacket<'a> {
+    /// Which packet of the session's audio this is.
+    ///
+    /// It counts Opus packets and skips none, so the gap is the loss, exactly
+    /// as it is for pictures. A receiver reads how much sound to conceal from
+    /// the distance between this and the last one it held.
+    pub id: FrameId,
+    /// When the host captured the samples, on the same clock a picture's
+    /// capture time is on.
+    pub capture: Timestamp,
+    /// The Opus packet itself.
+    pub opus: &'a [u8],
+}
+
+/// What one datagram turned out to be.
+///
+/// The sequence number is here whatever the datagram carried, because every
+/// datagram is counted in it: the receiver report is keyed on that number and a
+/// gap in it is the only evidence of loss the path leaves. What is optional is
+/// the sound, because only some datagrams carry any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received<'a> {
+    /// Where the datagram sat in the session-wide sequence.
+    pub seq: Seq,
+    /// The sound it carried, if it carried sound. Picture, repair and padding
+    /// all leave this empty: what they finished comes out of
+    /// [`Reassembler::pop`] instead.
+    pub audio: Option<AudioPacket<'a>>,
+}
+
+impl Received<'_> {
+    /// A datagram that carried no sound, which is picture, repair or padding.
+    const fn silent(seq: Seq) -> Self {
+        Self { seq, audio: None }
+    }
 }
 
 /// How long a frame waits once a signal says a fragment of it is missing.
@@ -931,7 +1042,8 @@ impl Reassembler {
         self.open.values().map(|partial| partial.deadline).min()
     }
 
-    /// Takes one datagram, reporting where it sat in the session's sequence.
+    /// Takes one datagram, reporting where it sat in the session's sequence and
+    /// handing back any sound it carried.
     ///
     /// Runs [`Reassembler::expire`] first, so a caller that keeps feeding
     /// datagrams needs no timer of its own. Whatever this completed or rebuilt
@@ -941,21 +1053,40 @@ impl Reassembler {
     /// it and this is where the header is already parsed. Parsing it a second
     /// time in the caller would be sixteen bytes of work per datagram on a
     /// phone, thousands of times a second, to recover something this function
-    /// already holds.
+    /// already holds. Sound is returned rather than queued for the same reason
+    /// in reverse: there is nothing here to assemble it into, and a queue here
+    /// would be a copy of every packet on the way to the one place that wants
+    /// it.
     ///
     /// # Errors
-    /// If the datagram is not a video packet.
-    pub fn push(&mut self, datagram: &[u8], now: Instant) -> Result<Seq, MalformedPacket> {
+    /// If the datagram is not a media packet.
+    pub fn push<'a>(
+        &mut self,
+        datagram: &'a [u8],
+        now: Instant,
+    ) -> Result<Received<'a>, MalformedPacket> {
         self.expire(now);
         let (header, payload) = PacketHeader::parse(datagram)?;
         self.stats.packets_received += 1;
 
         let gap_within_frame = self.track_sequence(&header);
-        // Padding takes part in the sequence accounting above and in nothing
-        // else. Every field that would say which frame it belongs to means
-        // nothing on it, so it must not reach reassembly.
-        if matches!(header.role, Role::Padding) {
-            return Ok(header.seq);
+        // Padding and sound take part in the sequence accounting above and in
+        // nothing else. Neither belongs to a frame of picture, every field that
+        // would say which frame is meaningless on them, and so neither may
+        // reach reassembly.
+        match header.role {
+            Role::Audio(audio) => {
+                return Ok(Received {
+                    seq: header.seq,
+                    audio: Some(AudioPacket {
+                        id: header.frame,
+                        capture: audio.capture,
+                        opus: payload,
+                    }),
+                });
+            }
+            Role::Padding => return Ok(Received::silent(header.seq)),
+            Role::Picture(_) | Role::Parity(_) => {}
         }
         let parity = matches!(header.role, Role::Parity(_));
         if parity {
@@ -965,7 +1096,7 @@ impl Reassembler {
             if !parity {
                 self.stats.packets_late += 1;
             }
-            return Ok(header.seq);
+            return Ok(Received::silent(header.seq));
         }
         if header.frame.0 > self.floor {
             let reorder = self.reorder;
@@ -978,9 +1109,9 @@ impl Reassembler {
             Role::Picture(picture) => {
                 self.take_picture(header.frame, header.kind, picture, payload, now);
             }
-            // Decided above, where the sequence accounting it does take part in
-            // happens.
-            Role::Padding => {}
+            // Both decided above, where the sequence accounting they do take
+            // part in happens.
+            Role::Padding | Role::Audio(_) => {}
         }
         if gap_within_frame {
             // The missing packets sit between two packets of this frame, so
@@ -995,7 +1126,7 @@ impl Reassembler {
                 partial.arm(now, self.reorder);
             }
         }
-        Ok(header.seq)
+        Ok(Received::silent(header.seq))
     }
 
     /// Files one parity shard against a frame that is already open.
@@ -1359,6 +1490,77 @@ mod tests {
             (first.len() + padding.len() + second.len()) as u64,
             "padding is a datagram the path carried, so the loss rate counts it"
         );
+    }
+
+    /// One Opus packet, as the host would send it.
+    fn sound(sequence: &Sequence, id: u32) -> Vec<u8> {
+        audio_datagram(
+            sequence.take(),
+            FrameId(id),
+            Timestamp::from_session_micros(u64::from(id) * 10_000),
+            b"opus",
+        )
+    }
+
+    #[test]
+    fn audio_is_counted_in_the_sequence_and_reaches_no_reassembly() {
+        let picture = picture(200, 0x22);
+        let mut packetiser = bare(PAYLOAD);
+        let sequence = packetiser.sequence();
+        let mut reassembler = Reassembler::new(Duration::from_millis(50));
+        let now = Instant::now();
+
+        let mut first = Vec::new();
+        packetiser.packetise(&unit(0, FrameKind::Key, &[&picture]), &mut first);
+        assert_eq!(deliver(&mut reassembler, &first, now).len(), 1);
+
+        // Sound between two pictures, stamped from the counter the pictures
+        // are stamped from. It must leave no hole in the sequence and no mark
+        // on the frames either side of it.
+        let opus: Vec<Vec<u8>> = (0..3).map(|id| sound(&sequence, id)).collect();
+        for (id, datagram) in (0..).zip(&opus) {
+            let received = reassembler.push(datagram, now).expect("well formed");
+            let audio = received.audio.expect("an audio datagram carries sound");
+            assert_eq!(audio.id, FrameId(id));
+            assert_eq!(audio.opus, b"opus");
+            assert_eq!(
+                audio.capture,
+                Timestamp::from_session_micros(10_000 * u64::from(id))
+            );
+        }
+        assert!(reassembler.pop().is_none(), "sound finishes no picture");
+
+        let mut second = Vec::new();
+        packetiser.packetise(&unit(1, FrameKind::Delta, &[&picture]), &mut second);
+        assert_eq!(deliver(&mut reassembler, &second, now).len(), 1);
+
+        let stats = reassembler.stats();
+        assert_eq!(stats.packets_lost, 0, "audio fills its own sequence");
+        assert_eq!(stats.packets_late, 0);
+        assert_eq!(stats.frames_dropped, 0);
+        assert_eq!(stats.frames_missing, 0);
+        assert_eq!(
+            stats.packets_received,
+            (first.len() + opus.len() + second.len()) as u64,
+            "audio is a datagram the path carried, so the loss rate counts it"
+        );
+    }
+
+    #[test]
+    fn a_lost_audio_datagram_is_loss_like_any_other() {
+        let sequence = Sequence::default();
+        let mut reassembler = Reassembler::new(Duration::from_millis(50));
+        let now = Instant::now();
+        let opus: Vec<Vec<u8>> = (0..3).map(|id| sound(&sequence, id)).collect();
+
+        // The middle one never arrives. Nothing in the audio itself says so:
+        // the sequence number is what the receiver report is written against,
+        // and this is the whole of why sound is counted in it.
+        for datagram in [&opus[0], &opus[2]] {
+            reassembler.push(datagram, now).expect("well formed");
+        }
+        assert_eq!(reassembler.stats().packets_lost, 1);
+        assert_eq!(reassembler.stats().packets_received, 2);
     }
 
     #[test]
@@ -1767,7 +1969,9 @@ mod tests {
                     assert_eq!(usize::from(parity.shard.index()), index - 10);
                     assert_eq!(payload.len(), 64, "a shard is one payload wide");
                 }
-                Role::Padding => panic!("packetising a picture produces no padding"),
+                Role::Padding | Role::Audio(_) => {
+                    panic!("packetising a picture produces picture and parity")
+                }
             }
         }
     }

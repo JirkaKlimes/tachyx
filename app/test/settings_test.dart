@@ -16,6 +16,11 @@ void main() {
   test('a fresh store has working defaults', () async {
     final Settings settings = await restored(<String, Object>{});
     expect(settings.hosts, isEmpty);
+    expect(
+      settings.relays,
+      <String>[Settings.defaultRelay],
+      reason: 'a client with no relay cannot reach a host off this network',
+    );
     expect(settings.streamBitrate, Settings.defaultMaxBitrate);
     expect(settings.sensitivity, 1);
     expect(settings.pointerAccel, Settings.defaultPointerAccel);
@@ -35,6 +40,32 @@ void main() {
       isNull,
       reason: 'migrated once, not on every start',
     );
+  });
+
+  test('a relay the user removed stays removed across a restart', () async {
+    final Settings settings = await restored(<String, Object>{});
+    await settings.forgetRelay(Settings.defaultRelay);
+    expect(settings.relays, isEmpty);
+
+    final SharedPreferences store = await SharedPreferences.getInstance();
+    final Settings again = Settings();
+    SharedPreferences.setMockInitialValues(<String, Object>{
+      'tachyx.relays': store.getStringList('tachyx.relays') ?? <String>[],
+    });
+    await again.restore();
+    expect(
+      again.relays,
+      isEmpty,
+      reason: 'an empty list is a decision, and only a missing one is a default',
+    );
+  });
+
+  test('keeping a relay again moves it up rather than doubling it', () async {
+    final Settings settings = await restored(<String, Object>{});
+    await settings.keepRelay('a:1#K');
+    await settings.keepRelay('b:2#K');
+    await settings.keepRelay('a:1#K');
+    expect(settings.relays, <String>['a:1#K', 'b:2#K', Settings.defaultRelay]);
   });
 
   test('keeping a host again moves it up rather than doubling it', () async {

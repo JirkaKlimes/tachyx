@@ -1,8 +1,9 @@
 //! The tachyx client core.
 //!
-//! Everything the client does that is not drawing or touching the screen: the
-//! session state machine, the batching that turns a touch sample rate into a
-//! packet rate, and the video reassembly that `tachyx-proto` supplies.
+//! Everything the client does that is not drawing, touching the screen or
+//! making a sound: the session state machine, the batching that turns a touch
+//! sample rate into a packet rate, the video reassembly that `tachyx-proto`
+//! supplies, and the ordering that puts the sound back the way it was captured.
 //!
 //! None of it performs I/O, and none of it frames anything. [`Session`] is
 //! handed the messages that arrived and asked for the messages to send, so the
@@ -13,9 +14,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod cursor;
 pub mod input;
 pub mod session;
 
+pub use audio::{AudioEvent, AudioQueue};
 pub use cursor::{CursorShape, CursorTracker, CursorView, Spot, Tracking};
 pub use session::{BITRATE_CEILING, Liveness, Session, capabilities};

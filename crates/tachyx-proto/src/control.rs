@@ -306,11 +306,12 @@ impl Hello for ClientHello {
 
 /// The host's answer to a [`ClientHello`], and the first thing it says.
 ///
-/// It carries the version and nothing else. There is nothing else for the host
-/// to announce at this point: the host, not the client, decides how to encode,
-/// and it says so in [`StreamConfig`] once it has read what the client can
-/// drive. What this message exists for is the version, which the client
-/// otherwise has no way to check.
+/// It carries the version and what the host can do that a client cannot ask
+/// about later. How the host encodes is not that: the host, not the client,
+/// decides it, and it says so in [`StreamConfig`] once it has read what the
+/// client can drive. What belongs here is the version, which the client
+/// otherwise has no way to check, and audio, which decides whether the client
+/// offers the user a control at all.
 ///
 /// The host sends it before it has read the client's hello, so the order the
 /// two arrive in never matters. It is not what a refused client usually reads,
@@ -322,25 +323,34 @@ pub struct HostHello {
     /// Read before anything after it, and private for the same reason as
     /// [`ClientHello::version`].
     version: u16,
+    /// Whether this host can stream its own audio.
+    ///
+    /// Probed on the machine the host runs on rather than assumed from the
+    /// platform, the same way the codec sets are: it takes a sound server that
+    /// answers and an encoder element that is installed, and a build carrying
+    /// the code for both still meets machines with neither.
+    ///
+    /// The client shows the audio control from this and no other source. A
+    /// control that is offered and then does nothing is worse than one that is
+    /// not offered, because the user cannot tell it from a fault.
+    pub audio: bool,
 }
 
 impl HostHello {
-    /// Announces this build's protocol version.
+    /// Announces this build's protocol version, and whether the host has a
+    /// working audio capture path.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { version: VERSION }
+    pub const fn new(audio: bool) -> Self {
+        Self {
+            version: VERSION,
+            audio,
+        }
     }
 
     /// The version the peer claims.
     #[must_use]
     pub const fn version(&self) -> u16 {
         self.version
-    }
-}
-
-impl Default for HostHello {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -551,6 +561,107 @@ pub struct Feedback {
     pub received: u64,
 }
 
+/// What the host does with its own sound while the session runs.
+///
+/// The order of the variants is the wire encoding: `postcard` writes the
+/// discriminant as a varint, so a mode appended here leaves the number of every
+/// mode before it alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioMode {
+    /// Nothing is captured and nothing is streamed, and the host's own output
+    /// is left exactly as it was found.
+    ///
+    /// The default, and the state a session must return the host to when it
+    /// ends. Nobody sitting at the host afterwards should have to work out why
+    /// their machine is silent.
+    #[default]
+    Off,
+    /// Streamed to the client, with the host's own sink muted.
+    ///
+    /// The sound follows the user to the other room rather than staying with
+    /// the computer. The capture tap is ahead of the mute, so muting the sink
+    /// silences the host without silencing the stream.
+    Exclusive,
+    /// Streamed to the client, and the host goes on playing it as well.
+    Shared,
+}
+
+/// The volume that means the host sink's own 100%.
+///
+/// Permille rather than a fraction, because a volume is a position on a control
+/// and not a measurement: a thousandth of the control is finer than a listener
+/// can hear and finer than the steps either end takes, and it travels as a
+/// `postcard` varint in two bytes.
+pub const VOLUME_NORM: u16 = 1000;
+
+/// What a client asks the host to do about sound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCommand {
+    /// Start streaming, stop streaming, or change what the host does with its
+    /// own output while it streams.
+    SetMode(AudioMode),
+    /// Sets the host sink's volume, in permille of [`VOLUME_NORM`].
+    ///
+    /// There is one volume in the session and it is the host's. The capture tap
+    /// sits on the sink's monitor ports, which are ahead of both the volume and
+    /// the mute, so the stream carries the same samples whatever this is set
+    /// to. The host applies it to its sink and reports it back in an
+    /// [`AudioStatus`], and the client turns the reported value into playback
+    /// gain with [`AudioStatus::gain`]. One knob, and it works the same in
+    /// every mode.
+    ///
+    /// A value above [`VOLUME_NORM`] is clamped by whichever end reads it. The
+    /// encoding cannot forbid one, and what reads it is a cube: a peer sending
+    /// ten thousand would otherwise put a thousandfold gain into a listener's
+    /// ears.
+    SetVolume(u16),
+    /// Mutes or unmutes the host sink, which is the host's own silence and not
+    /// the client's. See [`AudioStatus::muted`].
+    SetMuted(bool),
+}
+
+/// What the host is doing about sound.
+///
+/// Sent once after the hello, as the answer to every [`AudioCommand`], and
+/// whenever the sink changes underneath the session. That last case is the one
+/// that needs saying out loud: somebody at the host's own keyboard turns the
+/// volume down, and without a report the client's control and the host's would
+/// disagree until one of them was touched again.
+///
+/// It reports what the host **is** doing rather than what it was asked to do. A
+/// host that cannot start capture, or that refuses a mode, says so by reporting
+/// the mode it is really in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioStatus {
+    /// What the host is doing with its output.
+    pub mode: AudioMode,
+    /// The sink's volume, in permille of [`VOLUME_NORM`].
+    pub volume: u16,
+    /// Whether the sink itself is muted.
+    ///
+    /// The host's own silence, and only the host's. [`AudioMode::Exclusive`]
+    /// mutes the sink, so this reads true while the client is hearing
+    /// everything: the tap is ahead of the mute. A client that read it as
+    /// silence to apply would hear nothing in the one mode chosen to make it
+    /// hear everything.
+    pub muted: bool,
+}
+
+impl AudioStatus {
+    /// The gain a client multiplies its samples by.
+    ///
+    /// Cubic, because the volume is a position on a control rather than a ratio
+    /// of amplitude. `PulseAudio`, and the pipewire-pulse server that answers for
+    /// it, cube the control to get amplitude, so half way along the control is
+    /// an eighth of the amplitude. A client that applied the number directly
+    /// would be louder than the host at every setting but the two ends.
+    #[must_use]
+    pub fn gain(self) -> f32 {
+        let position = f32::from(self.volume.min(VOLUME_NORM)) / f32::from(VOLUME_NORM);
+        position * position * position
+    }
+}
+
 /// Anything a client sends after its hello.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -573,6 +684,12 @@ pub enum ClientMessage {
     /// after it is handed over. So this is not an optimisation of the
     /// transport's own estimate. It is the whole of the host's information.
     Feedback(Feedback),
+    /// What to do about the host's sound.
+    ///
+    /// Appended rather than placed beside the messages it belongs with, because
+    /// the variant order is the wire encoding and moving one renumbers every
+    /// message after it.
+    Audio(AudioCommand),
 }
 
 /// Where the host's pointer is and what it looks like.
@@ -774,6 +891,8 @@ pub enum HostMessage {
     Heartbeat(Heartbeat),
     /// Where the pointer is and what it looks like.
     Cursor(CursorUpdate),
+    /// What the host is doing about sound, and what its sink is set to.
+    Audio(AudioStatus),
 }
 
 #[cfg(test)]
@@ -841,10 +960,66 @@ mod tests {
 
     #[test]
     fn a_host_hello_survives_the_round_trip() {
-        let hello = HostHello::new();
-        assert_eq!(hello.version(), VERSION);
-        let bytes = postcard::to_stdvec(&hello).unwrap();
-        assert_eq!(HostHello::decode(&bytes), Ok(hello));
+        for audio in [false, true] {
+            let hello = HostHello::new(audio);
+            assert_eq!(hello.version(), VERSION);
+            assert_eq!(hello.audio, audio);
+            let bytes = postcard::to_stdvec(&hello).unwrap();
+            assert_eq!(HostHello::decode(&bytes), Ok(hello));
+        }
+    }
+
+    #[test]
+    fn an_audio_message_survives_the_round_trip_in_both_directions() {
+        // Appending is what keeps a mode's number its own. A host that only
+        // knew two of these must go on reading the two it knows.
+        assert_eq!(postcard::to_stdvec(&AudioMode::Off).unwrap(), [0]);
+        assert_eq!(postcard::to_stdvec(&AudioMode::Exclusive).unwrap(), [1]);
+        assert_eq!(postcard::to_stdvec(&AudioMode::Shared).unwrap(), [2]);
+
+        for command in [
+            AudioCommand::SetMode(AudioMode::Exclusive),
+            AudioCommand::SetVolume(650),
+            AudioCommand::SetMuted(true),
+        ] {
+            let message = ClientMessage::Audio(command);
+            let bytes = postcard::to_stdvec(&message).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<ClientMessage>(&bytes).unwrap(),
+                message
+            );
+        }
+
+        let message = HostMessage::Audio(AudioStatus {
+            mode: AudioMode::Shared,
+            volume: VOLUME_NORM,
+            muted: false,
+        });
+        let bytes = postcard::to_stdvec(&message).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<HostMessage>(&bytes).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn the_gain_a_client_applies_is_the_cube_of_the_control() {
+        let gain = |volume| {
+            AudioStatus {
+                mode: AudioMode::Shared,
+                volume,
+                muted: false,
+            }
+            .gain()
+        };
+        assert!((gain(VOLUME_NORM) - 1.0).abs() < 1e-6);
+        assert!(gain(0).abs() < 1e-6);
+        // Half way along the control is an eighth of the amplitude, which is
+        // the whole reason the mapping is not the number itself.
+        assert!((gain(VOLUME_NORM / 2) - 0.125).abs() < 1e-6);
+        // A peer that says more than the control holds is clamped rather than
+        // obeyed. Unclamped, this one is a gain of 281,000.
+        assert!((gain(u16::MAX) - 1.0).abs() < 1e-6);
     }
 
     #[test]

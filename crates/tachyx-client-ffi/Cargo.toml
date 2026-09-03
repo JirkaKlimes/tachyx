@@ -13,7 +13,9 @@ repository.workspace = true
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
+tachyx-audio.workspace = true
 tachyx-client.workspace = true
+tachyx-crypto.workspace = true
 tachyx-driver.workspace = true
 tachyx-proto.workspace = true
 tachyx-video.workspace = true

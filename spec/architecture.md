@@ -32,7 +32,7 @@ swappable.
 | Component | Binary | Role |
 |---|---|---|
 | Host daemon | `hostd` | Capture, encode, input injection, policy, pairing list. Runs headless on a workstation. |
-| CLI | `tachyx` | Thin client over `hostd`'s Unix socket. |
+| CLI | `tachyx-hostd <subcommand>` | Thin client over `hostd`'s Unix socket, on the same binary. See section 9. |
 | Client apps | Flutter | Desktop, mobile, web. Embed the Rust client core (FFI / wasm). Can also embed the host lib ("share this machine" toggle drives `hostd` over the same socket API). |
 | Relay | `relayd` | Zero-trust ciphertext forwarder + rendezvous mailboxes + presence. One static musl binary; self-hostable. Cloud fleet = same binary with billing module enabled. |
 | Coordination | `coordd` | Accounts, balances, token issuance, Stripe webhooks, signed relay directory, host→home-relay lookup. **Not on the connection path.** |
@@ -206,6 +206,23 @@ later. Low-latency settings: zero B-frames, slice encoding, tight VBV/CBR, intra
 **Decode/present (client)** — Vulkan Video / VideoToolbox / MediaCodec / WebCodecs; mailbox
 present mode; local cursor overlay; adaptive 0–2-frame jitter buffer.
 
+**Sound** — the host's own output, tapped at the monitor source of whichever sink the sound server
+calls the default, and never a device named by hand. `pulsesrc ! audioconvert ! audioresample !
+opusenc` at 48 kHz stereo, 128 kbit/s, 10 ms frames, on a thread of its own; one Opus packet a
+datagram, past the pacer rather than through it, because a paced key frame is tens of milliseconds
+and a gap in sound is a click everybody hears. Packets are stamped on the session clock the picture
+is stamped on — `CLOCK_MONOTONIC`, taken once, handed to both — so the two streams can be laid
+together at the far end. Sound costs the link about 141 kbit/s and the host takes that off the video
+target while it flows, in the spirit of the control reserve, because nothing paces it.
+
+The tap is **before** the sink's own volume and mute. That is the whole design: the host's knob is
+the volume, the client applies what the host reports as playback gain, and `Exclusive` mode mutes
+the host while the client still hears everything. The mute is held by a guard for the life of the
+mode, so a client that disconnects mid-session never leaves a machine silent. Volume, mute and
+which sink is the default are read and written over one PulseAudio client connection, which the
+pipewire-pulse server answers as readily as a real PulseAudio one, and a knob turned on the host
+reaches the client through that server's own subscription rather than a poll.
+
 **Codec rollout:** H.264 and AV1 are both negotiated today, per session, from what each end
 probes at run time; H.264 is the fallback and decodes literally everywhere incl. WebCodecs.
 Android advertises H.264 only, because its decoder is configured from the bitstream and only an
@@ -236,24 +253,43 @@ Instant local screen sharing: no internet, no relay, no account.
 
 ---
 
-## 9. CLI (`tachyx` over `hostd` Unix socket; `--json` everywhere)
+## 9. CLI (subcommands on `tachyx-hostd`; `--json` everywhere)
+
+Built, and this is what the binary answers to:
 
 ```
-tachyx status                        # daemon, home relay + RTT, live sessions:
-                                     # peer, direct/relayed, codec, res, fps, bitrate,
-                                     # RTT, loss, duration, bytes up/down
-tachyx pair                          # code + QR in terminal
-tachyx temp [--view-only] [--ttl t]  # LAN share
-tachyx pairings list
-tachyx pairings revoke <fp|name>
-tachyx pairings set <fp> --allow view|control --unattended true|false
-tachyx pairings rename <fp> <name>
-tachyx sessions kill <id>
-tachyx stats                         # lifetime counters per peer, direct vs relayed bytes
-tachyx doctor                        # portal check, encoder detection, NAT class, punch self-test
+tachyx-hostd [run]                   # the daemon. a bare invocation is this
+tachyx-hostd id                      # this host's device identifier
+tachyx-hostd status                  # daemon, home relay, live sessions
+tachyx-hostd pair [--view-only] [--attended] [--ttl 5m]
+tachyx-hostd pairings list
+tachyx-hostd pairings revoke <device|name>
+tachyx-hostd pairings set <device|name> --allow view|control --unattended true|false
+tachyx-hostd pairings rename <device|name> <name>
+tachyx-hostd sessions kill <id>
+tachyx-hostd relay list | add <addr:port#KEY> | remove <addr:port>
+tachyx-hostd doctor
 ```
 
-Config: single TOML (XDG). Counters: small local SQLite/state file.
+One binary rather than two. Everything but `run` is a thin client over the
+daemon's Unix socket at `$XDG_RUNTIME_DIR/tachyx/hostd.sock`, so the split this
+document originally described is a build-time question and not a runtime one, and
+a second binary would only be a second thing to install and keep in step.
+
+`doctor` is the exception: it answers with the daemon down, because that is the
+case it exists for. It reports the daemon, the device key and its mode, the
+encoders, the compositor's capture and injection, each configured relay, and how
+many devices are paired.
+
+`--json` is one JSON value on standard output, with errors as JSON on standard
+error and a non-zero exit. `pair` is the one command that cannot be one value,
+because it shows a code and then keeps reporting, so it is JSON Lines.
+
+**Not built:** `tachyx temp` (the LAN share of section 8) and `tachyx stats`.
+Lifetime counters have nowhere to live yet.
+
+Config: single TOML (XDG), edited in place by `relay add` so a hand-written file
+keeps its comments.
 
 ---
 
@@ -365,9 +401,10 @@ tachyx/
 PAKE pairing (QR + 8-digit) · fit-mode scaling · CLI incl. `doctor` · simple metered billing ·
 stats HUD.
 
-**Fast-follows, in order:** audio (PipeWire makes it nearly free; its absence is complaint #1) →
-clipboard → AV1 → blind tokens → LAN share polish → multi-monitor selection → Windows/iOS clients →
-file drag-and-drop → web client → 4:4:4 text mode → Windows/macOS hosts.
+**Fast-follows, in order:** ~~audio~~ (done: host output over the same datagrams, with the host's
+own volume as the one knob) → clipboard → ~~AV1~~ (done: negotiated per session) → blind tokens →
+LAN share polish → multi-monitor selection → Windows/iOS clients → file drag-and-drop → web client
+→ 4:4:4 text mode → Windows/macOS hosts.
 
 **Milestone one (de-risks everything at once):** `hostd` on a Hyprland box + Linux Flutter client;
 portal capture → VA-API → quinn datagrams over LAN; pinned-key auth; stats HUD.

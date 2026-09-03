@@ -1,0 +1,24 @@
+[package]
+name = "tachyx-sched"
+description = "Asking the login session for a scheduling priority on the threads that carry the picture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Linux and nothing else, so a build for the phone pulls in neither the code nor
+# the D-Bus stack underneath it. Android has no RealtimeKit and its own answer
+# to the same question, which the client will need and which is not this.
+[target.'cfg(target_os = "linux")'.dependencies]
+rtkit-rs.workspace = true
+# `setrlimit(RLIMIT_RTTIME)`, which the broker refuses to promote a thread
+# without.
+rustix.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

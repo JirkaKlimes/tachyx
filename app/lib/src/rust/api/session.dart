@@ -4,15 +4,16 @@
 // ignore_for_file: invalid_use_of_internal_member, unused_import, unnecessary_import
 
 import '../frb_generated.dart';
+import 'audio.dart';
 import 'input.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 import 'video.dart';
 
-// These functions are ignored because they are not marked as `pub`: `asked_for`, `init_logging`, `present`, `start_decoding`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Present`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `push`
+// These functions are ignored because they are not marked as `pub`: `asked_for`, `failure`, `follow_the_host`, `init_logging`, `player`, `present`, `relay_list`, `start_decoding`, `stats`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Listen`, `Present`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `push`, `push`
 
 /// The protocol version this build speaks.
 ///
@@ -23,31 +24,49 @@ int protocolVersion() => RustLib.instance.api.crateApiSessionProtocolVersion();
 /// Opens a session with the host at `address`, for a video surface of this size
 /// in physical pixels on a display that refreshes this often.
 ///
-/// `state_directory` is where the host's fingerprint is remembered, so that a
-/// host presenting a different key on a later connection is refused rather than
-/// silently accepted.
+/// `device` is the host's identifier in base32, as [`known_hosts`] reports it.
+/// Not an address: a host is reached by trying the addresses it gave at pairing
+/// and then by asking a relay, and either way the identifier is the only half
+/// that is checked. There is no trust on first use, so a host this client has
+/// not paired with cannot be reached at all.
+///
+/// `state_directory` is this client's own directory. Its device key lives there,
+/// and that key is what a host pairs with.
+///
+/// `relays` are the relays to ask when none of the host's own addresses answer,
+/// each written `address:port#KEY`. The host's own relay is tried first
+/// whatever this says.
 ///
 /// `bitrate_ceiling` caps what the stream may cost, in bits per second. `None`
 /// keeps the client's default.
 ///
 /// # Errors
-/// If the address names nothing, the viewport has no area, the host presents a
-/// key other than the one already pinned for it, or the host refuses the
-/// session. A refusal carries the host's own words, so a version mismatch reads
-/// as one.
+/// If `device` is not an identifier, this client has not paired with it, the
+/// viewport has no area, a relay is not written the way a relay is written,
+/// nothing answered, or the host refused. A refusal carries the host's own
+/// words, so a version mismatch reads as one.
+///
+/// A host that has revoked this client refuses **after** the handshake looks
+/// complete: TLS 1.3 sends the client's certificate in its own second flight,
+/// so the dialling end learns it on the first read. That failure names
+/// re-pairing rather than reading as a lost connection.
+///
+/// [`known_hosts`]: crate::api::pairing::known_hosts
 Future<Session> connect({
-  required String address,
+  required String device,
   required int viewportWidth,
   required int viewportHeight,
   required int refreshHz,
   required String stateDirectory,
+  required List<String> relays,
   int? bitrateCeiling,
 }) => RustLib.instance.api.crateApiSessionConnect(
-  address: address,
+  device: device,
   viewportWidth: viewportWidth,
   viewportHeight: viewportHeight,
   refreshHz: refreshHz,
   stateDirectory: stateDirectory,
+  relays: relays,
   bitrateCeiling: bitrateCeiling,
 );
 
@@ -92,6 +111,38 @@ abstract class Session implements RustOpaqueInterface {
   /// reported through [`SessionStats::video_fault`] instead, because the
   /// pipeline for it is built on the first picture rather than here.
   PlatformInt64 presentOn({required PlatformInt64 engineHandle});
+
+  /// Asks the host to start streaming its sound, stop, or change what it does
+  /// with its own output meanwhile.
+  ///
+  /// Nothing happens on a host whose hello said it has no audio, which
+  /// [`AudioStats::host_has_audio`] reports and the application reads before
+  /// it offers the control. What the host is really doing comes back in
+  /// [`AudioStats::mode`], because a host may refuse.
+  ///
+  /// Synchronous: it is a toolbar tap, and the answer arrives on the next
+  /// statistics poll rather than out of this call.
+  void setAudioMode({required AudioMode mode});
+
+  /// Mutes or unmutes the **host's** own sink.
+  ///
+  /// The host's silence, not the client's: the tap is ahead of the mute, so a
+  /// muted host still streams everything it is playing. A client that read
+  /// [`AudioStats::muted`] as its own silence would hear nothing in the one
+  /// mode chosen to make it hear everything.
+  void setHostMuted({required bool muted});
+
+  /// Sets the **host's** sink volume, in permille of its own hundred percent.
+  ///
+  /// There is one volume in the session and it is the host's. The capture tap
+  /// sits ahead of it, so the stream carries the same samples whatever this is
+  /// set to and the client applies the reported value as playback gain. One
+  /// knob, and it works the same in every mode.
+  ///
+  /// A value above a thousand is bounded on the way out. What reads it cubes
+  /// it, so four times the maximum would be a sixty-fourfold gain in
+  /// somebody's ears.
+  void setHostVolume({required int permille});
 
   /// What this session has done.
   ///
@@ -413,6 +464,9 @@ class SessionStats {
   /// What reassembly saw.
   final VideoStats video;
 
+  /// What the session is doing about sound, and what the play path counted.
+  final AudioStats audio;
+
   /// How the host is encoding, once it has said.
   final Encoding? encoding;
 
@@ -428,16 +482,25 @@ class SessionStats {
   /// The first thing the decode path complained about, if it has.
   final String? videoFault;
 
+  /// The first thing the play path complained about, if it has.
+  ///
+  /// A machine with no sound server says so here. The session goes on: a
+  /// remote desktop with no sound is a working remote desktop, and the user is
+  /// told rather than left wondering.
+  final String? audioFault;
+
   const SessionStats({
     required this.liveness,
     required this.rttUs,
     required this.batches,
     required this.video,
+    required this.audio,
     this.encoding,
     this.host,
     this.present,
     this.ended,
     this.videoFault,
+    this.audioFault,
   });
 
   @override
@@ -446,11 +509,13 @@ class SessionStats {
       rttUs.hashCode ^
       batches.hashCode ^
       video.hashCode ^
+      audio.hashCode ^
       encoding.hashCode ^
       host.hashCode ^
       present.hashCode ^
       ended.hashCode ^
-      videoFault.hashCode;
+      videoFault.hashCode ^
+      audioFault.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -461,11 +526,13 @@ class SessionStats {
           rttUs == other.rttUs &&
           batches == other.batches &&
           video == other.video &&
+          audio == other.audio &&
           encoding == other.encoding &&
           host == other.host &&
           present == other.present &&
           ended == other.ended &&
-          videoFault == other.videoFault;
+          videoFault == other.videoFault &&
+          audioFault == other.audioFault;
 }
 
 /// What the client's own video path has seen.

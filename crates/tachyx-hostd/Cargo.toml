@@ -17,12 +17,26 @@ path = "src/main.rs"
 
 [dependencies]
 tachyx-congestion.workspace = true
+tachyx-crypto.workspace = true
 tachyx-proto.workspace = true
+tachyx-relay.workspace = true
+tachyx-sched.workspace = true
 tachyx-input.workspace = true
 tachyx-media.workspace = true
 tachyx-transport.workspace = true
+clap.workspace = true
+libpulse-binding.workspace = true
+postcard.workspace = true
+qrcode.workspace = true
 quinn.workspace = true
+# `getuid`, and nothing else. The control socket has to know whether the far end
+# of a connection is this same user, and this crate is `forbid(unsafe_code)`, so
+# `libc::getuid` is not available to it.
+rustix.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+unicode-width.workspace = true
+toml_edit.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 toml.workspace = true
@@ -30,6 +44,11 @@ thiserror.workspace = true
 tracing.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
+
+[dev-dependencies]
+# `start_paused`, so that a test of the control socket's read deadline finishes
+# in no time rather than in the deadline.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -10,20 +10,25 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tachyx_congestion::{Controller, MIN_TARGET, START_TARGET};
-use tachyx_media::{Bitrate, Capture, EncodeConfig, EncodeSize, Encoder, Idle, Rate};
+use tachyx_media::{Bitrate, Capture, Clock, EncodeConfig, EncodeSize, Encoder, Idle, Rate};
 use tachyx_proto::control::{
     Aspect, ClientMessage, Codec, CodedSize, Feedback, Heartbeat, HostMessage, Size as WireSize,
     StreamConfig, HEARTBEAT_INTERVAL,
 };
 use tachyx_proto::media::Timestamp;
 use tachyx_proto::packet::{AccessUnit as WireUnit, Parity};
+use tachyx_transport::AudioSender;
 use tachyx_transport::endpoint::HostSession;
-use tachyx_transport::video::VideoControl;
+use tachyx_transport::video::{Sent, VideoControl};
+use tokio::sync::watch;
 
+use crate::audio::{HostAudio, Sink};
 use crate::config::Config;
 use crate::cursor::{self, CursorFeed};
 use crate::idr::{Budget, Reason, Verdict};
 use crate::ladder::{Ladder, Produced, Settings, Size as RungSize};
+use crate::sessions::{self, Handle, Peer, Sessions};
+use crate::sound::Sound;
 
 /// How often the rate controller looks at what the link is carrying.
 ///
@@ -33,15 +38,22 @@ use crate::ladder::{Ladder, Produced, Settings, Size as RungSize};
 /// additive increase is paced by.
 const RATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The longest a picture may stay wrong before a key frame repairs it.
+/// The longest a picture may stay wrong before a key frame repairs it, in the
+/// one case nothing else covers.
 ///
-/// The encoder's own key frame interval counts FRAMES, which is the wrong unit
-/// for this. Capture blocks until the screen changes, so a desktop nobody is
-/// touching produces a couple of frames a second, and an interval of a hundred
-/// and twenty frames is two seconds of a busy screen but a minute of a quiet
-/// one. A frame lost during a quiet period would leave the picture frozen for
-/// that minute, and the less that is happening the longer the freeze: the
-/// opposite of what anyone would expect.
+/// The client detects loss for itself and asks: the frame identifier counts
+/// encoded pictures and skips none, so a frame that lost every packet leaves a
+/// hole in the identifiers and the next picture reveals it. That is the whole
+/// of the recovery on a screen that is doing anything at all, and it costs one
+/// round trip rather than a key frame twice a second.
+///
+/// It has one hole. A frame that loses every packet and is followed by no
+/// picture at all reveals nothing: nothing arrives to show the hole. Capture
+/// blocks until the screen changes, so that is a real case rather than a
+/// theoretical one, and it leaves the client showing a stale picture with no
+/// way to learn it is stale.
+///
+/// [`Live::repair_if_stale`] covers exactly that hole and nothing else.
 const KEY_FRAME_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How often the send gate is re-examined while nothing is being encoded.
@@ -82,6 +94,11 @@ pub enum SessionError {
 
 /// Runs a session until the client goes away.
 ///
+/// `sound` is what the daemon probed at startup, and it is the same answer the
+/// client was given in the hello. A session opens the connection to the sound
+/// server only when it is true, and serves without sound if that connection
+/// then fails.
+///
 /// # Errors
 /// If the pipeline cannot be started, or the connection fails for a reason
 /// other than the client disconnecting.
@@ -89,18 +106,26 @@ pub async fn serve(
     config: &Config,
     session: HostSession,
     injection: &tachyx_input::Injection,
+    sessions: &Arc<Sessions>,
+    peer: Peer,
+    sound: bool,
 ) -> Result<(), SessionError> {
     // Held for the whole session. A blanked screen stops producing frames, and
     // the one person who wants the machine awake cannot reach it.
     let _awake = crate::idle::Inhibitor::new()?;
     let pipeline = start(config, &session)?;
-    run(session, injection, pipeline).await
+    // The row `status` lists and `sessions kill` ends. It leaves the list when
+    // this handle is dropped, however the session ended.
+    let listed = sessions.open(peer, pipeline.codec.to_string(), session.connection.clone());
+    run(session, injection, pipeline, &listed, sound).await
 }
 
 /// What bringing the pipeline up produces.
 struct Pipeline {
     capture: Capture,
     encoder: Arc<Encoder>,
+    /// What the picture is coded as, for the row `status` lists.
+    codec: Codec,
     units: tachyx_media::AccessUnits,
     ladder: Ladder,
     /// The most this session may ever ask for, in bits a second.
@@ -162,6 +187,7 @@ fn start(config: &Config, session: &HostSession) -> Result<Pipeline, SessionErro
     Ok(Pipeline {
         capture,
         encoder: Arc::new(encoder),
+        codec,
         units,
         ladder,
         ceiling,
@@ -185,6 +211,8 @@ struct Live {
     budget: Budget,
     parity: Parity,
     control: VideoControl,
+    /// The sound half of this session, when the host has one.
+    sound: Option<Sound>,
     /// The bits a second the encoder's own rate limiter is allowed to produce.
     spending: Arc<AtomicU32>,
     /// The transport's admission gate, which the watchdog reopens.
@@ -192,7 +220,18 @@ struct Live {
     sent: Arc<AtomicU64>,
     padded: Arc<AtomicU64>,
     watchdog: Watchdog,
+    /// The share of video datagrams the client last reported missing, for the
+    /// row `status` lists. Nothing decides on it: the controller reads the
+    /// losses themselves.
+    loss: f64,
     last_key: Instant,
+    /// Pictures on the wire when the client last reported a datagram missing,
+    /// and `None` while nothing has been lost since the last key frame.
+    ///
+    /// See [`Live::repair_if_stale`], which is the only thing that reads it.
+    lost_at: Option<u64>,
+    /// Capture to wire times for the heartbeat to carry.
+    pipeline: Arc<Latency>,
     started: Instant,
     ceiling: NonZeroU32,
     /// The daemon's configured bound, folded against every client cap.
@@ -207,6 +246,14 @@ impl Live {
     fn feedback(&mut self, report: &Feedback, now: Instant) {
         self.collect();
         let update = self.controller.feedback(report, now);
+        self.loss = update.losses.fraction();
+        // Every undetectable case starts here. A frame that vanished whole
+        // vanished as datagrams, and the report is per datagram and travels on
+        // the reliable stream, so a loss the client cannot see is never a loss
+        // this host cannot see.
+        if update.losses.lost > 0 {
+            self.lost_at = Some(self.sent.load(Ordering::Relaxed));
+        }
         // Adaptive parity, which is where this beats the prior art: Sunshine
         // and Moonlight carry a flat fifth for ever, and this follows what the
         // link is really losing.
@@ -236,7 +283,8 @@ impl Live {
         self.spend(update);
 
         let produced = produced(&self.encoder);
-        let Some(want) = self.ladder.observe(update.video.get(), produced, now) else {
+        let allowed = self.video_share(update.video);
+        let Some(want) = self.ladder.observe(allowed.get(), produced, now) else {
             return Ok(());
         };
         self.apply(want, to_client, now).await
@@ -265,8 +313,27 @@ impl Live {
 
     /// Tells the pacer and the encoder's rate limiter what the link will carry.
     fn set_target(&self, target: NonZeroU32) {
-        self.control.set_target_bitrate(target);
-        self.spending.store(target.get(), Ordering::Relaxed);
+        let video = self.video_share(target);
+        self.control.set_target_bitrate(video);
+        self.spending.store(video.get(), Ordering::Relaxed);
+    }
+
+    /// What the picture may spend, which is what the controller allowed less
+    /// whatever sound is taking.
+    ///
+    /// Sound is a near constant rate while it flows, and it is neither paced
+    /// nor gated: a packet leaves the moment it is encoded. Sent on top of the
+    /// video target rather than out of it, the link carries the sum of the two,
+    /// and every packet of the excess is one the estimator reads as the picture
+    /// asking for more than the path carries.
+    ///
+    /// Never below the floor. Under that there is no picture worth sending at
+    /// all, and a link too narrow for both is a link where sound is the thing
+    /// still worth having.
+    fn video_share(&self, allowed: NonZeroU32) -> NonZeroU32 {
+        let reserved = self.sound.as_ref().map_or(0, Sound::reserve);
+        NonZeroU32::new(allowed.get().saturating_sub(reserved).max(MIN_TARGET))
+            .unwrap_or(NonZeroU32::MIN)
     }
 
     /// Applies a rung, spending the key frame it costs from the shared budget.
@@ -299,7 +366,10 @@ impl Live {
         self.encoder.set_rate(rate_of(want)?)?;
         self.budget.retarget(want.bitrate);
         self.ladder.acknowledge(want, now);
-        self.last_key = now;
+        // Marked rather than forced: the property writes above raise the
+        // encoder's reconfigure flag by themselves, so the next picture is a
+        // key frame whether or not anybody asks for one.
+        self.expect_key_frame(now);
         tracing::info!(
             width = want.size.width,
             height = want.size.height,
@@ -334,11 +404,26 @@ impl Live {
         )
     }
 
+    /// Asks the encoder for a key frame on its next picture.
+    fn force_key_frame(&mut self, now: Instant) {
+        self.encoder.force_keyframe();
+        self.expect_key_frame(now);
+    }
+
+    /// Records that a key frame is on its way, however it was caused.
+    ///
+    /// It ends the loss the repair timer is armed by as well as restarting the
+    /// timer: a key frame refers to nothing, so whatever the client was missing
+    /// stops mattering the moment one is coded.
+    const fn expect_key_frame(&mut self, now: Instant) {
+        self.last_key = now;
+        self.lost_at = None;
+    }
+
     /// The client lost a frame and cannot continue from what it holds.
     fn keyframe_request(&mut self, now: Instant) {
         if self.spend_key_frame(Reason::ClientRequest, now) == Verdict::Allow {
-            self.encoder.force_keyframe();
-            self.last_key = now;
+            self.force_key_frame(now);
         }
     }
 
@@ -372,19 +457,41 @@ impl Live {
         }
     }
 
-    /// Asks for a key frame when the last one is old enough that a loss nobody
-    /// reported would still be showing.
+    /// Repairs a picture the client cannot know is broken.
     ///
-    /// On a clock rather than a frame count. The encoder applies the request to
-    /// the next picture it encodes, so a screen producing nothing pays nothing:
+    /// Three conditions, and each one removes a case the client already
+    /// handles, so what is left is only the case nothing else reaches. See
+    /// [`KEY_FRAME_MAX_AGE`].
+    ///
+    /// The client reported something missing, or nothing can be wrong. A
+    /// picture no datagram of which was lost is a picture the client holds.
+    ///
+    /// Nothing has gone out since. Any picture sent after the loss carries the
+    /// identifier that reveals the hole, so the client asks for itself, one
+    /// round trip after the frame rather than up to two seconds after it. This
+    /// is the condition that takes the repair off a busy screen entirely, and a
+    /// busy screen is where a key frame nobody needs costs the most: measured
+    /// on loopback, the two delta frames behind a key frame carry the pacer's
+    /// debt, and a run with a key frame every second measured a 99th percentile
+    /// of 18.2 ms against 5.5 ms for one that opened on a key frame and
+    /// scheduled none.
+    ///
+    /// And the last key frame is old. The client is given time to notice and
+    /// ask before the host guesses on its behalf.
+    ///
+    /// On a clock rather than a frame count, because the encoder applies the
+    /// request to the next picture it encodes and a still screen encodes none:
     /// the cost lands on the first frame after the quiet, which is exactly the
-    /// frame a client needs to be able to decode.
+    /// frame the client needs to be able to decode.
     fn repair_if_stale(&mut self, now: Instant) {
-        if now.duration_since(self.last_key) >= KEY_FRAME_MAX_AGE
-            && self.spend_key_frame(Reason::Periodic, now) == Verdict::Allow
+        let Some(lost_at) = self.lost_at else { return };
+        if self.sent.load(Ordering::Relaxed) != lost_at
+            || now.duration_since(self.last_key) < KEY_FRAME_MAX_AGE
         {
-            self.encoder.force_keyframe();
-            self.last_key = now;
+            return;
+        }
+        if self.spend_key_frame(Reason::Repair, now) == Verdict::Allow {
+            self.force_key_frame(now);
         }
     }
 
@@ -398,10 +505,9 @@ impl Live {
             return;
         };
         match owed {
-            Reason::ClientRequest | Reason::Periodic | Reason::Startup => {
+            Reason::ClientRequest | Reason::Repair | Reason::Startup => {
                 if self.spend_key_frame(owed, now) == Verdict::Allow {
-                    self.encoder.force_keyframe();
-                    self.last_key = now;
+                    self.force_key_frame(now);
                 }
             }
             // The ladder still wants the change and offers it again on its own
@@ -441,8 +547,31 @@ impl Live {
         // the send path checks the queue again for itself, so opening it cannot
         // reach the transport's eviction path.
         self.admission.store(true, Ordering::Relaxed);
-        self.encoder.force_keyframe();
-        self.last_key = now;
+        self.force_key_frame(now);
+    }
+
+    /// What this session is doing, for whoever runs `tachyx-hostd status`.
+    ///
+    /// Written once a heartbeat. It is a report and nothing reads it back: the
+    /// operating point is decided by the ladder and the controller, from what
+    /// the link says rather than from what was last printed.
+    fn publish(&self, listed: &Handle, connection: &quinn::Connection, beat: &Heartbeat) {
+        let applied = self.ladder.applied();
+        let stats = connection.stats();
+        listed.publish(sessions::Live {
+            width: u32::from(applied.size.width),
+            height: u32::from(applied.size.height),
+            millihertz: applied.millihertz,
+            bitrate: applied.bitrate,
+            rtt: u32::try_from(connection.rtt().as_millis()).unwrap_or(u32::MAX),
+            // The client's own figure, not a second reading of it: taking the
+            // median twice would drain the interval's samples on the first call
+            // and report nought on the second.
+            pipeline_micros: beat.pipeline_micros,
+            loss: self.loss,
+            sent: stats.udp_tx.bytes,
+            received: stats.udp_rx.bytes,
+        });
     }
 
     /// What the host has been doing, for a client that cannot tell a still
@@ -460,8 +589,71 @@ impl Live {
             pacing_rate: connection.congestion_state().metrics().pacing_rate,
             estimate: Some(self.controller.estimate().get()),
             padding_sent: self.padded.load(Ordering::Relaxed),
-            pipeline_micros: 0,
+            pipeline_micros: self.pipeline.median(),
         }
+    }
+}
+
+/// How long each picture took to get from the compositor to the wire.
+///
+/// The one number the client cannot work out for itself. There is no clock
+/// agreement between the two ends, so a client can measure jitter and relative
+/// change but never how much of what it feels was spent on the host. This is an
+/// elapsed time rather than an instant, which needs no agreement at all.
+///
+/// Measured at the far end of the send path, so it holds capture, the encoder,
+/// the wait for the release thread and the pacer's own spreading of the
+/// picture. Everything left over is the network and the client.
+/// The lock is held for a push on one side and a pointer swap on the other, and
+/// that is deliberate rather than incidental. The release thread runs at a
+/// realtime priority and the heartbeat that reads this does not, so a critical
+/// section long enough to be preempted inside would stop the picture while an
+/// ordinary thread was rescheduled. Neither side sorts or allocates under it.
+#[derive(Debug)]
+struct Latency(std::sync::Mutex<Vec<u32>>);
+
+impl Latency {
+    /// Two seconds of a 120 Hz stream, which is eight heartbeats.
+    ///
+    /// A bound rather than a ring, because a reader that has stopped reading is
+    /// a client that has gone, and the loop it beats on ends with it. Samples
+    /// past the bound are dropped, so the median is of the first of the
+    /// interval rather than of a buffer that grew without one.
+    const CAPACITY: usize = 256;
+
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::with_capacity(Self::CAPACITY)))
+    }
+
+    fn record(&self, micros: u32) {
+        let mut held = self.held();
+        if held.len() < Self::CAPACITY {
+            held.push(micros);
+        }
+    }
+
+    /// The median since the last call, and zero when there was nothing.
+    ///
+    /// Emptied by reading, which is what makes the figure the heartbeat
+    /// interval's rather than the session's. Zero means no picture went out,
+    /// which on a still desktop is the ordinary case and is not a latency of
+    /// nought.
+    fn median(&self) -> u32 {
+        // Allocated before the lock is taken and sorted after it is dropped, so
+        // what happens under it is one pointer swap.
+        let empty = Vec::with_capacity(Self::CAPACITY);
+        let mut held = std::mem::replace(&mut *self.held(), empty);
+        held.sort_unstable();
+        held.get(held.len() / 2).copied().unwrap_or(0)
+    }
+
+    /// A poisoned lock means a panic between the push and the drain. What is
+    /// behind it is still a list of timings, so reading it beats killing the
+    /// session over a statistic.
+    fn held(&self) -> std::sync::MutexGuard<'_, Vec<u32>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -470,10 +662,13 @@ async fn run(
     session: HostSession,
     injection: &tachyx_input::Injection,
     pipeline: Pipeline,
+    listed: &Handle,
+    sound: bool,
 ) -> Result<(), SessionError> {
     let Pipeline {
         capture,
         encoder,
+        codec: _,
         units,
         ladder,
         ceiling,
@@ -484,17 +679,34 @@ async fn run(
     let HostSession {
         connection,
         video,
+        audio,
         control,
         mut to_client,
         mut from_client,
         ..
     } = session;
 
+    // The picture's own clock, so that a packet of sound and the frame it
+    // belongs with are stamped against one instant.
+    let sound = if sound {
+        open_sound(audio, capture.clock()).await
+    } else {
+        None
+    };
     let started = Instant::now();
     let sent = Arc::new(AtomicU64::new(0));
     let padded = Arc::new(AtomicU64::new(0));
+    let pipeline = Arc::new(Latency::new());
     let admission = encoder.admission();
-    let pump = release(units, video, &admission, &sent, &padded);
+    let pump = release(
+        units,
+        video,
+        capture.clock(),
+        &admission,
+        &sent,
+        &padded,
+        &pipeline,
+    );
 
     let mut live = Live {
         spending: encoder.budget(),
@@ -502,10 +714,14 @@ async fn run(
         budget: Budget::new(ladder.applied().bitrate),
         parity: Parity::default(),
         watchdog: Watchdog::new(started),
+        loss: 0.0,
         last_key: started,
+        lost_at: None,
+        pipeline,
         encoder,
         ladder,
         control,
+        sound,
         admission,
         sent,
         padded,
@@ -515,19 +731,41 @@ async fn run(
         refresh,
         capture_size,
     };
-    // The picture the session opens on. Spent here so that a later request
-    // cannot be refused on the grounds that this one was free: the budget is
-    // shared precisely so every cause is counted.
-    live.budget.request(Reason::Startup, started);
-    let opening = live.controller.tick(started);
-    live.spend(opening);
-    to_client
-        .send(&HostMessage::Stream(stream_config(
-            &live.encoder,
-            live.ladder.applied().bitrate,
-        )?))
-        .await?;
+    greet(&mut live, &mut to_client, started).await?;
+    let outcome = converse(
+        &mut live,
+        &capture,
+        injection,
+        listed,
+        &connection,
+        &mut to_client,
+        &mut from_client,
+    )
+    .await;
 
+    // Detaching, not stopping: the pump ends by itself once the encoder it
+    // reads from is gone, and dropping the handle cannot block.
+    drop(pump);
+    teardown(live, capture).await?;
+    outcome
+}
+
+/// Serves the client until it goes away.
+///
+/// Everything on one loop, because everything here decides against the same
+/// state: a receiver report moves the estimate, the estimate moves the ladder,
+/// and a tick that fired while another was being served has nothing left to
+/// say. Splitting them across tasks would be several locks over one decision.
+async fn converse(
+    live: &mut Live,
+    capture: &Capture,
+    injection: &tachyx_input::Injection,
+    listed: &Handle,
+    connection: &quinn::Connection,
+    to_client: &mut tachyx_transport::control::ControlWriter,
+    from_client: &mut tachyx_transport::control::ControlReader,
+) -> Result<(), SessionError> {
+    let mut sink_changes = live.sound.as_ref().map(Sound::changes);
     let mut rate_tick = ticker(RATE_INTERVAL);
     // The interval is the protocol's, not this daemon's: the client reads
     // liveness from a beat that did not arrive, so it has to expect the same
@@ -540,7 +778,7 @@ async fn run(
     let mut cursor_tick = ticker(cursor::INTERVAL);
     let mut key_frame_tick = ticker(KEY_FRAME_MAX_AGE / 4);
 
-    let outcome = loop {
+    loop {
         tokio::select! {
             message = from_client.recv::<ClientMessage>() => match message {
                 Ok(ClientMessage::Input(batch)) => {
@@ -555,10 +793,25 @@ async fn run(
                     live.keyframe_request(Instant::now());
                 }
                 Ok(ClientMessage::ViewportChanged(changed)) => live.viewport_changed(changed),
+                Ok(ClientMessage::Audio(command)) => {
+                    if !answer_audio(live.sound.as_mut(), command, to_client).await {
+                        break Ok(());
+                    }
+                }
                 Err(_) => break Ok(()),
             },
+            () = sink_changed(&mut sink_changes) => {
+                // Somebody turned the knob on the host itself. The client is
+                // told without having asked, because the host's volume is the
+                // volume and the client applies it as playback gain.
+                if let Some(status) = live.sound.as_ref().map(Sound::status)
+                    && to_client.send(&HostMessage::Audio(status)).await.is_err()
+                {
+                    break Ok(());
+                }
+            }
             _ = rate_tick.tick() => {
-                live.tick(&connection, &mut to_client, Instant::now()).await?;
+                live.tick(connection, to_client, Instant::now()).await?;
             }
             _ = key_frame_tick.tick() => live.repair_if_stale(Instant::now()),
             _ = cursor_tick.tick() => {
@@ -574,7 +827,8 @@ async fn run(
             }
             _ = heartbeat_tick.tick() => {
                 live.watch(Instant::now());
-                let beat = live.beat(&capture, &connection);
+                let beat = live.beat(capture, connection);
+                live.publish(listed, connection, &beat);
                 if to_client.send(&HostMessage::Heartbeat(beat)).await.is_err() {
                     break Ok(());
                 }
@@ -585,13 +839,7 @@ async fn run(
         // is a whole heartbeat interval, and the budget then prices every
         // deferred key frame against a moment that has already passed.
         live.honour_owed(Instant::now());
-    };
-
-    // Detaching, not stopping: the pump ends by itself once the encoder it
-    // reads from is gone, and dropping the handle cannot block.
-    drop(pump);
-    teardown(live, capture).await?;
-    outcome
+    }
 }
 
 /// Stops the pipeline without holding a runtime worker while it happens.
@@ -620,6 +868,94 @@ async fn teardown(live: Live, capture: Capture) -> Result<(), SessionError> {
     }
 }
 
+/// Carries out one sound command, and tells the client what the host is doing
+/// afterwards.
+///
+/// The answer is the truth rather than an echo of the request: a volume the
+/// sound server clamps comes back clamped, and a mode whose pipeline would not
+/// start comes back off. A host with no sound at all says nothing, because its
+/// hello already told the client not to ask.
+///
+/// `false` once the client has gone.
+async fn answer_audio(
+    sound: Option<&mut Sound>,
+    command: tachyx_proto::control::AudioCommand,
+    to_client: &mut tachyx_transport::control::ControlWriter,
+) -> bool {
+    let Some(sound) = sound else {
+        tracing::debug!("this host announced no sound");
+        return true;
+    };
+    let status = sound.apply(command).await;
+    to_client.send(&HostMessage::Audio(status)).await.is_ok()
+}
+
+/// Says what the session opens on, before anything else is sent.
+///
+/// The stream configuration is what a decoder is built from, so it goes first
+/// and it goes unasked. The sound status follows it for the same reason: the
+/// client draws its volume control from what the host reports, and a control
+/// with nothing behind it would be drawn wrong until somebody touched it.
+async fn greet(
+    live: &mut Live,
+    to_client: &mut tachyx_transport::control::ControlWriter,
+    started: Instant,
+) -> Result<(), SessionError> {
+    // The picture the session opens on. Spent here so that a later request
+    // cannot be refused on the grounds that this one was free: the budget is
+    // shared precisely so every cause is counted.
+    live.budget.request(Reason::Startup, started);
+    let opening = live.controller.tick(started);
+    live.spend(opening);
+    to_client
+        .send(&HostMessage::Stream(stream_config(
+            &live.encoder,
+            live.ladder.applied().bitrate,
+        )?))
+        .await?;
+    // A host with no sound says nothing at all, and the hello already told the
+    // client not to expect any.
+    if let Some(status) = live.sound.as_ref().map(Sound::status) {
+        to_client.send(&HostMessage::Audio(status)).await?;
+    }
+    Ok(())
+}
+
+/// Opens the connection to the sound server this session controls.
+///
+/// A host that announced sound and then cannot reach the server serves the
+/// session without it. Nothing about the picture depends on this, and a client
+/// that asks for sound is answered with [`AudioMode::Off`], which is the truth.
+///
+/// [`AudioMode::Off`]: tachyx_proto::control::AudioMode::Off
+async fn open_sound(sender: AudioSender, clock: Clock) -> Option<Sound> {
+    // Off a runtime worker: it waits for the sound server to answer.
+    match tokio::task::spawn_blocking(HostAudio::open).await {
+        Ok(Ok(control)) => Some(Sound::new(control, sender, clock)),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "this session runs without sound");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "this session runs without sound");
+            None
+        }
+    }
+}
+
+/// Waits for the host's own output to change.
+///
+/// It never returns for a session with no sound, or once the connection that
+/// reports the changes has ended, so the arm it sits in simply stops firing.
+async fn sink_changed(watching: &mut Option<watch::Receiver<Sink>>) {
+    if let Some(sink) = watching
+        && sink.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await;
+}
+
 /// A periodic tick that does not try to catch up.
 ///
 /// Every tick in this loop carries a control message, and tokio's default is to
@@ -642,29 +978,47 @@ fn ticker(period: std::time::Duration) -> tokio::time::Interval {
 fn release(
     units: tachyx_media::AccessUnits,
     mut video: tachyx_transport::video::VideoSender,
+    clock: Clock,
     admission: &Arc<std::sync::atomic::AtomicBool>,
     sent: &Arc<AtomicU64>,
     padded: &Arc<AtomicU64>,
+    pipeline: &Arc<Latency>,
 ) -> tokio::task::JoinHandle<tachyx_transport::video::VideoSender> {
     let admission = Arc::clone(admission);
     let sent = Arc::clone(sent);
     let padded = Arc::clone(padded);
+    let pipeline = Arc::clone(pipeline);
     tokio::task::spawn_blocking(move || {
+        // The thread whose lateness is a late datagram: it holds the pacer's
+        // schedule, and everything it sends is already as old as the encode.
+        tachyx_sched::raise("release");
         loop {
             match units.recv_timeout(GATE_INTERVAL) {
                 Ok(unit) => {
+                    let captured = unit.captured;
                     let slices = unit.slices();
-                    let Ok(wire) = WireUnit::new(unit.frame, unit.captured, unit.kind, &slices)
-                    else {
+                    let Ok(wire) = WireUnit::new(unit.frame, captured, unit.kind, &slices) else {
                         continue;
                     };
                     // Only a lost connection ends this. A refusal is this
                     // frame's problem and the next one may well fit; treating it
                     // as fatal would end video for the life of the session over
                     // a transient.
-                    if let Err(error) = video.send(&wire) {
-                        tracing::warn!(%error, "video path ended");
-                        break;
+                    match video.send(&wire) {
+                        // Timed here, after the pacer has released the last
+                        // datagram of the picture, because a picture is worth
+                        // nothing until its last datagram.
+                        Ok(Sent::Queued { .. }) => pipeline.record(
+                            u32::try_from(clock.elapsed().micros_since(captured))
+                                .unwrap_or(u32::MAX),
+                        ),
+                        // A refused picture never reached the wire, so it has no
+                        // capture-to-wire time to report.
+                        Ok(Sent::Refused) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "video path ended");
+                            break;
+                        }
                     }
                 }
                 // No picture came along to be the probe, which on a desktop

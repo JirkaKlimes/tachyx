@@ -18,17 +18,40 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tachyx_client::{Liveness, capabilities};
-use tachyx_driver::{Error, FrameSink, Link, Stats};
+use tachyx_client::{AudioEvent, Liveness, capabilities};
+use tachyx_driver::{AudioSink, Error, FrameSink, Link, Stats};
 use tachyx_proto::VERSION;
 use tachyx_proto::control::{
-    Aspect, ClientMessage, Codec, CodedSize, HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size,
-    StreamConfig,
+    Aspect, AudioCommand, AudioMode, AudioStatus, ClientMessage, Codec, CodedSize,
+    HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size, StreamConfig,
 };
 use tachyx_proto::input::{InputEvent, PointerButton, Press};
 use tachyx_proto::media::{FrameId, FrameKind, Timestamp};
 use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
-use tachyx_transport::{ControlWriter, Host, HostIdentity, HostSession, Tuning};
+use tachyx_crypto::store::PairedClient;
+use tachyx_crypto::{DeviceId, DeviceKey, PairedClients, Permissions};
+use tachyx_transport::{ControlWriter, Host, HostSession, Tuning};
+
+/// A host key, its identifier, and a paired list holding the client's device.
+///
+/// The two devices get directories of their own inside `state`, because a device
+/// key is one file with one name and a host and a client that shared a directory
+/// would share an identity.
+fn paired(state: &std::path::Path) -> (DeviceKey, DeviceId, Arc<PairedClients>) {
+    let host = DeviceKey::load_or_create(&state.join("host")).expect("a host key");
+    let client = DeviceKey::load_or_create(&state.join("client")).expect("a client key");
+    let clients = Arc::new(PairedClients::open(state.join("clients.toml")).expect("a paired list"));
+    clients
+        .add(PairedClient {
+            device: client.id(),
+            name: "the test client".to_owned(),
+            permissions: Permissions::default(),
+            paired: 0,
+        })
+        .expect("the list is writable");
+    let device = host.id();
+    (host, device, clients)
+}
 
 /// A 1080p60 key frame out of `vah264enc`, measured on the target machine.
 const KEY_FRAME: usize = 130_427;
@@ -91,12 +114,31 @@ impl FrameSink for Decoder {
     }
 }
 
+/// What the driver handed the speakers.
+#[derive(Debug, Default)]
+struct Ears {
+    heard: Mutex<Vec<AudioEvent>>,
+}
+
+impl Ears {
+    fn heard(&self) -> Vec<AudioEvent> {
+        self.heard.lock().expect("no panic held it").clone()
+    }
+}
+
+impl AudioSink for Ears {
+    fn push(&self, event: AudioEvent) {
+        self.heard.lock().expect("no panic held it").push(event);
+    }
+}
+
 /// A host on the loopback interface, running on a thread of its own.
 ///
 /// The client blocks while it builds its runtime, so the host cannot share the
 /// caller's.
 struct Loopback {
     address: SocketAddr,
+    host_device: DeviceId,
     directory: PathBuf,
     done: Receiver<String>,
     worker: Option<thread::JoinHandle<()>>,
@@ -111,7 +153,27 @@ impl Loopback {
             + Send
             + 'static,
     {
-        Self::raw(name, |host, report| {
+        Self::accepting(name, false, play)
+    }
+
+    /// The same, for a host whose hello says it can stream its own sound. The
+    /// client offers its audio controls from that and nothing else.
+    fn listening<F>(name: &str, play: F) -> Self
+    where
+        F: FnOnce(HostSession, Sender<String>) -> std::pin::Pin<Box<dyn Future<Output = ()>>>
+            + Send
+            + 'static,
+    {
+        Self::accepting(name, true, play)
+    }
+
+    fn accepting<F>(name: &str, audio: bool, play: F) -> Self
+    where
+        F: FnOnce(HostSession, Sender<String>) -> std::pin::Pin<Box<dyn Future<Output = ()>>>
+            + Send
+            + 'static,
+    {
+        Self::raw(name, audio, |host, report| {
             Box::pin(async move {
                 let session = host.accept().await.expect("the host accepts");
                 play(session, report).await;
@@ -121,7 +183,7 @@ impl Loopback {
 
     /// The same, but with the accepting left to the caller: a host that answers
     /// something no session would answer.
-    fn raw<F>(name: &str, play: F) -> Self
+    fn raw<F>(name: &str, audio: bool, play: F) -> Self
     where
         F: FnOnce(Arc<Host>, Sender<String>) -> std::pin::Pin<Box<dyn Future<Output = ()>>>
             + Send
@@ -130,21 +192,20 @@ impl Loopback {
         let directory =
             std::env::temp_dir().join(format!("tachyx-driver-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
+        let (host_key, host_device, clients) = paired(&directory);
         let (bound, address) = channel();
         let (report, done) = channel();
-        let listening = directory.clone();
         let worker = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("a runtime");
             runtime.block_on(async move {
-                let identity =
-                    HostIdentity::load_or_create(&listening).expect("an identity on disk");
                 let tuning = Tuning::for_stream(CodedSize::new(1920, 1088).expect("codeable"));
                 let host = Arc::new(
-                    Host::bind((Ipv4Addr::LOCALHOST, 0).into(), &identity, tuning)
-                        .expect("a bound host"),
+                    Host::bind((Ipv4Addr::LOCALHOST, 0).into(), &host_key, clients, tuning)
+                        .expect("a bound host")
+                        .with_audio(audio),
                 );
                 bound
                     .send(host.local_address().expect("a bound address"))
@@ -154,6 +215,7 @@ impl Loopback {
         });
         Self {
             address: address.recv().expect("the host binds"),
+            host_device,
             directory,
             done,
             worker: Some(worker),
@@ -162,9 +224,10 @@ impl Loopback {
 
     /// Dials the host with a client that decodes into `decoder`.
     fn dial(&self, decoder: &Arc<Decoder>) -> Result<Link, Error> {
-        let link = Link::connect(
+        let link = Link::dial(
             &self.address.to_string(),
-            &self.directory,
+            self.host_device,
+            &self.directory.join("client"),
             capabilities(surface(), NonZeroU16::new(60).expect("nonzero")),
         )?;
         link.present_on(Arc::clone(decoder) as Arc<dyn FrameSink>);
@@ -506,7 +569,7 @@ struct Later {
 
 #[test]
 fn a_host_of_another_version_is_named_and_not_misparsed() {
-    let loopback = Loopback::raw("version", |host, report| {
+    let loopback = Loopback::raw("version", false, |host, report| {
         Box::pin(async move {
             let incoming = host.endpoint().accept().await.expect("a client calls");
             let connection = incoming.await.expect("the handshake succeeds");
@@ -542,7 +605,7 @@ fn a_refusal_reaches_the_client_as_the_close_reason() {
         VERSION + 7
     );
 
-    let loopback = Loopback::raw("refusal", |host, report| {
+    let loopback = Loopback::raw("refusal", false, |host, report| {
         Box::pin(async move {
             let incoming = host.endpoint().accept().await.expect("a client calls");
             let connection = incoming.await.expect("the handshake succeeds");
@@ -572,4 +635,126 @@ fn a_refusal_reaches_the_client_as_the_close_reason() {
         said.contains(&reason),
         "the host's own words must reach the user, and got {said}"
     );
+}
+
+/// How many packets of sound the audio test moves.
+const SOUNDS: u32 = 10;
+
+/// The one packet the wire is told to eat, so that the hole is a hole in the
+/// identifiers and nothing else. It has packets on both sides of it, because a
+/// receiver reads a hole from the sound that arrives after it.
+const EATEN: u32 = 5;
+
+/// What the host says about its sound before anything is streamed.
+fn status() -> AudioStatus {
+    AudioStatus {
+        mode: AudioMode::Shared,
+        volume: 650,
+        muted: false,
+    }
+}
+
+/// One Opus packet, as far as anything under test can tell: nothing in the
+/// client decodes it, so what matters is that these bytes and no others come
+/// out the other end.
+fn sound(id: u32) -> Vec<u8> {
+    picture(id, 200)
+}
+
+/// The next audio command the client sends.
+///
+/// Everything else is stepped around rather than asserted on: a session that
+/// has been open longer than a key frame request gap asks for a key frame, and
+/// which side of that this test lands on is the scheduler's business.
+async fn next_command(from_client: &mut tachyx_transport::ControlReader) -> AudioCommand {
+    loop {
+        if let ClientMessage::Audio(command) = from_client
+            .recv::<ClientMessage>()
+            .await
+            .expect("the client speaks")
+        {
+            return command;
+        }
+    }
+}
+
+async fn stream_sound(mut host: HostSession, report: Sender<String>) {
+    // What the host is doing about sound, sent as soon as the session opens.
+    host.to_client
+        .send(&HostMessage::Audio(status()))
+        .await
+        .expect("a live stream");
+
+    // Nothing is captured until the user asks for it, which is what the mode
+    // command is. Waiting for it here is the protocol and not a contrivance:
+    // sound sent before anybody asked would be sound played by nothing.
+    let asked = next_command(&mut host.from_client).await;
+    report
+        .send(format!("{asked:?}"))
+        .expect("the test is waiting");
+
+    for id in 0..SOUNDS {
+        if id == EATEN {
+            continue;
+        }
+        host.audio
+            .send(
+                FrameId(id),
+                Timestamp::from_session_micros(u64::from(id) * 10_000),
+                &sound(id),
+            )
+            .expect("the connection is live");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    host.connection.closed().await;
+}
+
+#[test]
+fn sound_input_and_the_volume_control_all_cross_a_real_socket() {
+    let loopback = Loopback::listening("audio", |host, report| {
+        Box::pin(stream_sound(host, report))
+    });
+
+    let decoder = Arc::new(Decoder::default());
+    let ears = Arc::new(Ears::default());
+    let link = loopback.dial(&decoder).expect("the host accepts");
+    // Both go through the loop's own queue, in this order, so the sink is in
+    // place before the host is asked for a single packet.
+    link.listen_on(Arc::clone(&ears) as Arc<dyn AudioSink>);
+    link.set_audio_mode(AudioMode::Exclusive);
+    assert_eq!(
+        loopback.report(),
+        "SetMode(Exclusive)",
+        "the command has to reach the host, and only a host that said it has \
+         sound is sent one"
+    );
+
+    let stats = until(&link, |stats| {
+        stats.audio_packets == u64::from(SOUNDS) - 1 && stats.audio.is_some()
+    });
+    assert!(
+        stats.host_audio,
+        "the host's hello said it has sound, and nothing else answers that: {stats:?}"
+    );
+    assert_eq!(stats.audio, Some(status()), "the status reached the app");
+    assert_eq!(stats.audio_packets, u64::from(SOUNDS) - 1);
+    assert_eq!(
+        stats.audio_lost, 1,
+        "the packet that was never sent is a hole in the sound"
+    );
+
+    // Every packet, in the order it was captured, with the hole where the wire
+    // ate one and the sound behind it played after the hole rather than in
+    // place of it.
+    let heard = ears.heard();
+    let mut expected: Vec<AudioEvent> = (0..SOUNDS)
+        .filter(|id| *id != EATEN)
+        .map(|id| AudioEvent::Packet {
+            id: FrameId(id),
+            capture: Timestamp::from_session_micros(u64::from(id) * 10_000),
+            opus: sound(id),
+        })
+        .collect();
+    expected.insert(EATEN as usize, AudioEvent::Lost(1));
+    assert_eq!(heard, expected, "the sound came back out of order or short");
 }

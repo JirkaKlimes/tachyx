@@ -27,12 +27,18 @@
 //! pointer itself and move it the instant the finger does, rather than watching
 //! it arrive one whole pipeline late. [`Capture::cursor`] is where it comes out.
 
+mod audio;
 mod capture;
 mod encode;
 mod slot;
 
 use core::num::NonZeroU32;
 
+use tachyx_proto::media::Timestamp;
+
+pub use audio::{
+    AUDIO_BITRATE, AUDIO_FRAME, AudioCapture, OpusPacket, OpusPackets, audio_available,
+};
 pub use capture::{
     Capture, CaptureFormat, CaptureStats, Cursor, CursorImage, Frame, Frames, Plane, Pointer,
 };
@@ -40,6 +46,54 @@ pub use encode::{
     AccessUnit, AccessUnits, EncodeConfig, EncodeStats, Encoder, Idle, Percentiles, StreamGeometry,
     encoders,
 };
+
+/// The instant a session counts its timestamps from.
+///
+/// Sound and picture are captured by two pipelines that start at different
+/// moments, and the two streams have to be laid against each other at the far
+/// end. So the epoch is one value, made once and handed to both, rather than
+/// each of them counting from whenever it happened to start.
+///
+/// It reads `CLOCK_MONOTONIC`, which is the clock the compositor stamps a
+/// captured frame with and the clock GStreamer's own default clock is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Clock(u64);
+
+impl Clock {
+    /// A clock counting from now.
+    #[must_use]
+    pub fn now() -> Self {
+        Self(monotonic_nanos())
+    }
+
+    /// Stamps an instant already read from `CLOCK_MONOTONIC`.
+    ///
+    /// Saturating, because an instant from before the clock started is a bug
+    /// somewhere else and a wrapped timestamp would hide it inside a hundred
+    /// and nineteen hours of valid-looking numbers.
+    #[must_use]
+    pub fn stamp(self, monotonic_nanos: u64) -> Timestamp {
+        Timestamp::from_session_micros(monotonic_nanos.saturating_sub(self.0) / 1000)
+    }
+
+    /// Stamps this moment.
+    #[must_use]
+    pub fn elapsed(self) -> Timestamp {
+        self.stamp(monotonic_nanos())
+    }
+}
+
+/// `CLOCK_MONOTONIC`, in nanoseconds.
+pub(crate) fn monotonic_nanos() -> u64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "CLOCK_MONOTONIC counts up from an unspecified point in the past"
+    )]
+    {
+        now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+    }
+}
 
 /// Why capture or encode could not be set up or carried on.
 #[derive(Debug, thiserror::Error)]
@@ -56,8 +110,11 @@ pub enum Error {
     /// The compositor does not offer a protocol that capture requires.
     #[error("compositor does not offer {0}, which capture requires")]
     Missing(&'static str),
-    /// The compositor announced no output by the requested name.
-    #[error("no output named {0}")]
+    /// The compositor announced no output by the requested name, or announced
+    /// none at all when none was asked for.
+    #[error(
+        "no output named {0}: run `tachyx-hostd doctor` for what the compositor          does report, or leave `output` unset to take the first one"
+    )]
     NoSuchOutput(String),
     /// The compositor ended the capture session.
     #[error("the compositor stopped the capture session")]

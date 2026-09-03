@@ -1,8 +1,12 @@
-//! The video datagram header.
+//! The media datagram header.
 //!
 //! Sixteen bytes, little-endian, written and read by hand. This is the only part
 //! of the protocol on the per-packet path, and the part most worth auditing, so
 //! it is specified as bytes rather than derived from a Rust type.
+//!
+//! One header for picture, repair, padding and sound. They share a session-wide
+//! sequence number because they share a path, and the only measurement either
+//! end has of that path is which of those numbers arrived.
 //!
 //! There is no RTP framing, no synchronisation source, and no per-packet
 //! authentication tag. QUIC already supplies encryption, connection identity and
@@ -238,9 +242,9 @@ pub struct FrameId(pub u32);
 /// count and index for its own count and index, because the invariant is the
 /// same one.
 ///
-/// Padding is told apart from both by one flag bit, read before the slice
-/// identifier, because a padding datagram belongs to no frame and every field
-/// that would say which one is meaningless on it.
+/// Padding and audio are told apart from both by one flag bit each, read before
+/// the slice identifier, because neither belongs to a frame of picture and every
+/// field that would say which one is meaningless on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// A fragment of one slice of the picture.
@@ -258,6 +262,16 @@ pub enum Role {
     /// [`PacketHeader::frame`] and [`PacketHeader::kind`] are whatever the
     /// sender happened to write and mean nothing here.
     Padding,
+    /// One packet of encoded sound.
+    ///
+    /// It rides the same datagram path and the same sequence as the picture,
+    /// because it costs the path the same kind of bytes and its loss is the
+    /// same evidence about it. It reaches no reassembly: an audio packet is
+    /// whole in one datagram, so there is nothing to put back together.
+    ///
+    /// [`PacketHeader::frame`] counts audio packets rather than pictures here,
+    /// and [`PacketHeader::kind`] means nothing.
+    Audio(AudioHeader),
 }
 
 /// What a picture packet says beyond [`PacketHeader`]'s common fields.
@@ -299,7 +313,24 @@ pub struct ParityHeader {
     pub shard: Fragment,
 }
 
-/// The header carried by every video datagram.
+/// What an audio packet says beyond [`PacketHeader`]'s common fields.
+///
+/// One field, because everything else an audio packet needs is already common.
+/// The packet counter is [`PacketHeader::frame`] and the sequence number is
+/// [`PacketHeader::seq`], and both mean for sound exactly what they mean for
+/// picture. The payload is one Opus packet, which describes its own duration
+/// and channel layout, so nothing here has to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioHeader {
+    /// When the host captured the samples.
+    ///
+    /// It sits where a picture packet's capture time sits, and it is the same
+    /// clock, so a receiver can line sound up against picture without either
+    /// side sending a mapping between two timelines.
+    pub capture: Timestamp,
+}
+
+/// The header carried by every datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketHeader {
     /// Which frame this packet belongs to. The reassembly key, and what a
@@ -320,6 +351,7 @@ impl PacketHeader {
     const FLAG_KEY: u8 = 1 << 0;
     const FLAG_LAST_SLICE: u8 = 1 << 1;
     const FLAG_PADDING: u8 = 1 << 2;
+    const FLAG_AUDIO: u8 = 1 << 3;
 
     /// The header as it appears on the wire.
     #[must_use]
@@ -338,27 +370,40 @@ impl PacketHeader {
                 }
                 head[4..8].copy_from_slice(&picture.capture.0.to_le_bytes());
                 head[14] = picture.slice.get();
-                picture.fragment
+                Some(picture.fragment)
             }
             Role::Parity(parity) => {
                 head[4..6].copy_from_slice(&parity.data_shards.get().to_le_bytes());
                 head[6..8].copy_from_slice(&parity.tail.get().to_le_bytes());
                 head[14] = SliceId::PARITY;
-                parity.shard
+                Some(parity.shard)
             }
             Role::Padding => {
                 flags |= Self::FLAG_PADDING;
                 // Written so that the fixed layout stays well formed rather
                 // than because a receiver reads them: the padding bit is
                 // checked first and everything here is skipped.
-                Fragment {
+                Some(Fragment {
                     count: NonZeroU16::MIN,
                     index: 0,
-                }
+                })
+            }
+            Role::Audio(audio) => {
+                flags |= Self::FLAG_AUDIO;
+                head[4..8].copy_from_slice(&audio.capture.0.to_le_bytes());
+                // The fragment fields and the slice identifier are left at
+                // zero, and that is the opposite choice from padding's on
+                // purpose. A count of zero is not a slice, so a receiver that
+                // does not know the audio bit rejects the datagram by name
+                // instead of handing a decoder an Opus packet it read as a
+                // band of the picture.
+                None
             }
         };
-        head[10..12].copy_from_slice(&fragment.count.get().to_le_bytes());
-        head[12..14].copy_from_slice(&fragment.index.to_le_bytes());
+        if let Some(fragment) = fragment {
+            head[10..12].copy_from_slice(&fragment.count.get().to_le_bytes());
+            head[12..14].copy_from_slice(&fragment.index.to_le_bytes());
+        }
         head[15] = flags;
         head
     }
@@ -370,8 +415,9 @@ impl PacketHeader {
     ///
     /// # Errors
     /// If the datagram is too short to hold a header, carries no payload,
-    /// describes a fragment whose index falls outside its count, or is a parity
-    /// packet describing a coding block no decoder could be given.
+    /// claims to be two kinds of datagram at once, describes a fragment whose
+    /// index falls outside its count, or is a parity packet describing a coding
+    /// block no decoder could be given.
     pub fn parse(datagram: &[u8]) -> Result<(Self, &[u8]), MalformedPacket> {
         let (head, payload) = datagram
             .split_at_checked(HEADER_LEN)
@@ -380,10 +426,23 @@ impl PacketHeader {
             return Err(MalformedPacket::NoPayload);
         }
         let flags = head[15];
-        // Read before the fragment fields rather than after, because on a
-        // padding datagram those fields describe nothing and validating them
+        // Both are read before the fragment fields rather than after, because
+        // on either of them those fields describe nothing and validating them
         // would be validating whatever the sender left there.
-        let role = if flags & Self::FLAG_PADDING != 0 {
+        let audio = flags & Self::FLAG_AUDIO != 0;
+        let padding = flags & Self::FLAG_PADDING != 0;
+        // Refused rather than resolved by precedence. The two say opposite
+        // things about the payload, one carries sound and the other is defined
+        // to carry nothing, and a receiver that guessed would play whichever
+        // the sender did not mean.
+        if audio && padding {
+            return Err(MalformedPacket::TwoKinds);
+        }
+        let role = if audio {
+            Role::Audio(AudioHeader {
+                capture: Timestamp(u32::from_le_bytes([head[4], head[5], head[6], head[7]])),
+            })
+        } else if padding {
             Role::Padding
         } else {
             let count = NonZeroU16::new(u16::from_le_bytes([head[10], head[11]]))
@@ -440,15 +499,19 @@ fn parity(head: &[u8], payload: &[u8], shard: Fragment) -> Result<ParityHeader, 
     })
 }
 
-/// Why a received datagram could not be a video packet.
+/// Why a received datagram could not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MalformedPacket {
     /// Shorter than a header.
     #[error("datagram is shorter than a {HEADER_LEN}-byte header")]
     TooShort,
-    /// Header but no video bytes.
+    /// Header but no payload bytes.
     #[error("datagram carries a header and no payload")]
     NoPayload,
+    /// Flagged as audio and as padding at once, which is two answers to the
+    /// question of what the payload is.
+    #[error("datagram claims to be both audio and padding")]
+    TwoKinds,
     /// A slice claiming to contain no packets, which cannot describe this one.
     #[error("slice claims to hold no packets")]
     EmptySlice,
@@ -562,10 +625,56 @@ mod tests {
         assert_eq!(PacketHeader::parse(&noise).unwrap().0.role, Role::Padding);
     }
 
+    fn audio_header() -> PacketHeader {
+        PacketHeader {
+            frame: FrameId(4_112),
+            seq: Seq(0x0BAD),
+            kind: FrameKind::Delta,
+            role: Role::Audio(AudioHeader {
+                capture: Timestamp::from_session_micros(3_600_000),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_audio_header_survives_a_round_trip_and_describes_no_picture() {
+        let mut buf = audio_header().to_bytes().to_vec();
+        buf.extend_from_slice(b"opus");
+        let (parsed, payload) = PacketHeader::parse(&buf).unwrap();
+        assert_eq!(parsed, audio_header());
+        assert_eq!(payload, b"opus");
+        assert_eq!(buf[15] & 0b1000, 0b1000);
+        assert_eq!(
+            &buf[10..15],
+            &[0u8; 5],
+            "an audio datagram belongs to no slice and says so"
+        );
+
+        // A receiver that does not know the audio bit finds no slice rather
+        // than a one-fragment picture, which is what keeps an Opus packet out
+        // of a video decoder.
+        let mut older = buf;
+        older[15] &= !0b1000;
+        assert_eq!(
+            PacketHeader::parse(&older),
+            Err(MalformedPacket::EmptySlice)
+        );
+    }
+
+    #[test]
+    fn a_datagram_cannot_be_audio_and_padding_at_once() {
+        let mut buf = audio_header().to_bytes().to_vec();
+        buf.extend_from_slice(b"opus");
+        buf[15] |= 0b100;
+        assert_eq!(PacketHeader::parse(&buf), Err(MalformedPacket::TwoKinds));
+    }
+
     #[test]
     fn unknown_flag_bits_do_not_reject_a_packet() {
         let mut buf = header().to_bytes().to_vec();
-        buf[15] |= 0b1111_1000;
+        // Every spare bit, which is every bit above the four this version
+        // defines.
+        buf[15] |= 0b1111_0000;
         buf.push(1);
         let (parsed, _) = PacketHeader::parse(&buf).expect("later versions may set spare bits");
         assert_eq!(parsed.kind, FrameKind::Key);

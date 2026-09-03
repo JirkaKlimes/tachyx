@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 
 import 'package:tachyx/src/input/keyboard.dart';
 import 'package:tachyx/src/input/touchpad.dart';
+import 'package:tachyx/src/rust/api/audio.dart';
 import 'package:tachyx/src/rust/api/session.dart';
 import 'package:tachyx/src/session/cursor.dart';
 import 'package:tachyx/src/session/pip.dart';
@@ -17,6 +18,7 @@ import 'package:tachyx/src/session/pipe.dart';
 import 'package:tachyx/src/session/present.dart';
 import 'package:tachyx/src/session/viewport.dart';
 import 'package:tachyx/src/settings.dart';
+import 'package:tachyx/src/ui/audio.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 import 'package:tachyx/src/ui/theme.dart';
 import 'package:tachyx/src/ui/video_surface.dart';
@@ -89,6 +91,15 @@ class _SessionScreenState extends State<SessionScreen>
   /// restored with it.
   static const int _pipBitrate = 2000000;
 
+  /// How long the client shows what it asked the host for, before the host's
+  /// own word wins again.
+  ///
+  /// Long enough for an answer to come back over a slow link, short enough
+  /// that a refusal is not reported as success for long. A host may refuse,
+  /// and a control that shows a refusal as if it had worked is worse than one
+  /// that answers a moment late.
+  static const Duration _pending = Duration(seconds: 1);
+
   final InputPipe _pipe = InputPipe();
   final Pip _pip = Pip.instance;
   late final CursorFeed _cursor;
@@ -99,6 +110,21 @@ class _SessionScreenState extends State<SessionScreen>
   Timer? _lingerTimer;
   bool _showStats = false;
   bool _expanded = true;
+
+  /// The mode asked of the host and not yet confirmed, with the moment of the
+  /// asking. Shown in place of the sample while it stands, so that a second
+  /// tap follows the first rather than repeating it: the sample is up to a
+  /// tenth of a second behind, and the host answers no faster than the link.
+  (AudioMode, DateTime)? _askedMode;
+
+  /// The host volume asked for and not yet confirmed, with the moment. It is
+  /// what the next step counts from, so that a key held down climbs instead of
+  /// stepping off the same stale reading each time.
+  (int, DateTime)? _askedVolume;
+
+  /// Bumped when a volume key moved the host, which is what puts the column on
+  /// the glass. What the number is means nothing; the change is the message.
+  final ValueNotifier<int> _nudged = ValueNotifier<int>(0);
 
   /// The counters, held apart from the element tree.
   ///
@@ -137,7 +163,7 @@ class _SessionScreenState extends State<SessionScreen>
       sensitivity: widget.settings.sensitivity,
       pointerAccel: widget.settings.pointerAccel,
     );
-    _keys = HardwareKeys(_pipe.send)..attach();
+    _keys = HardwareKeys(_pipe.send, stepVolume: _stepVolume)..attach();
     WidgetsBinding.instance.addObserver(this);
     widget.settings.addListener(_settingsMoved);
     _pip.active.addListener(_pipMoved);
@@ -232,6 +258,7 @@ class _SessionScreenState extends State<SessionScreen>
     _soft.hide();
     _cursor.dispose();
     _stats.dispose();
+    _nudged.dispose();
     _pipe.detach();
     unawaited(_presentation?.close() ?? Future<void>.value());
     super.dispose();
@@ -387,6 +414,50 @@ class _SessionScreenState extends State<SessionScreen>
     setState(() => _showStats = !_showStats);
   }
 
+  /// Asks the host for a mode, and shows it as asked for until the host says
+  /// what it is really doing.
+  void _askMode(AudioMode mode) {
+    widget.session?.setAudioMode(mode: mode);
+    _buzz();
+    _reveal();
+    setState(() => _askedMode = (mode, DateTime.now()));
+  }
+
+  /// Moves the host's volume by [step] permille, reporting whether it did.
+  ///
+  /// Nothing moves while the session is playing nothing: the volume keys are
+  /// then the phone's own, and a client that swallowed them while silent would
+  /// leave the user unable to turn their own machine down.
+  bool _stepVolume(int step) {
+    final AudioStats? audio = _stats.value?.audio;
+    if (audio == null || audio.mode == AudioMode.off) return false;
+    _askVolume((_standing(_askedVolume) ?? audio.volume) + step);
+    _nudged.value += 1;
+    return true;
+  }
+
+  /// Asks the host for a sink volume, bounded to what the protocol carries.
+  void _askVolume(int permille) {
+    final int wanted = permille.clamp(0, 1000);
+    widget.session?.setHostVolume(permille: wanted);
+    setState(() => _askedVolume = (wanted, DateTime.now()));
+  }
+
+  void _askMuted(bool muted) {
+    widget.session?.setHostMuted(muted: muted);
+    _buzz();
+  }
+
+  /// What was asked of the host and is still worth showing over its own word.
+  ///
+  /// Nothing once the answer has had [_pending] to arrive: by then the host
+  /// either agreed, in which case its word says the same thing, or it refused
+  /// and the client has no business repeating the request as a fact.
+  static T? _standing<T>((T, DateTime)? asked) =>
+      asked != null && DateTime.now().difference(asked.$2) < _pending
+      ? asked.$1
+      : null;
+
   void _buzz() =>
       unawaited(HapticFeedback.selectionClick().catchError((Object _) {}));
 
@@ -426,7 +497,9 @@ class _SessionScreenState extends State<SessionScreen>
           // against it, so the viewport the hello named is still the area the
           // video occupies, and the host keeps encoding for the screen that is
           // really there.
-          Positioned.fill(child: TouchSurface(pad: _pad, child: _picture())),
+          Positioned.fill(
+            child: TouchSurface(pad: _pad, child: _picture()),
+          ),
           // The panel keeps the top left corner and the controls the bottom
           // right, so the two never cover each other on a screen as short as
           // a phone held sideways.
@@ -459,6 +532,35 @@ class _SessionScreenState extends State<SessionScreen>
                 ),
               ),
             ),
+          // The column keeps the right edge, halfway down: the dock has the
+          // corner under it and the panel the far side, so nothing here ever
+          // covers anything else.
+          if (!thumbnail)
+            Positioned(
+              right: 0,
+              top: 0,
+              bottom: media.viewInsets.bottom,
+              child: SafeArea(
+                left: false,
+                child: Center(
+                  child: ValueListenableBuilder<SessionStats?>(
+                    valueListenable: _stats,
+                    builder:
+                        (
+                          BuildContext context,
+                          SessionStats? stats,
+                          Widget? _,
+                        ) => VolumeOverlay(
+                          audio: stats?.audio,
+                          asked: _standing(_askedVolume),
+                          nudged: _nudged,
+                          onVolume: _askVolume,
+                          onMuted: _askMuted,
+                        ),
+                  ),
+                ),
+              ),
+            ),
           if (!thumbnail)
             Positioned(
               right: 0,
@@ -468,14 +570,22 @@ class _SessionScreenState extends State<SessionScreen>
               child: SafeArea(
                 top: false,
                 left: false,
-                child: _CornerDock(
-                  expanded: _expanded,
-                  address: widget.address,
-                  showingStats: _showStats,
-                  onOpen: _reveal,
-                  onKeyboard: _toggleKeyboard,
-                  onToggleStats: _toggleStats,
-                  onLeave: widget.onLeave,
+                child: ValueListenableBuilder<SessionStats?>(
+                  valueListenable: _stats,
+                  builder:
+                      (BuildContext context, SessionStats? stats, Widget? _) =>
+                          _CornerDock(
+                            expanded: _expanded,
+                            address: widget.address,
+                            showingStats: _showStats,
+                            audio: stats?.audio,
+                            askedMode: _standing(_askedMode),
+                            onOpen: _reveal,
+                            onAudio: _askMode,
+                            onKeyboard: _toggleKeyboard,
+                            onToggleStats: _toggleStats,
+                            onLeave: widget.onLeave,
+                          ),
                 ),
               ),
             ),
@@ -499,7 +609,10 @@ class _CornerDock extends StatelessWidget {
     required this.expanded,
     required this.address,
     required this.showingStats,
+    required this.audio,
+    required this.askedMode,
     required this.onOpen,
+    required this.onAudio,
     required this.onKeyboard,
     required this.onToggleStats,
     required this.onLeave,
@@ -511,7 +624,10 @@ class _CornerDock extends StatelessWidget {
   final bool expanded;
   final String? address;
   final bool showingStats;
+  final AudioStats? audio;
+  final AudioMode? askedMode;
   final VoidCallback onOpen;
+  final ValueChanged<AudioMode> onAudio;
   final VoidCallback onKeyboard;
   final VoidCallback onToggleStats;
   final VoidCallback onLeave;
@@ -579,6 +695,7 @@ class _CornerDock extends StatelessWidget {
               ),
             ),
           ),
+          AudioButton(audio: audio, asked: askedMode, onMode: onAudio),
           IconButton(
             onPressed: onKeyboard,
             icon: const Icon(Icons.keyboard_outlined, size: 18),

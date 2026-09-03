@@ -9,14 +9,12 @@ repository.workspace = true
 
 [dependencies]
 tachyx-congestion.workspace = true
+tachyx-crypto.workspace = true
 tachyx-proto.workspace = true
 bytes.workspace = true
 postcard.workspace = true
 quinn.workspace = true
-rcgen.workspace = true
-ring.workspace = true
 rustls.workspace = true
-rustls-webpki.workspace = true
 serde.workspace = true
 socket2.workspace = true
 thiserror.workspace = true

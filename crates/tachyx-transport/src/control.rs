@@ -124,6 +124,19 @@ impl ControlReader {
         Ok(H::decode(bytes)?)
     }
 
+    /// Reads one message without decoding it.
+    ///
+    /// The relay's control stream is framed exactly as this one and carries its
+    /// own message set, so it frames here and decodes for itself. There is one
+    /// framing in the tree rather than two that can drift.
+    ///
+    /// # Errors
+    /// If the stream ends, or the peer announces a message longer than
+    /// [`MAX_MESSAGE`].
+    pub async fn bytes(&mut self) -> Result<&[u8], ControlError> {
+        self.frame().await
+    }
+
     /// Takes the next whole frame out of the buffer, reading more when the
     /// buffer does not hold one yet.
     async fn frame(&mut self) -> Result<&[u8], ControlError> {

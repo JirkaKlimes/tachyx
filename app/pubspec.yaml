@@ -51,6 +51,14 @@ dependencies:
   # line of ours. The version below is the last one that reaches the platform
   # through a method channel and needs no native build at all.
   path_provider_android: ">=2.2.0 <2.3.0"
+  # A pairing link reaches the app two ways: scanned from the host's terminal,
+  # or opened as `tachyx://pair`. This is the second, and it is the only path
+  # the Linux desktop client has, because no Flutter package scans a QR with a
+  # camera on Linux at all.
+  app_links: ^7.2.1
+  # The first. Android only in practice: the package lists no Linux support and
+  # nothing else does either.
+  mobile_scanner: ^7.4.0
 
 dev_dependencies:
   flutter_test:

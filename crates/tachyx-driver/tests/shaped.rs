@@ -36,7 +36,9 @@ use tachyx_proto::control::{
 use tachyx_proto::media::{FrameId, FrameKind, Timestamp};
 use tachyx_proto::packet::{AccessUnit, Parity};
 use tachyx_transport::endpoint::HostSession;
-use tachyx_transport::{Host, HostIdentity, Tuning};
+use tachyx_crypto::store::PairedClient;
+use tachyx_crypto::{DeviceId, DeviceKey, PairedClients, Permissions};
+use tachyx_transport::{Host, Tuning};
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
@@ -299,6 +301,7 @@ async fn serve(session: HostSession, seconds: u64, report: &Sender<Samples>) {
         control,
         mut to_client,
         mut from_client,
+        ..
     } = session;
     let started = Instant::now();
     let mut controller = Controller::new(hello.capabilities.bitrate_ceiling, started.into_std());
@@ -392,13 +395,34 @@ fn at(samples: &Samples, at: f64) -> u32 {
 }
 
 /// Runs one shaped session and returns what the host's estimate did.
+/// A host key, its identifier, and a paired list holding the client's device.
+///
+/// The two devices get directories of their own inside `state`, because a device
+/// key is one file with one name and a host and a client that shared a directory
+/// would share an identity.
+fn paired(state: &std::path::Path) -> (DeviceKey, DeviceId, Arc<PairedClients>) {
+    let host = DeviceKey::load_or_create(&state.join("host")).expect("a host key");
+    let client = DeviceKey::load_or_create(&state.join("client")).expect("a client key");
+    let clients = Arc::new(PairedClients::open(state.join("clients.toml")).expect("a paired list"));
+    clients
+        .add(PairedClient {
+            device: client.id(),
+            name: "the test client".to_owned(),
+            permissions: Permissions::default(),
+            paired: 0,
+        })
+        .expect("the list is writable");
+    let device = host.id();
+    (host, device, clients)
+}
+
 fn run(name: &str, shape: Shape, seconds: u64) -> (Samples, u64) {
     let directory =
         std::env::temp_dir().join(format!("tachyx-shaped-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     let (bound, front) = channel();
     let (report, done) = channel();
-    let listening = directory.clone();
+    let (host_key, host_device, clients) = paired(&directory);
 
     let host = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -407,9 +431,8 @@ fn run(name: &str, shape: Shape, seconds: u64) -> (Samples, u64) {
             .build()
             .expect("a runtime");
         runtime.block_on(async move {
-            let identity = HostIdentity::load_or_create(&listening).expect("an identity on disk");
             let tuning = Tuning::for_stream(CodedSize::new(1920, 1088).expect("codeable"));
-            let host = Host::bind((Ipv4Addr::LOCALHOST, 0).into(), &identity, tuning)
+            let host = Host::bind((Ipv4Addr::LOCALHOST, 0).into(), &host_key, clients, tuning)
                 .expect("a bound host");
             let address = relay(host.local_address().expect("a bound address"), shape)
                 .await
@@ -422,9 +445,10 @@ fn run(name: &str, shape: Shape, seconds: u64) -> (Samples, u64) {
 
     let front: SocketAddr = front.recv().expect("the host binds");
     let decoder = Arc::new(Decoder::default());
-    let link = Link::connect(
+    let link = Link::dial(
         &front.to_string(),
-        &directory,
+        host_device,
+        &directory.join("client"),
         capabilities(surface(), NonZeroU16::new(60).expect("nonzero")),
     )
     .expect("the host accepts");

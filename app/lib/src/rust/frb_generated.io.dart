@@ -3,7 +3,9 @@
 
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
+import 'api/audio.dart';
 import 'api/input.dart';
+import 'api/pairing.dart';
 import 'api/session.dart';
 import 'api/video.dart';
 
@@ -52,6 +54,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  AudioMode dco_decode_audio_mode(dynamic raw);
+
+  @protected
+  AudioStats dco_decode_audio_stats(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
@@ -74,6 +82,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   InputEvent dco_decode_box_autoadd_input_event(dynamic raw);
+
+  @protected
+  PairedHost dco_decode_box_autoadd_paired_host(dynamic raw);
 
   @protected
   PresentStats dco_decode_box_autoadd_present_stats(dynamic raw);
@@ -115,7 +126,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   InputEvent dco_decode_input_event(dynamic raw);
 
   @protected
+  KnownHostView dco_decode_known_host_view(dynamic raw);
+
+  @protected
   Latency dco_decode_latency(dynamic raw);
+
+  @protected
+  List<String> dco_decode_list_String(dynamic raw);
+
+  @protected
+  List<KnownHostView> dco_decode_list_known_host_view(dynamic raw);
 
   @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
@@ -142,6 +162,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   HostReport? dco_decode_opt_box_autoadd_host_report(dynamic raw);
 
   @protected
+  PairedHost? dco_decode_opt_box_autoadd_paired_host(dynamic raw);
+
+  @protected
   PresentStats? dco_decode_opt_box_autoadd_present_stats(dynamic raw);
 
   @protected
@@ -149,6 +172,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt? dco_decode_opt_box_autoadd_u_64(dynamic raw);
+
+  @protected
+  PairReport dco_decode_pair_report(dynamic raw);
+
+  @protected
+  PairedHost dco_decode_paired_host(dynamic raw);
 
   @protected
   PointerButton dco_decode_pointer_button(dynamic raw);
@@ -208,6 +237,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
+  AudioMode sse_decode_audio_mode(SseDeserializer deserializer);
+
+  @protected
+  AudioStats sse_decode_audio_stats(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
@@ -230,6 +265,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   InputEvent sse_decode_box_autoadd_input_event(SseDeserializer deserializer);
+
+  @protected
+  PairedHost sse_decode_box_autoadd_paired_host(SseDeserializer deserializer);
 
   @protected
   PresentStats sse_decode_box_autoadd_present_stats(
@@ -273,7 +311,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   InputEvent sse_decode_input_event(SseDeserializer deserializer);
 
   @protected
+  KnownHostView sse_decode_known_host_view(SseDeserializer deserializer);
+
+  @protected
   Latency sse_decode_latency(SseDeserializer deserializer);
+
+  @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer);
+
+  @protected
+  List<KnownHostView> sse_decode_list_known_host_view(
+    SseDeserializer deserializer,
+  );
 
   @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
@@ -306,6 +355,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  PairedHost? sse_decode_opt_box_autoadd_paired_host(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   PresentStats? sse_decode_opt_box_autoadd_present_stats(
     SseDeserializer deserializer,
   );
@@ -315,6 +369,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   BigInt? sse_decode_opt_box_autoadd_u_64(SseDeserializer deserializer);
+
+  @protected
+  PairReport sse_decode_pair_report(SseDeserializer deserializer);
+
+  @protected
+  PairedHost sse_decode_paired_host(SseDeserializer deserializer);
 
   @protected
   PointerButton sse_decode_pointer_button(SseDeserializer deserializer);
@@ -380,6 +440,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
+  void sse_encode_audio_mode(AudioMode self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_audio_stats(AudioStats self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
@@ -415,6 +481,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_input_event(
     InputEvent self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_paired_host(
+    PairedHost self,
     SseSerializer serializer,
   );
 
@@ -461,7 +533,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_input_event(InputEvent self, SseSerializer serializer);
 
   @protected
+  void sse_encode_known_host_view(KnownHostView self, SseSerializer serializer);
+
+  @protected
   void sse_encode_latency(Latency self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_known_host_view(
+    List<KnownHostView> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_prim_u_8_strict(
@@ -506,6 +590,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_paired_host(
+    PairedHost? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_present_stats(
     PresentStats? self,
     SseSerializer serializer,
@@ -516,6 +606,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_box_autoadd_u_64(BigInt? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pair_report(PairReport self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_paired_host(PairedHost self, SseSerializer serializer);
 
   @protected
   void sse_encode_pointer_button(PointerButton self, SseSerializer serializer);

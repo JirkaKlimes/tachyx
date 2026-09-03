@@ -12,15 +12,16 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::time::{Duration, Instant};
 
 use tachyx_proto::control::{
-    Capabilities, ClientHello, ClientMessage, Codec, Codecs, FEEDBACK_INTERVAL,
-    FEEDBACK_SLOW_BELOW, FEEDBACK_SLOW_INTERVAL, HEARTBEAT_INTERVAL, Heartbeat, HostMessage, Size,
-    StreamConfig,
+    AudioCommand, AudioMode, AudioStatus, Capabilities, ClientHello, ClientMessage, Codec, Codecs,
+    FEEDBACK_INTERVAL, FEEDBACK_SLOW_BELOW, FEEDBACK_SLOW_INTERVAL, HEARTBEAT_INTERVAL, Heartbeat,
+    HostHello, HostMessage, Size, StreamConfig, VOLUME_NORM,
 };
 use tachyx_proto::input::InputEvent;
 use tachyx_proto::media::{FrameId, MalformedPacket, Timestamp};
 use tachyx_proto::packet::{Frame, Reassembler, ReassemblyStats};
 use tachyx_proto::report::Reporter;
 
+use crate::audio::{AudioEvent, AudioQueue};
 use crate::cursor::{CursorTracker, CursorView, Spot};
 use crate::input::InputQueue;
 
@@ -142,6 +143,7 @@ impl Liveness {
 #[derive(Debug)]
 pub struct Session {
     hello: ClientHello,
+    greeting: Option<HostHello>,
     stream: Option<StreamConfig>,
     outgoing: VecDeque<ClientMessage>,
     input: InputQueue,
@@ -157,6 +159,8 @@ pub struct Session {
     beat: Option<Heartbeat>,
     reports: Reporter,
     cursor: CursorTracker,
+    audio: AudioQueue,
+    sound: Option<AudioStatus>,
 }
 
 impl Session {
@@ -168,6 +172,7 @@ impl Session {
     pub fn new(capabilities: Capabilities, now: Instant) -> Self {
         Self {
             hello: ClientHello::new(capabilities),
+            greeting: None,
             stream: None,
             outgoing: VecDeque::new(),
             input: InputQueue::new(),
@@ -187,6 +192,8 @@ impl Session {
             beat: None,
             reports: Reporter::new(now),
             cursor: CursorTracker::new(),
+            audio: AudioQueue::default(),
+            sound: None,
         }
     }
 
@@ -195,6 +202,29 @@ impl Session {
     #[must_use]
     pub const fn hello(&self) -> ClientHello {
         self.hello
+    }
+
+    /// Takes what the host said before it had read a word from this client.
+    ///
+    /// The transport reads it during the handshake, checks its version, and
+    /// hands it here, because what is in it decides what the client offers the
+    /// user. Nothing in the session waits for it: a session whose greeting
+    /// never arrived is a session that was refused.
+    pub const fn greeted(&mut self, hello: HostHello) {
+        self.greeting = Some(hello);
+    }
+
+    /// Whether the host said it can stream its own sound.
+    ///
+    /// The only source for that answer. A control offered against a host with
+    /// no capture path would do nothing, and a user cannot tell that from a
+    /// fault.
+    #[must_use]
+    pub const fn host_has_audio(&self) -> bool {
+        match self.greeting {
+            Some(hello) => hello.audio,
+            None => false,
+        }
     }
 
     /// How the host said it is encoding, once it has said.
@@ -262,7 +292,80 @@ impl Session {
             }
             HostMessage::Heartbeat(beat) => self.beat = Some(beat),
             HostMessage::Cursor(update) => self.cursor.reported(now, &update, round_trip),
+            // What the host is really doing, which is not always what it was
+            // asked to do. Kept whole rather than merged into a request of the
+            // client's own: the two disagree whenever the host refuses
+            // something or somebody turns the volume knob on the host itself.
+            HostMessage::Audio(status) => self.sound = Some(status),
         }
+    }
+
+    /// What the host last said it is doing about sound.
+    ///
+    /// `None` until it has said anything, which for a host with audio is one
+    /// message after the hello.
+    #[must_use]
+    pub const fn audio_status(&self) -> Option<AudioStatus> {
+        self.sound
+    }
+
+    /// The next thing to play, in the order it was captured.
+    ///
+    /// Drained after every [`Session::datagram`]. A hole in the sound comes out
+    /// as [`AudioEvent::Lost`] ahead of the packet behind it, because
+    /// concealing a gap needs its length.
+    pub fn pop_audio(&mut self) -> Option<AudioEvent> {
+        self.audio.pop()
+    }
+
+    /// Asks the host to start streaming its sound, stop, or change what it does
+    /// with its own output meanwhile.
+    pub fn set_audio_mode(&mut self, mode: AudioMode) {
+        self.audio_command(AudioCommand::SetMode(mode));
+    }
+
+    /// Asks the host to set its sink to this volume, in permille of
+    /// [`VOLUME_NORM`].
+    ///
+    /// There is one volume in the session and it is the host's own. What the
+    /// client hears follows from it through [`AudioStatus::gain`], once the
+    /// host has confirmed the change.
+    pub fn set_host_volume(&mut self, permille: u16) {
+        self.audio_command(AudioCommand::SetVolume(permille));
+    }
+
+    /// Asks the host to mute or unmute its own sink.
+    ///
+    /// The host's silence, not the client's: the capture tap is ahead of the
+    /// mute, so a muted host still streams everything it is playing.
+    pub fn set_host_muted(&mut self, muted: bool) {
+        self.audio_command(AudioCommand::SetMuted(muted));
+    }
+
+    /// Queues one audio command, for a host that has audio.
+    ///
+    /// The three methods above are what a caller that is building a command
+    /// wants; this is for a caller that was handed one, which is the driver
+    /// carrying what the application asked for.
+    ///
+    /// A host that announced no audio is sent nothing. It has no capture path,
+    /// no sink control and nothing to answer with, so the command would be
+    /// traffic spent on a message that changes nothing.
+    ///
+    /// A volume is bounded here rather than where it was typed. What reads it
+    /// cubes it, so a control that let four times the maximum through would put
+    /// a sixty-fourfold gain into somebody's ears.
+    pub fn audio_command(&mut self, command: AudioCommand) {
+        if !self.host_has_audio() {
+            return;
+        }
+        let command = match command {
+            AudioCommand::SetVolume(permille) => {
+                AudioCommand::SetVolume(permille.min(VOLUME_NORM))
+            }
+            other => other,
+        };
+        self.outgoing.push_back(ClientMessage::Audio(command));
     }
 
     /// Where to draw the host's pointer, or `None` when there is nothing to
@@ -275,17 +378,23 @@ impl Session {
         self.cursor.view()
     }
 
-    /// Takes one video datagram.
+    /// Takes one media datagram.
     ///
     /// Whatever it completed, or the parity behind it rebuilt, comes out of
     /// [`Session::pop_frame`]. One datagram can finish more than one picture,
-    /// so a caller drains rather than reading a single return.
+    /// so a caller drains rather than reading a single return. A datagram of
+    /// sound finishes no picture and comes out of [`Session::pop_audio`]
+    /// instead, having been counted in the sequence like everything else: the
+    /// host paid for it and the report has to say it arrived.
     ///
     /// # Errors
-    /// If the datagram is not a video packet.
+    /// If the datagram is not a media packet.
     pub fn datagram(&mut self, datagram: &[u8], now: Instant) -> Result<(), MalformedPacket> {
-        let seq = self.video.push(datagram, now)?;
-        self.reports.record(seq, now);
+        let received = self.video.push(datagram, now)?;
+        self.reports.record(received.seq, now);
+        if let Some(sound) = received.audio {
+            self.audio.push(sound);
+        }
         self.collect(now);
         self.request_key_if_needed(now);
         self.report(now);
@@ -480,7 +589,7 @@ mod tests {
     use tachyx_proto::input::{PointerButton, Press};
     use tachyx_proto::media::FrameKind;
     use tachyx_proto::media::Seq;
-    use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
+    use tachyx_proto::packet::{audio_datagram, AccessUnit, Packetiser, Parity, Sequence};
 
     use super::*;
 
@@ -1133,6 +1242,165 @@ mod tests {
             session.liveness(start + HEARTBEAT_INTERVAL * 2),
             Liveness::Idle,
             "two missed heartbeats are not yet a fault"
+        );
+    }
+
+    /// A session with a host that has sound, which is the only host the audio
+    /// controls are offered against.
+    fn listening() -> Session {
+        let mut session = session();
+        session.greeted(HostHello::new(true));
+        session
+    }
+
+    /// One datagram of sound, stamped from the session's own counter.
+    fn opus(sequence: &Sequence, id: u32) -> Vec<u8> {
+        audio_datagram(
+            sequence.take(),
+            FrameId(id),
+            Timestamp::from_session_micros(u64::from(id) * 10_000),
+            &[u8::try_from(id % 251).expect("under a byte"); 40],
+        )
+    }
+
+    #[test]
+    fn sound_comes_back_out_in_order_and_a_hole_is_measured() {
+        let start = Instant::now();
+        let mut session = listening();
+        let sequence = Sequence::default();
+
+        for id in 0..2 {
+            session
+                .datagram(&opus(&sequence, id), start)
+                .expect("an audio packet");
+        }
+        assert!(
+            matches!(
+                session.pop_audio(),
+                Some(AudioEvent::Packet { id: FrameId(0), .. })
+            ),
+            "an unbroken stream waits for nothing"
+        );
+        assert!(matches!(
+            session.pop_audio(),
+            Some(AudioEvent::Packet { id: FrameId(1), .. })
+        ));
+        assert_eq!(session.pop_audio(), None);
+
+        // Packet two is lost. Three alone could have overtaken it; four proves
+        // it gone.
+        for id in [3, 4] {
+            session
+                .datagram(&opus(&sequence, id), start)
+                .expect("an audio packet");
+        }
+        assert_eq!(
+            session.pop_audio(),
+            Some(AudioEvent::Lost(1)),
+            "the length of the hole comes out ahead of the sound behind it"
+        );
+        assert!(matches!(
+            session.pop_audio(),
+            Some(AudioEvent::Packet { id: FrameId(3), .. })
+        ));
+
+        assert_eq!(
+            session.video_stats().frames_delivered,
+            0,
+            "sound reaches no reassembly"
+        );
+    }
+
+    #[test]
+    fn sound_the_path_swapped_is_played_in_the_order_it_was_captured() {
+        let start = Instant::now();
+        let mut session = listening();
+        let sequence = Sequence::default();
+        // The first packet of a session begins the count wherever it lands, so
+        // the swap under test is between two packets past that.
+        let opening = opus(&sequence, 0);
+        let first = opus(&sequence, 1);
+        let second = opus(&sequence, 2);
+        for datagram in [&opening, &second, &first] {
+            session.datagram(datagram, start).expect("an audio packet");
+        }
+        let played: Vec<_> = std::iter::from_fn(|| session.pop_audio())
+            .map(|event| match event {
+                AudioEvent::Packet { id, .. } => id,
+                AudioEvent::Lost(_) => panic!("nothing was lost, only reordered"),
+            })
+            .collect();
+        assert_eq!(played, vec![FrameId(0), FrameId(1), FrameId(2)]);
+    }
+
+    #[test]
+    fn every_datagram_of_sound_is_reported_to_the_host() {
+        let start = Instant::now();
+        let mut session = listening();
+        let sequence = Sequence::default();
+        for id in 0..4 {
+            session
+                .datagram(&opus(&sequence, id), start)
+                .expect("an audio packet");
+        }
+        session.expire(start + FEEDBACK_INTERVAL);
+        let last = reports(&mut session).pop().expect("arrivals owe a report");
+        assert_eq!(
+            last.received, 4,
+            "the host paid for those datagrams and the report has to account for them"
+        );
+        assert_eq!(last.lost, 0);
+    }
+
+    #[test]
+    fn what_the_host_says_about_sound_is_kept_as_the_host_said_it() {
+        let now = Instant::now();
+        let mut session = listening();
+        assert_eq!(session.audio_status(), None);
+
+        let status = AudioStatus {
+            mode: AudioMode::Exclusive,
+            volume: 650,
+            muted: true,
+        };
+        session.host(HostMessage::Audio(status), now, RTT);
+        assert_eq!(session.audio_status(), Some(status));
+        assert_eq!(
+            session.liveness(now),
+            Liveness::Idle,
+            "a status is a word from the host, so the host is not lost"
+        );
+    }
+
+    #[test]
+    fn the_audio_controls_reach_the_host_and_the_volume_is_bounded() {
+        let mut session = listening();
+        session.set_audio_mode(AudioMode::Shared);
+        session.set_host_volume(4_000);
+        session.set_host_muted(true);
+        assert_eq!(
+            queued(&mut session),
+            vec![
+                ClientMessage::Audio(AudioCommand::SetMode(AudioMode::Shared)),
+                ClientMessage::Audio(AudioCommand::SetVolume(VOLUME_NORM)),
+                ClientMessage::Audio(AudioCommand::SetMuted(true)),
+            ],
+            "what reads a volume cubes it, so four times the control is a \
+             thousandfold in somebody's ears"
+        );
+    }
+
+    #[test]
+    fn a_host_without_sound_is_sent_no_commands_about_it() {
+        let mut session = session();
+        session.greeted(HostHello::new(false));
+        assert!(!session.host_has_audio());
+        session.set_audio_mode(AudioMode::Shared);
+        session.set_host_volume(500);
+        session.set_host_muted(false);
+        assert!(
+            queued(&mut session).is_empty(),
+            "a host with no capture path has nothing to answer with"
         );
     }
 }

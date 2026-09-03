@@ -2,9 +2,11 @@
 # ask for backticks around them. `..` keeps clippy's own list.
 doc-valid-idents = [
   "..",
+  "AAudio",
   "GStreamer",
   "GBM",
   "DMA-BUF",
+  "PipeWire",
   "VA-API",
   "Wayland",
 ]

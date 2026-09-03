@@ -41,7 +41,7 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{
 };
 
 use crate::slot::Slot;
-use crate::{Error, Framerate, Size};
+use crate::{Clock, Error, Framerate, Size, monotonic_nanos};
 
 /// The modifier the protocol uses for "any layout the allocator likes", which
 /// no allocator can be asked to produce.
@@ -285,6 +285,9 @@ pub struct CursorImage {
 #[derive(Debug)]
 pub struct Capture {
     format: CaptureFormat,
+    /// The epoch every frame of this session is stamped against, handed out so
+    /// that sound counts from the same instant. See [`Clock`].
+    clock: Clock,
     counters: Arc<Counters>,
     cursor: Arc<Mutex<Cursor>>,
     stop: OwnedFd,
@@ -304,6 +307,10 @@ impl Capture {
     /// not have, or shares no buffer layout with the encoder.
     pub fn start(output: &str) -> Result<(Self, Frames), Error> {
         gstreamer::init()?;
+        // Started before the thread rather than inside it, because it is the
+        // session's clock and not capture's: whatever else the session captures
+        // is stamped against this same instant.
+        let clock = Clock::now();
         let stop = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
         let wake = stop.try_clone()?;
 
@@ -319,13 +326,17 @@ impl Capture {
             let cursor = Arc::clone(&cursor);
             std::thread::Builder::new()
                 .name("tachyx-capture".to_owned())
-                .spawn(move || run(&output, wake, &slot, &counters, &cursor, &ready))?
+                .spawn(move || {
+                    tachyx_sched::raise("capture");
+                    run(&output, wake, clock, &slot, &counters, &cursor, &ready)
+                })?
         };
 
         match started.recv() {
             Ok(Ok(format)) => Ok((
                 Self {
                     format: format.clone(),
+                    clock,
                     counters,
                     cursor,
                     stop,
@@ -342,6 +353,16 @@ impl Capture {
     #[must_use]
     pub const fn format(&self) -> &CaptureFormat {
         &self.format
+    }
+
+    /// The epoch every frame of this session is stamped against.
+    ///
+    /// Hand it to anything else the session captures. Two pipelines counting
+    /// from their own starts produce two timestamps a receiver cannot lay
+    /// against each other.
+    #[must_use]
+    pub const fn clock(&self) -> Clock {
+        self.clock
     }
 
     /// Counters since the session began.
@@ -397,17 +418,6 @@ impl Drop for Capture {
         if let Ok(Err(error)) = thread.join() {
             tracing::warn!(%error, "capture ended in an error");
         }
-    }
-}
-
-fn monotonic_nanos() -> u64 {
-    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "CLOCK_MONOTONIC counts up from an unspecified point in the past"
-    )]
-    {
-        now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
     }
 }
 
@@ -746,7 +756,7 @@ struct Pump {
     /// compositor will not fill is said once rather than once a turn.
     refused: bool,
     size: Size,
-    epoch: u64,
+    clock: Clock,
     next_id: u64,
 }
 
@@ -878,6 +888,7 @@ impl CursorImage {
 fn run(
     output: &str,
     stop: OwnedFd,
+    clock: Clock,
     slot: &Arc<Slot<Frame>>,
     counters: &Arc<Counters>,
     cursor: &Arc<Mutex<Cursor>>,
@@ -888,13 +899,14 @@ fn run(
     // clean return would leave one blocked for ever on any other ending.
     let _closing = CloseOnDrop(slot);
     let mut state = State::default();
-    let (mut pump, format) = match Pump::setup(output, stop, slot, counters, cursor, &mut state) {
-        Ok(started) => started,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return Ok(());
-        }
-    };
+    let (mut pump, format) =
+        match Pump::setup(output, stop, clock, slot, counters, cursor, &mut state) {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return Ok(());
+            }
+        };
     if ready.send(Ok(format)).is_err() {
         return Ok(());
     }
@@ -914,6 +926,7 @@ impl Pump {
     fn setup(
         output: &str,
         stop: OwnedFd,
+        clock: Clock,
         slot: &Arc<Slot<Frame>>,
         counters: &Arc<Counters>,
         cursor: &Arc<Mutex<Cursor>>,
@@ -1028,7 +1041,7 @@ impl Pump {
             shapes: Shapes::new(scale),
             refused: false,
             size,
-            epoch: monotonic_nanos(),
+            clock,
             next_id: 0,
         };
         pump.arm(0);
@@ -1116,7 +1129,7 @@ impl Pump {
         self.next_id += 1;
         Ok(Frame {
             id,
-            captured: Timestamp::from_session_micros(presented.saturating_sub(self.epoch) / 1000),
+            captured: self.clock.stamp(presented),
             presented_nanos: presented,
             fd: self.buffers[index].fd.try_clone()?,
             lease: Lease {
@@ -1278,14 +1291,23 @@ impl Pump {
 }
 
 impl State {
+    /// The output `wanted` names, or the first one the compositor reported when
+    /// it names nothing.
+    ///
+    /// An empty name is what an unconfigured host asks for, and the
+    /// configuration documents it as the first output. Comparing the empty
+    /// string against every monitor's name instead matches nothing, so a host
+    /// nobody had configured refused every session with "no output named".
     fn find_output(&self, wanted: &str) -> Result<(wl_output::WlOutput, Framerate), Error> {
         let output = self
             .outputs
             .iter()
             .find(|output| {
-                self.names
-                    .get(&output.id().protocol_id())
-                    .is_some_and(|name| name == wanted)
+                wanted.is_empty()
+                    || self
+                        .names
+                        .get(&output.id().protocol_id())
+                        .is_some_and(|name| name == wanted)
             })
             .ok_or_else(|| Error::NoSuchOutput(wanted.to_owned()))?;
         let refresh = self

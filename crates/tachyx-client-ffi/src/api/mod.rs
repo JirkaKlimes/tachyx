@@ -5,6 +5,8 @@
 //! `tachyx-client`. A rule that lives here is a rule the tests in that crate
 //! cannot reach.
 
+pub mod audio;
 pub mod input;
+pub mod pairing;
 pub mod session;
 pub mod video;

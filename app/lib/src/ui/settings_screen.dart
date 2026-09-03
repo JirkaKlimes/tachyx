@@ -1,12 +1,11 @@
 /// The user's choices: what a stream may cost, how the trackpad feels, and
-/// which hosts are kept.
+/// which relays are asked.
 library;
 
 import 'package:flutter/material.dart';
 
-import 'package:tachyx/src/session/link.dart';
 import 'package:tachyx/src/settings.dart';
-import 'package:tachyx/src/ui/host_list.dart';
+import 'package:tachyx/src/ui/relay_list.dart';
 import 'package:tachyx/src/ui/theme.dart';
 
 /// The settings screen.
@@ -18,15 +17,11 @@ class SettingsScreen extends StatelessWidget {
   /// A screen over [settings].
   const SettingsScreen({
     required this.settings,
-    required this.onConnect,
     super.key,
   });
 
   /// What is being edited.
   final Settings settings;
-
-  /// Called with an address when the user connects from here.
-  final ValueChanged<String> onConnect;
 
   @override
   Widget build(BuildContext context) => Material(
@@ -120,18 +115,24 @@ class SettingsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 28),
-                  const Text('hosts', style: label),
+                  const Text('relays', style: label),
                   const SizedBox(height: 10),
-                  HostList(
-                    // Settings is reachable only while nothing is being
-                    // dialled, so the list here never has a state to report.
-                    hosts: settings.hosts,
-                    state: const Offline(),
-                    onConnect: onConnect,
-                    onForget: settings.forgetHost,
+                  const Text(
+                    'where this client looks for a host that is not on this '
+                    'network. a relay carries ciphertext it cannot read.',
+                    style: TextStyle(
+                      color: Shade.dim,
+                      fontSize: 12,
+                      height: 1.5,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  RelayList(
+                    relays: settings.relays,
+                    onForget: settings.forgetRelay,
                   ),
                   const SizedBox(height: 14),
-                  AddHostForm(onAdd: settings.keepHost),
+                  AddRelayForm(onAdd: settings.keepRelay),
                 ],
               ),
             ),

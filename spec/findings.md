@@ -399,6 +399,69 @@ across the resolution change in the middle of it.
 "Second unit" rather than "next" is the frame that was already inside the
 pipeline when the property was set, not a delay in applying it.
 
+### Nothing schedules a key frame any more
+
+Two mechanisms used to force one every two seconds: `key-int-max` in the encoder,
+counted in pictures, and a wall clock in the daemon beside it. Both are gone.
+
+`gst-inspect-1.0` gives `key-int-max` a range of 0 to 1024 on `vah264enc` and on
+`vaav1enc`, and 0 means the element chooses an interval rather than none, so 1024
+is as close to an infinite group of pictures as the property reaches. Measured on
+DP-2 at 2580x1080 and 8 Mbit/s over 400 pictures: **0 key frames** at 1024
+against 2 at a two-second interval. A test in `encode.rs` reads the property back
+off the real element afterwards, because a value out of range is clamped by
+GObject with only a warning and would schedule key frames again in silence.
+
+What one costs, measured over 1437 pictures of the same content: **key frames
+average 287.2 kB and delta frames 30.2 kB**, a ratio of 9.5. At 75 Hz a
+two-second interval is one key frame in 150 pictures, so it was 5.4% of the
+stream. The figure at 1080p60 in the pacing section below, 130.4 kB against
+16.7 kB, gives 5.7% the same way.
+
+The latency it cost is larger than the bitrate and is measured under
+"Loopback, measured" above: the pacer charges what a key frame borrowed to the
+two delta frames behind it, so the 99th percentile of capture to delivery was
+18.2 ms with a key frame every second and **5.5 ms** with one at the start.
+
+The client does not need them. The frame identifier counts encoded pictures and
+skips none, so a frame that lost every packet leaves a hole that the next picture
+reveals, and the client asks. One case escapes that rule and it is the reason
+`repair_if_stale` still exists: a frame that loses every packet and is followed
+by **no picture at all** reveals nothing, and capture blocks until the screen
+changes, so a still desktop is exactly where that happens. The repair now fires
+only when the client has reported a datagram missing and nothing has gone out
+since, which is that case and no other. On a busy screen it never fires, because
+a later picture always reveals the hole first; on a clean link it never fires,
+because nothing was lost. The one thing it does not cover is a client that is
+holding a broken picture and cannot say so, which cannot happen: the receiver
+report is per datagram and travels on the reliable stream.
+
+### The coded picture buffer cannot be made smaller than half a second
+
+Measured, `bitrate=8000` and `target-percentage=100` so the peak is 8 Mbit/s,
+reading `vah264enc`'s own log:
+
+| `cpb-size` asked for | what the encoder used |
+|---|---|
+| 4000 kb | 4,000,000 bits, which is 500 ms |
+| 3999 kb | "Too small cpb_size: 3999", "Adjust cpb_size to: 16000", which is 2000 ms |
+| 133 kb, one frame at 60 Hz | the same 16000, which is 2000 ms |
+
+`vaav1enc` refuses identically, in `_av1_calculate_bitrate_hrd`.
+
+So the floor is exactly half the peak bitrate, and below it there is a cliff
+rather than a clamp: one kilobit under and the buffer becomes **four times** what
+was asked for. `target-percentage` does not help, because the peak is what the
+session has to be able to send. **A one-frame buffer, which is what Sunshine
+sizes its VBV to, is unreachable through this element at any operating point.**
+At 8 Mbit/s and 60 Hz one frame is 133 kb and the floor is 4000, thirty times
+larger.
+
+This is the measurement the `cros-libva` decision needs. That backend reaches the
+buffer through `VAEncMiscParameterTypeHRD` and reaches intra refresh through the
+same road, so the two prizes are on one route, and the buffer is what makes a key
+frame 130 kB in the first place.
+
 ## Input injection
 
 `zwlr_virtual_pointer_manager_v1` version 2 and `zwp_virtual_keyboard_manager_v1`
@@ -549,6 +612,24 @@ figures come from.
 | BBR pacing rate | 670, 721, 280 Mbit/s |
 | Congestion events | 0 |
 
+Re-run on the newer development shell to price the scheduled key frame, three
+runs each on an otherwise idle machine, everything else the same:
+
+| key frames | median | 99th percentile | worst |
+|---|---|---|---|
+| one every 60 frames | 1.49, 1.30, 1.46 ms | 18.36, 17.96, 18.38 ms | 26.33, 26.36, 27.33 ms |
+| one at the start | 1.36, 1.42, 1.33 ms | **5.50, 5.09, 5.86 ms** | 26.49, 26.43, 27.19 ms |
+
+The median does not move and the worst case does not move: the worst case is the
+opening key frame, which both shapes pay and which is unavoidable. What moves is
+the 99th percentile, by 12.5 ms, and the reason is not the key frame's own 26 ms
+span. `Pacer::release` charges bytes whether the caller waits or not, so the two
+delta frames behind a key frame pay off what it borrowed, and at one key frame a
+second that is three frames in every sixty. The bytes moved with it: 26.74 Mbit
+against 24.92 for the same 180 frames.
+
+The test now sends the second shape, because that is what the host sends.
+
 Capture to delivery is measured from the moment the frame was due to be sent, so
 it holds the sender's own scheduling and none of the encoder. On an idle machine
 the transport costs about one and a half milliseconds of the ten to twenty
@@ -624,6 +705,100 @@ sequence numbers separates it from the frame boundary around it. The frame
 identifiers are what say it happened, which is why the host must number every
 picture it encodes and skip none. That rule and its consequences are in
 [`protocol.md`](protocol.md).
+
+### Segmentation was off for every session, including the ones with no relay
+
+`RoutingSocket::max_transmit_segments` answered 1, and the comment gave an honest
+reason: the socket carries direct and relayed traffic on one port, and a relay
+reads a nine-byte header and forwards what is behind it, so a segmented transmit
+handed to one arrives as pieces of which only the first carries a header.
+
+The consequence was wider than the reason. Both production endpoints are built
+through this socket, so the answer of 1 turned segmentation off for the five
+sessions in six that never touch a relay. Measured on this machine: the socket
+underneath reports **64** segments.
+
+The taking apart now happens in `try_send`, where the destination is known, so
+only the relayed path pays for it and the direct path passes the transmit through
+whole. Where it bites is the pacer's burst allowance, which is 25,000 bytes or
+about seventeen datagrams handed over back to back: seventeen system calls where
+one will do, and four times that at a raised ceiling. That is processor time on
+the machine that is also capturing and encoding, not latency, and it has not been
+measured end to end: no test drives a high send rate through the routing socket,
+because the host half of every harness binds a plain one.
+
+Only the first datagram of a relayed transmit may report a failure back. quinn
+answers `WouldBlock` by waiting and offering the whole transmit again, so
+reporting one half way through would put the datagrams already sent on the wire
+twice.
+
+## The threads that carry the picture are ordinary threads
+
+`spec/findings.md` has said since the loopback runs above that the transport's
+own 99th percentile moves from 2.5 ms to 7.9 ms when the machine is busy, and
+that the round trip moves with it, so the cost is the scheduler rather than the
+network. Nothing in the tree set a thread priority.
+
+### A nice level does not fix it. The realtime class does
+
+Measured by `crates/tachyx-sched/examples/wake.rs` on the target machine, which
+is what a thread on this path really does: sleep for one millisecond and then
+run. 20,000 wake-ups against 64 spinning processes on 16 hardware threads, each
+process in a session of its own.
+
+| | p50 | p90 | p99 | worst |
+|---|---|---|---|---|
+| ordinary | 0.006 ms | 0.016 ms | 2.977 ms | 46.409 ms |
+| nice -11 through RealtimeKit | 0.007 ms | 0.017 ms | 2.987 ms | 30.115 ms |
+| `SCHED_RR` 5 through RealtimeKit | 0.006 ms | 0.015 ms | **0.018 ms** | **0.047 ms** |
+
+Two repeats of the shipped path against the same load gave a 99th percentile of
+0.018 ms both times, against 3.000 and 2.990 ms unraised, and a worst case of
+0.150 and 0.034 ms against 99.724 and 53.169 ms.
+
+**The nice level buys nothing above the ninetieth percentile.** The reason is
+`kernel.sched_autogroup_enabled`, which is 1 here and on every desktop
+distribution: the fair scheduler shares the processor between session groups
+first and between the threads inside a group second, so a thread's nice level
+orders it against its own siblings and says nothing about the compile in the next
+terminal. An earlier version of this measurement spun the load up inside the same
+process, which put it in the same autogroup, and made a nice level look like it
+worked. That was the wrong experiment.
+
+The realtime class sits above the whole of the fair scheduler and is the only
+lever that reaches the case the tail comes from. It is also what PipeWire asks
+the same broker for.
+
+### RealtimeKit is the only unprivileged way in
+
+Measured on the target machine: `ulimit -e` and `ulimit -r` are both 0 soft and 0
+hard, so `setpriority` below nought and `sched_setscheduler` are both refused for
+an ordinary login. A `setpriority` fallback would be a call that always fails.
+`rtkit-daemon` is running on the system bus here and on every desktop that runs
+PipeWire, which this host already needs for sound.
+
+Three bounds keep a realtime thread from taking the machine down, and none of
+them is ours. `kernel.sched_rt_runtime_us` is 950,000 of 1,000,000, so five per
+cent of every processor is reserved for ordinary threads. `RLIMIT_RTTIME`, which
+the broker refuses to promote a thread without and which is 200 ms here, is the
+kernel's dead-man switch on a thread that holds a processor without blocking. And
+the priority asked for is 5 of the 20 the broker allows, so the sound server and
+the kernel's interrupt threads still outrank us.
+
+Raised: capture, encode, the sound pump, the host's release loop, and both of the
+client's runtime workers. Every one of them blocks on something within a frame.
+
+### The client can now see the host's half
+
+`Heartbeat.pipeline_micros` existed in the protocol and the host wrote zero into
+it. It now carries the median capture-to-wire time over the heartbeat interval,
+measured in the release loop after the pacer has let the last datagram of the
+picture go, because a picture is worth nothing until its last datagram. It is an
+elapsed time and not an instant, so it needs no clock agreement between the two
+ends, which is the whole reason Sunshine reports it that way.
+
+It is also on the row `tachyx-hostd status` prints, so an operator can attribute
+a session's latency without a client that displays it.
 
 ## Discovery
 

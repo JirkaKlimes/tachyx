@@ -87,21 +87,17 @@ clear message.
 
 ### The key frame interval is counted against a frame rate the encoder is not running at
 
-`encode.rs:756` sets `key-int-max` to `KEY_FRAME_INTERVAL_SECONDS * 60`. The
-constant is documented at `encode.rs:54-60` as "how long a lost frame may leave
-the picture wrong", which is a time, and the property is a frame count. The 60
-that converts one into the other is not this machine's refresh rate, which is 75
-or 120, and it is not the declared rate either, which the ladder moves between
-75, 37.5, 25, 18.75 and 15 frames a second.
+**Closed, and not the way this section proposed.** The reading was right: the
+property counted pictures while the comment above it promised a time, so the two
+seconds were 1.6 at full rate on DP-2 and eight at the ladder's slowest rung.
+The proposed fix was to convert the time into a frame count properly.
 
-So the two seconds the comment promises is 1.6 seconds at full rate on DP-2, and
-eight seconds at the ladder's slowest rung, which is exactly the moment the link
-is bad and a stale picture costs most. The property is also set once, in
-`configure_encoder`, and never rewritten when the ladder changes the declared
-rate.
-
-The value should be `KEY_FRAME_INTERVAL_SECONDS * declared_fps`, applied
-alongside the rate in `apply_rate`. The declared rate is already in hand there.
+Measuring it settled a prior question instead. The encoder now schedules no key
+frame at all: `key-int-max` is the element's own ceiling of 1024 pictures,
+written once in `configure_encoder` because it no longer depends on the rate.
+See "Nothing schedules a key frame any more" in [`findings.md`](findings.md) for
+what was measured and for the one recovery case that a scheduled key frame was
+really covering.
 
 ### The dead host threshold is sixteen heartbeats, and four places say three
 

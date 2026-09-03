@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// session without a restart.
 class Settings extends ChangeNotifier {
   static const String _hostsKey = 'tachyx.hosts';
+  static const String _relaysKey = 'tachyx.relays';
   static const String _bitrateKey = 'tachyx.stream.maxBitrate';
   static const String _sensitivityKey = 'tachyx.pad.sensitivity';
   static const String _pointerAccelKey = 'tachyx.pad.acceleration';
@@ -19,6 +20,20 @@ class Settings extends ChangeNotifier {
 
   /// Where a run before the hosts list existed kept its one address.
   static const String _legacyAddressKey = 'tachyx.host.address';
+
+  /// The relay a client looks for a host through before it has been told
+  /// otherwise.
+  ///
+  /// Written `address:port#KEY`, because a relay address without its key would
+  /// have to be trusted on first sight, and that is the one moment trust on
+  /// first sight cannot defend. Pairing carries the authenticated copy, so this
+  /// only has to be right often enough to reach the mailbox.
+  ///
+  /// Provisional: it points at the machine this was developed on. Both halves
+  /// change when a relay is deployed somewhere that stays up. Nothing else in
+  /// the app may name a relay address; this is the one place.
+  static const String defaultRelay =
+      '100.64.0.2:47990#27JOBTX5HG5UTF5ELHXL6YLX26EKX3PH6O4S7V4IT3VGMV37LV5Q';
 
   /// The default cap, matching the client core's own ceiling.
   ///
@@ -54,6 +69,7 @@ class Settings extends ChangeNotifier {
   static const double defaultPointerAccel = 0.3;
 
   List<String> _hosts = <String>[];
+  List<String> _relays = <String>[defaultRelay];
   int _streamBitrate = defaultMaxBitrate;
   double _sensitivity = 1;
   double _pointerAccel = defaultPointerAccel;
@@ -61,6 +77,9 @@ class Settings extends ChangeNotifier {
 
   /// The hosts the user has kept, most recently used first.
   List<String> get hosts => List<String>.unmodifiable(_hosts);
+
+  /// The relays this client looks for a host through, tried in order.
+  List<String> get relays => List<String>.unmodifiable(_relays);
 
   /// The most a stream may cost, in bits per second.
   int get streamBitrate => _streamBitrate;
@@ -87,6 +106,10 @@ class Settings extends ChangeNotifier {
       await store.setStringList(_hostsKey, _hosts);
       await store.remove(_legacyAddressKey);
     }
+    // A user who has removed every relay has removed every relay, so an empty
+    // stored list is kept. Only a client that has never been asked gets the
+    // default, which is what the missing key means.
+    _relays = store.getStringList(_relaysKey) ?? <String>[defaultRelay];
     _streamBitrate = (store.getInt(_bitrateKey) ?? defaultMaxBitrate).clamp(
       minBitrate,
       maxBitrate,
@@ -139,6 +162,30 @@ class Settings extends ChangeNotifier {
     notifyListeners();
     final SharedPreferences store = await SharedPreferences.getInstance();
     await store.setStringList(_hostsKey, _hosts);
+  }
+
+  /// Keeps [relay], at the top of the list, as `address:port#KEY`.
+  ///
+  /// Adding one the list holds moves it up rather than doubling it, which is
+  /// also what a successful rendezvous calls to keep the list in the order that
+  /// worked.
+  Future<void> keepRelay(String relay) async {
+    final String trimmed = relay.trim();
+    if (trimmed.isEmpty) return;
+    _relays
+      ..remove(trimmed)
+      ..insert(0, trimmed);
+    notifyListeners();
+    final SharedPreferences store = await SharedPreferences.getInstance();
+    await store.setStringList(_relaysKey, _relays);
+  }
+
+  /// Forgets [relay].
+  Future<void> forgetRelay(String relay) async {
+    if (!_relays.remove(relay)) return;
+    notifyListeners();
+    final SharedPreferences store = await SharedPreferences.getInstance();
+    await store.setStringList(_relaysKey, _relays);
   }
 
   /// Forgets [address].

@@ -5,18 +5,33 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:tachyx/src/input/touchpad.dart';
+import 'package:tachyx/src/rust/api/audio.dart' show AudioMode, AudioStats;
 import 'package:tachyx/src/rust/api/input.dart';
 import 'package:tachyx/src/rust/api/session.dart'
     show Encoding, HostReport, Liveness, SessionStats, VideoStats;
+import 'package:tachyx/src/rust/api/pairing.dart' show KnownHostView;
 import 'package:tachyx/src/rust/api/video.dart' show Latency, PresentStats;
+import 'package:tachyx/src/session/hosts.dart';
 import 'package:tachyx/src/session/link.dart';
 import 'package:tachyx/src/settings.dart';
+import 'package:tachyx/src/ui/audio.dart';
 import 'package:tachyx/src/ui/connect_screen.dart';
 import 'package:tachyx/src/ui/session_screen.dart';
 import 'package:tachyx/src/ui/settings_screen.dart';
 import 'package:tachyx/src/ui/stats_overlay.dart';
 
 Widget _wrap(Widget child) => MaterialApp(home: child);
+
+/// A paired host, as the client core would report one.
+KnownHostView _host({String name = 'desk', String device = 'ABCD1234'}) =>
+    KnownHostView(
+      device: device,
+      short: 'ABCD-1234-EFGH',
+      name: name,
+      endpoints: const <String>[],
+      control: true,
+      unattended: true,
+    );
 
 /// A settings store over mocked preferences, restored so its listeners work.
 Future<Settings> _settings({
@@ -42,6 +57,26 @@ VideoStats _video() => VideoStats(
   framesUndecodable: BigInt.from(2),
 );
 
+/// A host that can stream its sound, with the play path counting normally.
+AudioStats _audio({
+  bool hostHasAudio = true,
+  AudioMode mode = AudioMode.off,
+  int volume = 500,
+  bool muted = false,
+}) => AudioStats(
+  hostHasAudio: hostHasAudio,
+  mode: mode,
+  volume: volume,
+  muted: muted,
+  packets: BigInt.from(900),
+  lost: BigInt.from(2),
+  played: BigInt.from(896),
+  concealed: BigInt.from(2),
+  recovered: BigInt.one,
+  dropped: BigInt.zero,
+  buffered: 2,
+);
+
 Latency _latency(int median) => Latency(
   minUs: median - 100,
   medianUs: median,
@@ -52,11 +87,13 @@ Latency _latency(int median) => Latency(
 SessionStats _stats({
   Liveness liveness = Liveness.streaming,
   bool presenting = true,
+  AudioStats? audio,
 }) => SessionStats(
   liveness: liveness,
   rttUs: 1234,
   batches: BigInt.from(9),
   video: _video(),
+  audio: audio ?? _audio(),
   encoding: const Encoding(
     codec: 'AV1',
     codedWidth: 1920,
@@ -231,127 +268,109 @@ void main() {
   });
 
   group('the connect screen', () {
-    testWidgets('a kept host connects with one tap', (
+    Widget screen({
+      required HostBook book,
+      Link state = const Offline(),
+      ValueChanged<KnownHostView>? onDial,
+      VoidCallback? onPair,
+      required Settings settings,
+    }) => _wrap(
+      ConnectScreen(
+        state: state,
+        protocolVersion: 1,
+        settings: settings,
+        book: book,
+        onDial: onDial ?? (KnownHostView _) {},
+        onPair: onPair ?? () {},
+        onDetach: () {},
+      ),
+    );
+
+    testWidgets('a paired host connects with one tap', (
       WidgetTester tester,
     ) async {
-      final Settings settings = await _settings(
-        hosts: <String>['10.0.0.4:9999'],
-      );
-      String? dialled;
+      final List<String> dialled = <String>[];
       await tester.pumpWidget(
-        _wrap(
-          ConnectScreen(
-            state: const Offline(),
-            protocolVersion: 1,
-            settings: settings,
-            onDial: (String address) => dialled = address,
-            onDetach: () {},
-          ),
+        screen(
+          book: HostBook.of(<KnownHostView>[_host()]),
+          settings: await _settings(),
+          onDial: (KnownHostView host) => dialled.add(host.device),
         ),
       );
 
-      await tester.tap(find.text('10.0.0.4:9999'));
-      await tester.pump();
-
-      expect(dialled, '10.0.0.4:9999');
-    });
-
-    testWidgets('an empty list opens the add form and explains itself', (
-      WidgetTester tester,
-    ) async {
-      final Settings settings = await _settings();
-      await tester.pumpWidget(
-        _wrap(
-          ConnectScreen(
-            state: const Offline(),
-            protocolVersion: 1,
-            settings: settings,
-            onDial: (String address) {},
-            onDetach: () {},
-          ),
-        ),
-      );
-
-      expect(find.textContaining('no hosts yet'), findsOneWidget);
-      expect(find.text('add host'), findsOneWidget);
-
-      await tester.enterText(find.byType(TextField).first, '10.0.0.7');
-      await tester.tap(find.text('add host'));
-      await tester.pump();
-
-      expect(settings.hosts, <String>['10.0.0.7:${HostLink.defaultPort}']);
-    });
-
-    testWidgets('a host can be forgotten', (WidgetTester tester) async {
-      final Settings settings = await _settings(
-        hosts: <String>['10.0.0.4:9999'],
-      );
-      await tester.pumpWidget(
-        _wrap(
-          ConnectScreen(
-            state: const Offline(),
-            protocolVersion: 1,
-            settings: settings,
-            onDial: (String address) {},
-            onDetach: () {},
-          ),
-        ),
-      );
-
-      await tester.tap(find.byTooltip('forget'));
-      await tester.pump();
-
-      expect(settings.hosts, isEmpty);
-      expect(find.textContaining('no hosts yet'), findsOneWidget);
-    });
-
-    testWidgets('a refusal is shown in the words the client was given, '
-        'on the row that refused', (WidgetTester tester) async {
-      final Settings settings = await _settings(
-        hosts: <String>['10.0.0.4:4433'],
-      );
-      await tester.pumpWidget(
-        _wrap(
-          ConnectScreen(
-            state: const Refused(
-              '10.0.0.4:4433',
-              'the QUIC transport is not implemented yet',
-            ),
-            protocolVersion: 1,
-            settings: settings,
-            onDial: (String address) {},
-            onDetach: () {},
-          ),
-        ),
-      );
-
+      expect(find.text('desk'), findsOneWidget);
       expect(
-        find.text('the QUIC transport is not implemented yet'),
+        find.text('ABCD-1234-EFGH'),
         findsOneWidget,
+        reason: 'a name is the peer\'s word, so the identifier is shown too',
       );
+      await tester.tap(find.text('desk'));
+      expect(dialled, <String>['ABCD1234']);
+    });
+
+    testWidgets('an empty list says how to begin, which is pairing', (
+      WidgetTester tester,
+    ) async {
+      bool asked = false;
+      await tester.pumpWidget(
+        screen(
+          book: HostBook.of(<KnownHostView>[]),
+          settings: await _settings(),
+          onPair: () => asked = true,
+        ),
+      );
+
+      expect(find.textContaining('no hosts yet'), findsOneWidget);
+      await tester.tap(find.text('+ pair with a host'));
+      expect(
+        asked,
+        isTrue,
+        reason:
+            'an address cannot be typed in: only a pairing puts this '
+            'client\'s key on the host',
+      );
+    });
+
+    testWidgets('a refusal is shown in the words the client was given', (
+      WidgetTester tester,
+    ) async {
+      await tester.pumpWidget(
+        screen(
+          book: HostBook.of(<KnownHostView>[_host()]),
+          settings: await _settings(),
+          state: const Refused('ABCD1234', 'desk', 'peer speaks version 7'),
+        ),
+      );
+
+      expect(find.text('peer speaks version 7'), findsOneWidget);
+    });
+
+    testWidgets('the row being dialled says so', (WidgetTester tester) async {
+      await tester.pumpWidget(
+        screen(
+          book: HostBook.of(<KnownHostView>[_host()]),
+          settings: await _settings(),
+          state: const Dialling('ABCD1234', 'desk'),
+        ),
+      );
+
+      expect(find.text('dialling…'), findsOneWidget);
     });
 
     testWidgets('dialling cannot be started twice', (
       WidgetTester tester,
     ) async {
-      final Settings settings = await _settings(
-        hosts: <String>['10.0.0.4:4433'],
-      );
       int dials = 0;
       await tester.pumpWidget(
-        _wrap(
-          ConnectScreen(
-            state: const Dialling('10.0.0.4:4433'),
-            protocolVersion: 1,
-            settings: settings,
-            onDial: (String address) => dials++,
-            onDetach: () {},
-          ),
+        screen(
+          book: HostBook.of(<KnownHostView>[_host()]),
+          settings: await _settings(),
+          state: const Dialling('ABCD1234', 'desk'),
+          onDial: (KnownHostView _) => dials += 1,
         ),
       );
 
-      expect(find.text('dialling…'), findsOneWidget);
-      await tester.tap(find.text('10.0.0.4:4433'));
+      await tester.tap(find.text('desk'), warnIfMissed: false);
       await tester.pump();
 
       expect(dials, 0);
@@ -363,9 +382,7 @@ void main() {
       WidgetTester tester,
     ) async {
       final Settings settings = await _settings();
-      await tester.pumpWidget(
-        _wrap(SettingsScreen(settings: settings, onConnect: (String _) {})),
-      );
+      await tester.pumpWidget(_wrap(SettingsScreen(settings: settings)));
 
       expect(find.text('20 Mbit/s'), findsOneWidget, reason: 'the default cap');
       expect(find.text('1.0×'), findsOneWidget, reason: 'default sensitivity');
@@ -380,28 +397,24 @@ void main() {
       );
     });
 
-    testWidgets('hosts can be added and removed here too', (
+    testWidgets('relays can be added and removed here', (
       WidgetTester tester,
     ) async {
-      final Settings settings = await _settings(
-        hosts: <String>['10.0.0.4:9999'],
-      );
-      await tester.pumpWidget(
-        _wrap(SettingsScreen(settings: settings, onConnect: (String _) {})),
-      );
+      final Settings settings = await _settings();
+      await tester.pumpWidget(_wrap(SettingsScreen(settings: settings)));
 
-      // The screen scrolls, so the hosts at the foot of it need bringing into
+      // The screen scrolls, so the relays at the foot of it need bringing into
       // view before they can be touched. A test window is smaller than a phone.
-      await tester.ensureVisible(find.byTooltip('forget'));
-      await tester.tap(find.byTooltip('forget'));
+      await tester.ensureVisible(find.byTooltip('remove'));
+      await tester.tap(find.byTooltip('remove'));
       await tester.pump();
-      expect(settings.hosts, isEmpty);
+      expect(settings.relays, isEmpty);
 
-      await tester.enterText(find.byType(TextField).first, 'desk.local');
-      await tester.ensureVisible(find.text('add host'));
-      await tester.tap(find.text('add host'));
+      await tester.enterText(find.byType(TextField).last, '10.0.0.9:47990#KEY');
+      await tester.ensureVisible(find.text('+ add relay'));
+      await tester.tap(find.text('+ add relay'));
       await tester.pump();
-      expect(settings.hosts, <String>['desk.local:${HostLink.defaultPort}']);
+      expect(settings.relays, <String>['10.0.0.9:47990#KEY']);
     });
   });
 
@@ -458,7 +471,8 @@ void main() {
       expect(
         tester.getSize(find.byType(TouchSurface)),
         tester.view.physicalSize / tester.view.devicePixelRatio,
-        reason: 'the host encodes for the viewport the client named, so the '
+        reason:
+            'the host encodes for the viewport the client named, so the '
             'video has to be the whole of it',
       );
 
@@ -576,6 +590,205 @@ void main() {
       expect(controls(), findsOneWidget, reason: 'the tap opened the dock');
 
       await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('with no host there is no sound to offer', (
+      WidgetTester tester,
+    ) async {
+      await pumpSession(tester);
+
+      expect(
+        find.byTooltip('audio: unavailable'),
+        findsOneWidget,
+        reason: 'the control says it cannot be used rather than doing nothing',
+      );
+      expect(find.byTooltip('audio: off'), findsNothing);
+
+      await tester.pumpWidget(const SizedBox());
+    });
+  });
+
+  group('the sound controls', () {
+    testWidgets('the toolbar button cycles off, here, both', (
+      WidgetTester tester,
+    ) async {
+      AudioMode mode = AudioMode.off;
+      await tester.pumpWidget(
+        _wrap(
+          StatefulBuilder(
+            builder: (BuildContext context, StateSetter rebuild) => AudioButton(
+              // What the host says it is doing, as the next sample would
+              // report it: the button shows the host, not the tap.
+              audio: _audio(mode: mode),
+              onMode: (AudioMode wanted) => rebuild(() => mode = wanted),
+            ),
+          ),
+        ),
+      );
+
+      expect(find.byTooltip('audio: off'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('audio: off'));
+      await tester.pump();
+      expect(find.byTooltip('audio: here'), findsOneWidget);
+      expect(mode, AudioMode.exclusive);
+
+      await tester.tap(find.byTooltip('audio: here'));
+      await tester.pump();
+      expect(find.byTooltip('audio: both'), findsOneWidget);
+      expect(mode, AudioMode.shared);
+
+      await tester.tap(find.byTooltip('audio: both'));
+      await tester.pump();
+      expect(find.byTooltip('audio: off'), findsOneWidget);
+      expect(mode, AudioMode.off, reason: 'three states and back round');
+    });
+
+    testWidgets('a host with no sound is asked for none', (
+      WidgetTester tester,
+    ) async {
+      await tester.pumpWidget(
+        _wrap(
+          AudioButton(
+            audio: _audio(hostHasAudio: false),
+            onMode: (AudioMode _) => fail('a host with no sound cannot play'),
+          ),
+        ),
+      );
+
+      expect(find.byTooltip('audio: unavailable'), findsOneWidget);
+      await tester.tap(
+        find.byTooltip('audio: unavailable'),
+        warnIfMissed: false,
+      );
+      await tester.pump();
+    });
+
+    testWidgets('a tap that is not answered stands, then gives way', (
+      WidgetTester tester,
+    ) async {
+      await tester.pumpWidget(
+        _wrap(
+          AudioButton(
+            audio: _audio(),
+            asked: AudioMode.shared,
+            onMode: (AudioMode _) {},
+          ),
+        ),
+      );
+
+      expect(
+        find.byTooltip('audio: both'),
+        findsOneWidget,
+        reason: 'the tap is shown until the host has answered it',
+      );
+    });
+
+    testWidgets('the volume column comes up when a key moves it, then goes', (
+      WidgetTester tester,
+    ) async {
+      final ValueNotifier<int> nudged = ValueNotifier<int>(0);
+      addTearDown(nudged.dispose);
+      await tester.pumpWidget(
+        // Under a Material, as the session screen puts it: the column sits
+        // over the picture, which is drawn on one.
+        _wrap(
+          Material(
+            child: Center(
+              child: VolumeOverlay(
+                audio: _audio(mode: AudioMode.shared, volume: 640),
+                nudged: nudged,
+                onVolume: (int _) {},
+                onMuted: (bool _) {},
+              ),
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('64%'), findsNothing, reason: 'nothing has moved it');
+
+      nudged.value += 1;
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(find.text('64%'), findsOneWidget);
+
+      await tester.pump(const Duration(milliseconds: 1500));
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(
+        find.text('64%'),
+        findsNothing,
+        reason: 'the picture is the point of the screen, so nothing parks here',
+      );
+    });
+
+    testWidgets('dragging the column up asks for more, not less', (
+      WidgetTester tester,
+    ) async {
+      final ValueNotifier<int> nudged = ValueNotifier<int>(0);
+      addTearDown(nudged.dispose);
+      final List<int> asked = <int>[];
+      await tester.pumpWidget(
+        _wrap(
+          Material(
+            child: Center(
+              child: VolumeOverlay(
+                audio: _audio(mode: AudioMode.shared, volume: 500),
+                nudged: nudged,
+                onVolume: asked.add,
+                onMuted: (bool _) {},
+              ),
+            ),
+          ),
+        ),
+      );
+
+      nudged.value += 1;
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+
+      await tester.drag(find.byType(Slider), const Offset(0, -40));
+      await tester.pump();
+
+      expect(
+        asked.last,
+        greaterThan(asked.first),
+        reason: 'the column is turned so that the loud end is the top one',
+      );
+    });
+
+    testWidgets('the column mutes the host, and says so', (
+      WidgetTester tester,
+    ) async {
+      final ValueNotifier<int> nudged = ValueNotifier<int>(0);
+      addTearDown(nudged.dispose);
+      bool? asked;
+      await tester.pumpWidget(
+        // Under a Material, as the session screen puts it: the column sits
+        // over the picture, which is drawn on one.
+        _wrap(
+          Material(
+            child: Center(
+              child: VolumeOverlay(
+                audio: _audio(mode: AudioMode.shared, volume: 300),
+                nudged: nudged,
+                onVolume: (int _) {},
+                onMuted: (bool muted) => asked = muted,
+              ),
+            ),
+          ),
+        ),
+      );
+
+      nudged.value += 1;
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+
+      expect(find.text('30%'), findsOneWidget);
+      await tester.tap(find.byTooltip('mute host'));
+      await tester.pump();
+
+      expect(asked, isTrue, reason: 'it is the host that goes quiet, not this');
     });
   });
 

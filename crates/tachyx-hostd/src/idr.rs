@@ -28,9 +28,9 @@ pub enum Reason {
     Bitrate,
     /// The encoded resolution changed.
     Resolution,
-    /// Enough time has passed that a picture damaged by a loss nobody reported
-    /// should be repaired anyway.
-    Periodic,
+    /// A loss the client cannot report, because no picture followed it to
+    /// reveal the hole it left.
+    Repair,
     /// The client lost a frame and cannot continue from what it has.
     ClientRequest,
     /// The session is starting and the client has nothing to decode from.
@@ -166,10 +166,10 @@ mod tests {
     }
 
     #[test]
-    fn a_periodic_repair_draws_from_the_same_budget_as_everything_else() {
+    fn a_repair_draws_from_the_same_budget_as_everything_else() {
         let mut budget = Budget::new(TARGET);
         let now = Instant::now();
-        assert_eq!(budget.request(Reason::Periodic, now), Verdict::Allow);
+        assert_eq!(budget.request(Reason::Repair, now), Verdict::Allow);
         assert_eq!(
             budget.request(Reason::ClientRequest, now),
             Verdict::Refuse,

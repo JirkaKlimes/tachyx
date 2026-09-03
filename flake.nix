@@ -82,6 +82,7 @@
               libdrm
               libgbm
               libva
+              libpulseaudio
               gtk3
             ]);
 

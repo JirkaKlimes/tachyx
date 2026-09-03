@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 
-use gstreamer_gl::{GLAPI, GLContext, GLPlatform, prelude::GLContextExt};
+use gstreamer_gl::{prelude::GLContextExt, GLContext, GLPlatform, GLAPI};
 use gstreamer_gl_egl::GLDisplayEGL;
 
 #[expect(

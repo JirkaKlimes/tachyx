@@ -10,6 +10,12 @@ repository.workspace = true
 [dependencies]
 tachyx-client.workspace = true
 tachyx-proto.workspace = true
+tachyx-crypto.workspace = true
+# The pairing mailbox and the rendezvous. The client reaches a host by device
+# rather than by address, and neither the mailbox nor the punch exists without
+# this.
+tachyx-relay.workspace = true
+tachyx-sched.workspace = true
 tachyx-transport.workspace = true
 quinn.workspace = true
 thiserror.workspace = true
@@ -24,6 +30,9 @@ serde.workspace = true
 # The shaped-path test drives the shipped controller against a userspace relay,
 # so the test binary needs both the estimator and a UDP socket of its own.
 tachyx-congestion.workspace = true
+# The pairing and rendezvous tests run against a real relay rather than a mock,
+# so the test binary binds one on the loopback interface.
+tachyx-relayd.workspace = true
 tokio = { workspace = true, features = ["net", "time"] }
 
 [lints]

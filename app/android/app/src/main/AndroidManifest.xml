@@ -8,6 +8,10 @@
          permanently stops delivering the video flow seconds into a session. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- Only to read a pairing code off the host's screen. Nothing here records
+         or keeps a picture. A phone that will not grant it can still type the
+         eight digits or open the link. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
 
     <application
         android:label="tachyx"
@@ -28,6 +32,12 @@
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">
+            <!-- Flutter's own router would otherwise swallow the VIEW intent
+                 and `app_links` would never see the pairing link. -->
+            <meta-data
+              android:name="flutter_deeplinking_enabled"
+              android:value="false"
+              />
             <!-- Specifies an Android theme to apply to this Activity as soon as
                  the Android process has started. This theme is visible to the user
                  while the Flutter UI initializes. After that, this theme continues
@@ -39,6 +49,17 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <!-- The pairing link the host's QR carries. The scheme and the host
+                 must be lower case: Android matches both case-sensitively and
+                 does not normalise the incoming URI, so an upper-case scheme
+                 reaches no application at all. See spec/pairing.md, which is why
+                 only the base32 body after them is upper case. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="tachyx" android:host="pair"/>
             </intent-filter>
         </activity>
         <!-- Don't delete the meta-data below.

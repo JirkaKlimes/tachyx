@@ -1,4 +1,10 @@
 //! The two ends of the connection, and the settings both agree on.
+//!
+//! Nothing in here binds a socket unless it is asked to. [`Host::bind`] and
+//! [`Client::bind`] are the plain local-network path; [`Host::on_endpoint`] and
+//! [`Client::on_endpoint`] take an endpoint somebody else built, which is what
+//! `tachyx-relay` does when the socket underneath has to route. This crate does
+//! not know relays exist, and it must not: the dependency runs the other way.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,12 +15,13 @@ use quinn::{
     AckFrequencyConfig, Connection, Endpoint, EndpointConfig, IdleTimeout, TokioRuntime,
     TransportConfig, VarInt,
 };
-use rustls::crypto::CryptoProvider;
 use socket2::{Domain, Protocol, Socket, Type};
+use tachyx_crypto::{CryptoError, DeviceId, DeviceKey, PairedClients};
 use tachyx_proto::control::{ClientHello, HostHello};
 
+use crate::audio::AudioSender;
 use crate::control::{ControlError, ControlReader, ControlWriter};
-use crate::identity::{HostIdentity, IdentityError, PinStore, PinnedServer};
+use crate::identity::{peer_device, provider, Paired, Pinned, SERVER_NAME};
 use crate::video::{VideoControl, VideoSender};
 
 /// The application protocol both ends announce.
@@ -27,6 +34,21 @@ const ALPN: &[u8] = b"tachyx";
 /// The close code for a peer whose hello this build will not accept.
 const REFUSED: VarInt = VarInt::from_u32(1);
 
+/// The starting packet size on a path this build believes is a local network.
+///
+/// A 1500-byte path less twenty bytes of IPv4 and eight of UDP. Discovery lowers
+/// it if the path turns out to be smaller.
+pub const LAN_MTU: u16 = 1472;
+
+/// The starting packet size on a path that may be relayed or on a tailnet.
+///
+/// Such a path is 1280 bytes at the interface, and every packet of the local
+/// network's size is then black-holed until discovery notices, which is a stall
+/// at exactly the moment a session opens. Discovery raises this if the path
+/// turns out to be larger, which costs nothing; starting too high costs the
+/// first second of the session.
+pub const RELAYED_MTU: u16 = 1200;
+
 /// Settings the defaults get wrong for a local network, and by large factors.
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
@@ -37,14 +59,29 @@ pub struct Tuning {
     /// shreds every key frame and the client never synchronises at all. See
     /// [`crate::video::video_send_buffer`].
     pub video_buffer: usize,
+    /// The packet size to start at, before discovery has measured the path.
+    ///
+    /// [`LAN_MTU`] for a socket that sends straight out the wire, and
+    /// [`RELAYED_MTU`] for one that may be wrapped and forwarded.
+    pub initial_mtu: u16,
 }
 
 impl Tuning {
-    /// Sizes the video buffer for a stream at `coded`.
+    /// Sizes the video buffer for a stream at `coded`, on a local network.
     #[must_use]
     pub fn for_stream(coded: tachyx_proto::control::CodedSize) -> Self {
         Self {
             video_buffer: crate::video::video_send_buffer(coded),
+            initial_mtu: LAN_MTU,
+        }
+    }
+
+    /// The same settings, for a path that may be relayed.
+    #[must_use]
+    pub const fn relayed(self) -> Self {
+        Self {
+            initial_mtu: RELAYED_MTU,
+            ..self
         }
     }
 }
@@ -61,9 +98,7 @@ fn transport_config(tuning: Tuning) -> TransportConfig {
         .initial_rtt(Duration::from_millis(5))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(5_000))))
         .keep_alive_interval(Some(Duration::from_millis(500)))
-        // A 1500-byte path less twenty bytes of IPv4 and eight of UDP. Discovery
-        // lowers it if the path turns out to be smaller.
-        .initial_mtu(1472)
+        .initial_mtu(tuning.initial_mtu)
         // The bandwidth estimate the whole rate controller reads comes from
         // here. Only BBR reports a pacing rate; Cubic reports none.
         .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()))
@@ -80,15 +115,6 @@ fn transport_config(tuning: Tuning) -> TransportConfig {
     acks.max_ack_delay(Some(Duration::from_millis(2)));
     config.ack_frequency_config(Some(acks));
     config
-}
-
-/// The cryptographic provider, named rather than defaulted.
-///
-/// quinn defaults to one provider and rustls to another, so taking both
-/// defaults compiles both. Ring is the one named here: the other has an open
-/// link failure on `aarch64-linux-android`, which is the client's main target.
-fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
 }
 
 /// The receive and send buffer this transport asks the kernel for, in bytes.
@@ -108,13 +134,18 @@ fn provider() -> Arc<CryptoProvider> {
 /// granted in full.
 const SOCKET_BUFFER_TARGET: usize = 4 * 1024 * 1024;
 
-/// Binds a UDP socket at `address`, with its receive and send buffers raised.
+/// Binds a UDP socket at `address`, with its receive and send buffers raised and
+/// its packets marked as real time media.
+///
+/// Public because the socket a session runs on is not always bound here: a peer
+/// that can be relayed binds one socket and puts a routing layer over it, and
+/// that socket must carry the same hygiene as this one.
 ///
 /// # Errors
 /// If the socket cannot be opened or bound. A failure to raise a buffer is not
 /// one of these: the stream works with whatever buffer the socket already has,
 /// so that failure is logged and the socket is returned unchanged.
-fn bind_socket(address: SocketAddr) -> Result<std::net::UdpSocket, TransportError> {
+pub fn bind_socket(address: SocketAddr) -> Result<std::net::UdpSocket, TransportError> {
     let socket = Socket::new(
         Domain::for_address(address),
         Type::DGRAM,
@@ -126,6 +157,18 @@ fn bind_socket(address: SocketAddr) -> Result<std::net::UdpSocket, TransportErro
     // quinn hands the socket to tokio, which needs it non-blocking.
     socket.set_nonblocking(true)?;
     Ok(socket.into())
+}
+
+/// Binds an unspecified address, preferring a dual-stack IPv6 socket.
+///
+/// The dialling end opens the connection, so nothing has to reach it at a known
+/// port. IPv6 is tried first, then IPv4 for a machine without it.
+///
+/// # Errors
+/// If neither family can be bound.
+pub fn bind_any() -> Result<std::net::UdpSocket, TransportError> {
+    bind_socket((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
+        .or_else(|_| bind_socket((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))
 }
 
 /// The differentiated services class the video is marked with.
@@ -183,40 +226,113 @@ fn raise_buffers(socket: &Socket) {
     }
 }
 
+/// The server configuration a host listens with: its own certificate, and a
+/// verifier that takes only the devices it has paired with.
+///
+/// Public because a host that can be reached through a relay does not bind its
+/// own endpoint. It hands this to whatever built the endpoint instead.
+///
+/// # Errors
+/// If the certificate machinery refuses, or this build cannot negotiate TLS 1.3.
+pub fn server_config(
+    key: &DeviceKey,
+    clients: Arc<PairedClients>,
+    tuning: Tuning,
+) -> Result<quinn::ServerConfig, TransportError> {
+    let provider = provider();
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(Arc::new(Paired::new(clients, provider)))
+        .with_single_cert(vec![key.certificate()?], key.private_key())?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let quic = QuicServerConfig::try_from(tls).map_err(|_| TransportError::NoTls13)?;
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    config.transport_config(Arc::new(transport_config(tuning)));
+    Ok(config)
+}
+
+/// The client configuration for reaching exactly one host.
+///
+/// # Errors
+/// If the certificate machinery refuses, or this build cannot negotiate TLS 1.3.
+pub fn client_config(
+    key: &DeviceKey,
+    host: DeviceId,
+    tuning: Tuning,
+) -> Result<quinn::ClientConfig, TransportError> {
+    let provider = provider();
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Pinned::new(host, provider)))
+        .with_client_auth_cert(vec![key.certificate()?], key.private_key())?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    let quic = QuicClientConfig::try_from(tls).map_err(|_| TransportError::NoTls13)?;
+    let mut config = quinn::ClientConfig::new(Arc::new(quic));
+    config.transport_config(Arc::new(transport_config(tuning)));
+    Ok(config)
+}
+
 /// The host end of the connection.
 #[derive(Debug)]
 pub struct Host {
     endpoint: Endpoint,
     tuning: Tuning,
+    /// What every hello announces about audio. See [`Host::with_audio`].
+    audio: bool,
 }
 
 impl Host {
-    /// Binds a host at `address`, presenting `identity`.
+    /// Binds a host at `address`, presenting `key` and accepting `clients`.
     ///
     /// # Errors
-    /// If the socket cannot be opened, or the identity will not make a TLS
+    /// If the socket cannot be opened, or the key will not make a TLS
     /// configuration.
     pub fn bind(
         address: SocketAddr,
-        identity: &HostIdentity,
+        key: &DeviceKey,
+        clients: Arc<PairedClients>,
         tuning: Tuning,
     ) -> Result<Self, TransportError> {
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_no_client_auth()
-            .with_single_cert(identity.chain(), identity.key())?;
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        let quic = QuicServerConfig::try_from(tls).map_err(|_| TransportError::NoTls13)?;
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
-        config.transport_config(Arc::new(transport_config(tuning)));
-        let socket = bind_socket(address)?;
+        let config = server_config(key, clients, tuning)?;
         let endpoint = Endpoint::new(
             EndpointConfig::default(),
             Some(config),
-            socket,
+            bind_socket(address)?,
             Arc::new(TokioRuntime),
         )?;
-        Ok(Self { endpoint, tuning })
+        Ok(Self {
+            endpoint,
+            tuning,
+            audio: false,
+        })
+    }
+
+    /// Announces that this host can stream its own sound.
+    ///
+    /// Off unless a caller says otherwise, because whether a machine has a
+    /// working capture path is something only the daemon that probed it knows,
+    /// and a host that announced audio it cannot deliver would put a control in
+    /// front of the user that does nothing.
+    #[must_use]
+    pub const fn with_audio(mut self, audio: bool) -> Self {
+        self.audio = audio;
+        self
+    }
+
+    /// Serves sessions on an endpoint somebody else built.
+    ///
+    /// `endpoint` must already carry a [`server_config`], because the endpoint's
+    /// socket is shared with whatever built it: a relay connection and a session
+    /// run on the same port, and quinn tells them apart by connection
+    /// identifier.
+    #[must_use]
+    pub const fn on_endpoint(endpoint: Endpoint, tuning: Tuning) -> Self {
+        Self {
+            endpoint,
+            tuning,
+            audio: false,
+        }
     }
 
     /// The address the host actually bound, which is what to advertise.
@@ -229,11 +345,13 @@ impl Host {
 
     /// Waits for a client, completes the handshake, and exchanges hellos.
     ///
-    /// The host's own hello goes out before the client's is read, so a client
-    /// this build cannot talk to is told which version the host speaks rather
-    /// than left with a connection that closed for no stated reason. For the
-    /// same reason a refusal closes the connection with the refusal as its
-    /// reason instead of dropping it.
+    /// The handshake has already refused any device this host has not paired
+    /// with, so [`HostSession::peer`] names a device that is in the list. The
+    /// host's own hello goes out before the client's is read, so a client this
+    /// build cannot talk to is told which version the host speaks rather than
+    /// left with a connection that closed for no stated reason. For the same
+    /// reason a refusal closes the connection with the refusal as its reason
+    /// instead of dropping it.
     ///
     /// # Errors
     /// If the endpoint is closed, the connection fails, or the client's hello
@@ -241,12 +359,13 @@ impl Host {
     pub async fn accept(&self) -> Result<HostSession, TransportError> {
         let incoming = self.endpoint.accept().await.ok_or(TransportError::Closed)?;
         let connection = incoming.await?;
+        let peer = peer_device(&connection).ok_or(TransportError::UnknownPeer)?;
         // The client opens the stream, so the host waits for it rather than
         // racing to open one of its own.
         let (send, recv) = connection.accept_bi().await?;
         let mut to_client = ControlWriter::new(send);
         let mut from_client = ControlReader::new(recv);
-        to_client.send(&HostHello::new()).await?;
+        to_client.send(&HostHello::new(self.audio)).await?;
         let hello = match from_client.recv_hello::<ClientHello>().await {
             Ok(hello) => hello,
             Err(refused) => {
@@ -264,10 +383,16 @@ impl Host {
             self.tuning.video_buffer,
             hello.capabilities.bitrate_ceiling,
         );
+        // Taken here, while the video sender is still in hand. It is what ties
+        // the two paths to one sequence and one set of release records, and the
+        // session moves the video sender onto a thread of its own.
+        let audio = video.audio();
         Ok(HostSession {
             connection,
+            peer,
             hello,
             video,
+            audio,
             control,
             to_client,
             from_client,
@@ -301,6 +426,10 @@ impl Host {
 pub struct HostSession {
     /// The connection itself, for statistics and for closing it.
     pub connection: Connection,
+    /// Which device this is. It is in the paired list, because the handshake
+    /// refused every device that is not, and it is what a caller looks
+    /// [`Permissions`](tachyx_crypto::Permissions) up by.
+    pub peer: DeviceId,
     /// What the client said it can decode.
     pub hello: ClientHello,
     /// Encoded pictures out.
@@ -308,6 +437,12 @@ pub struct HostSession {
     /// Moved into a thread of its own for the life of the session, because
     /// releasing a paced key frame is tens of milliseconds of waiting.
     pub video: VideoSender,
+    /// Encoded sound out, on the same connection and past the pacer.
+    ///
+    /// A separate handle rather than a method on the video sender, because the
+    /// video sender is on a thread that spends most of its time asleep between
+    /// datagrams and sound cannot wait for it.
+    pub audio: AudioSender,
     /// What the congestion controller drives that thread through.
     pub control: VideoControl,
     /// Stream configuration and heartbeats out.
@@ -320,39 +455,41 @@ pub struct HostSession {
 #[derive(Debug)]
 pub struct Client {
     endpoint: Endpoint,
+    key: Arc<DeviceKey>,
+    tuning: Tuning,
 }
 
 impl Client {
-    /// Builds a client that trusts the hosts in `pins`, and any host it has not
-    /// met before.
+    /// Binds a client on an unspecified address, presenting `key`.
     ///
     /// # Errors
-    /// If a socket cannot be opened, or this build cannot negotiate TLS 1.3.
-    pub fn new(pins: Arc<PinStore>, tuning: Tuning) -> Result<Self, TransportError> {
-        let provider = provider();
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedServer::new(pins, provider)))
-            .with_no_client_auth();
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        let quic = QuicClientConfig::try_from(tls).map_err(|_| TransportError::NoTls13)?;
-        let mut config = quinn::ClientConfig::new(Arc::new(quic));
-        config.transport_config(Arc::new(transport_config(tuning)));
-
-        // Unspecified address and port: the client opens the connection, so
-        // nothing has to reach it at a known one. A dual-stack IPv6 bind is
-        // tried first, then IPv4, for a host without IPv6.
-        let socket = bind_socket((std::net::Ipv6Addr::UNSPECIFIED, 0).into())
-            .or_else(|_| bind_socket((std::net::Ipv4Addr::UNSPECIFIED, 0).into()))?;
-        let mut endpoint = Endpoint::new(
+    /// If a socket cannot be opened.
+    pub fn bind(key: Arc<DeviceKey>, tuning: Tuning) -> Result<Self, TransportError> {
+        let endpoint = Endpoint::new(
             EndpointConfig::default(),
             None,
-            socket,
+            bind_any()?,
             Arc::new(TokioRuntime),
         )?;
-        endpoint.set_default_client_config(config);
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            key,
+            tuning,
+        })
+    }
+
+    /// Dials from an endpoint somebody else built.
+    ///
+    /// The endpoint carries no server configuration when it is only a client's,
+    /// which is what makes it drop an incoming Initial rather than answer it.
+    /// That is the property the relay's hole punch stands on.
+    #[must_use]
+    pub const fn on_endpoint(endpoint: Endpoint, key: Arc<DeviceKey>, tuning: Tuning) -> Self {
+        Self {
+            endpoint,
+            key,
+            tuning,
+        }
     }
 
     /// The endpoint this client dials from, for its statistics, its address,
@@ -364,33 +501,45 @@ impl Client {
         &self.endpoint
     }
 
-    /// Connects to the host at `address`, which is pinned under `host`.
+    /// This client's own device.
+    #[must_use]
+    pub fn device(&self) -> DeviceId {
+        self.key.id()
+    }
+
+    /// Connects to `host` at `address`.
     ///
-    /// `host` names the peer for the purpose of pinning. It is not resolved and
-    /// need not resolve: a host on a local network is found by discovery and
-    /// reached by address, and what identifies it is its key.
+    /// `address` is where to send packets; `host` is who must answer. The two
+    /// are unrelated: an address is discovered, changes, and is not
+    /// authenticated, and a device identifier is none of those things. A peer at
+    /// that address presenting any other key ends the handshake.
+    ///
+    /// A host that will not have **this** device refuses a moment later than
+    /// that, and there is nothing to be done about it: in TLS 1.3 the client's
+    /// certificate travels in its second flight, so QUIC reports the handshake
+    /// complete to the dialling end before the host has looked at it. The
+    /// refusal then arrives as a closed connection on the first read, which is
+    /// where it is reported.
     ///
     /// # Errors
-    /// If the connection fails, or the host presents a key other than the one
-    /// pinned for that name.
+    /// If the connection fails, the host presents another key, or the host
+    /// refuses the session.
     pub async fn connect(
         &self,
         address: SocketAddr,
-        host: &str,
+        host: DeviceId,
         hello: &ClientHello,
     ) -> Result<ClientSession, TransportError> {
-        // The name goes to quinn as written. Turning it into a `ServerName`
-        // here and back into a string for quinn produced the debug form of an
-        // address for every host named by one, which quinn then refused: a
-        // client that dials an address it was told, which is every client on a
-        // local network, could not connect at all.
-        let connection = match self.endpoint.connect(address, host) {
-            Ok(connecting) => connecting.await?,
-            Err(quinn::ConnectError::InvalidServerName(_)) => {
-                return Err(TransportError::UnusableHostName);
-            }
-            Err(refused) => return Err(refused.into()),
-        };
+        let config = client_config(&self.key, host, self.tuning)?;
+        // The name is a constant, because nothing reads it. A self-signed
+        // certificate says whatever its maker liked about names and dates, so
+        // the key is the whole of the identity and the name is a field TLS
+        // requires to be filled in.
+        let connection = self
+            .endpoint
+            .connect_with(config, address, SERVER_NAME)?
+            .await?;
+        let peer = peer_device(&connection).ok_or(TransportError::UnknownPeer)?;
         let (send, recv) = connection.open_bi().await?;
         let mut to_host = ControlWriter::new(send);
         // The stream reaches the host only when something is written on it, so
@@ -411,12 +560,18 @@ impl Client {
                             reason: String::from_utf8_lossy(&refusal.reason).into_owned(),
                         }
                     }
-                    _ => unread.into(),
+                    // A host that has not paired with this device refuses inside
+                    // TLS instead, and closes with an alert. Report the close and
+                    // not the read that failed behind it: "a read failed" says
+                    // nothing, and the alert names the fault.
+                    Some(closed) => TransportError::Connection(closed),
+                    None => unread.into(),
                 });
             }
         };
         Ok(ClientSession {
             connection,
+            peer,
             greeting,
             to_host,
             from_host,
@@ -429,6 +584,9 @@ impl Client {
 pub struct ClientSession {
     /// The connection itself, for statistics and for closing it.
     pub connection: Connection,
+    /// Which device answered. It is the device that was asked for: the
+    /// handshake refused every other one.
+    pub peer: DeviceId,
     /// What the host said before it read the hello. Its version has already
     /// been checked against this build's.
     pub greeting: HostHello,
@@ -444,9 +602,10 @@ pub enum TransportError {
     /// The socket could not be opened or read.
     #[error("the socket could not be used")]
     Socket(#[from] std::io::Error),
-    /// The identity could not be settled.
+    /// The device key would not produce a certificate, or the paired list would
+    /// not open.
     #[error(transparent)]
-    Identity(#[from] IdentityError),
+    Identity(#[from] CryptoError),
     /// The TLS configuration was refused.
     #[error("the TLS configuration was refused")]
     Tls(#[from] rustls::Error),
@@ -459,6 +618,11 @@ pub enum TransportError {
     /// The connection ended.
     #[error("the connection ended")]
     Connection(#[from] quinn::ConnectionError),
+    /// The handshake completed with no certificate to name the peer by, which
+    /// these configurations do not allow and which therefore means the session
+    /// cannot say who it is talking to.
+    #[error("the peer presented no certificate to be named by")]
+    UnknownPeer,
     /// The host closed the connection rather than opening a session, and said
     /// why. Its words, not ours: a version mismatch reads as a version
     /// mismatch and not as a failed read.
@@ -473,7 +637,4 @@ pub enum TransportError {
     /// The endpoint has been closed.
     #[error("the endpoint is closed")]
     Closed,
-    /// A name TLS cannot carry.
-    #[error("the host name cannot be put in a TLS handshake")]
-    UnusableHostName,
 }

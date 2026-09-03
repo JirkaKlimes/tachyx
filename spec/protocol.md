@@ -1,8 +1,9 @@
-# tachyx wire protocol — draft 2
+# tachyx wire protocol — draft 4
 
-Status: draft. Covers only what the current milestone implements: one client, one
-host, one LAN. Pairing, authentication and relaying are specified elsewhere when
-they exist.
+Status: draft. Covers the session: what two devices say to each other once they
+have met. How they meet is [`pairing.md`](pairing.md), and how they find each
+other when they are not on one network is [`relay.md`](relay.md). A relayed
+session is this session, unchanged: the relay forwards packets it cannot read.
 
 Draft 1 defines `slice_id` 255, which draft 0 reserved. A draft 0 client reads a
 parity packet as a slice of the picture and then completes no frame at all, so
@@ -13,34 +14,52 @@ writes no field names, so a draft 1 hello read as a draft 2 one ends a field
 short and a draft 2 hello read as a draft 1 one leaves a byte over. Neither
 fails to parse on its own, which is what the version exists to catch.
 
+Draft 3 moves the cursor report into the logical pixels the compositor measures
+the pointer in, and gives each pointer picture an identifier. A report from
+either side read by the other places the pointer by a fifth of the screen and
+draws it at the wrong size.
+
+Draft 4 adds sound. A datagram now carries audio as well as picture, marked by a
+flag bit draft 3 left spare, and a draft 3 receiver ignores a spare bit rather
+than refusing it: it reads an audio datagram as a picture packet that describes
+no fragments, rejects it as malformed, and never records its sequence number. A
+hundred audio packets a second then read as a hundred lost datagrams a second,
+which drives parity to its ceiling and the bitrate to its floor. `HostHello`
+gains a field in the same draft, with nothing in the encoding to name it.
+
 ## Transport
 
 A single QUIC connection carries everything.
 
 | Path | QUIC object | Reliability |
 |---|---|---|
-| Video | DATAGRAM (RFC 9221) | unreliable, never retransmitted |
+| Video and audio | DATAGRAM (RFC 9221) | unreliable, never retransmitted |
 | Control and input | one bidirectional stream, opened by the client | reliable, ordered |
 
 Video never shares a stream with control. A lost video packet must not delay an
 input event, and an input event must not delay a frame.
 
-### Security, currently
+### Security
 
-The host presents a self-signed certificate derived from a key it keeps, and the
-client pins the SHA-256 of that certificate's subject public key info the first
-time it sees a host under a given name. Afterwards a different key under the same
-name is refused. The pin is over the public key rather than the certificate
-because the host derives a fresh certificate from the stored key on every start,
-and a certificate is not byte-stable across those starts.
+Both ends present a self-signed certificate derived from a key they keep, and
+both ends check the exact key. The key **is** the device identifier and there is
+no certificate authority. [`pairing.md`](pairing.md) is where that is specified;
+this section says only what it means for the session.
 
-Validity dates and the subject name are deliberately not checked. The certificate
-is self-signed, so a forger writes whatever it likes into both; the pin is the
-only thing an attacker has to break.
+- The client accepts one key, the one it paired with. Nothing is pinned on first
+  sight.
+- The host requires a client certificate and refuses a device that is not in its
+  paired list. Before pairing existed it accepted anything that could reach the
+  port.
+- Validity dates and subject names are not examined by either end. The
+  certificate is self-signed, so a forger writes what it likes into both, and the
+  key is the only thing an attacker has to break.
+- A certificate whose key is not Ed25519 is refused before it is compared, rather
+  than compared and found different.
 
-What is missing is the first meeting. A host the client has not met is accepted
-and remembered, so an attacker present at that moment is pinned instead of the
-host. Pairing closes that hole, and it is one verifier away.
+The identity travels no further than the handshake. Which device connected is
+what the host reads its permissions from; the messages below say nothing about
+who is at either end.
 
 ## Control stream framing
 
@@ -70,7 +89,7 @@ loses the race to the close. Measured on loopback, a client claiming version 7
 sees `closed by peer: peer speaks protocol version 7, this build speaks 0 (code
 1)`, which is a named answer rather than a reset.
 
-The video path does not use this encoding, or serde at all. See below.
+The datagram path does not use this encoding, or serde at all. See below.
 
 ## Control messages
 
@@ -115,12 +134,16 @@ The video path does not use this encoding, or serde at all. See below.
   one packet.
 
 `Feedback`
-: The receiver report that drives congestion control. When each video datagram
+: The receiver report that drives congestion control. When each datagram
   arrived, which never did, and cumulative counts of both. Specified below and
   in [`congestion.md`](congestion.md).
 
 `KeyframeRequest`
 : Sent when reassembly failed and the client cannot continue from what it has.
+
+`Audio`
+: What to do about the host's own sound: set the mode, set the volume, set the
+  mute. Sent only to a host whose hello said it has audio. Specified below.
 
 `ClockSyncRequest`
 : Carries the client's send timestamp. Used to put the two clocks on a common
@@ -174,11 +197,17 @@ statuses, and drops to every 250 ms while the host's announced bitrate is under
 ### Host to client
 
 `HostHello` — first message on the stream, sent before the client's is read.
-: The protocol version, and at draft 0 nothing else. There is nothing else for
-  the host to announce at this point: the host decides how to encode, not the
-  client, and it says so in `StreamConfig` once it has read what the client can
-  drive. Encoders, capture formats and the list of monitors join it when
-  choosing a monitor is a thing a client can do.
+: The protocol version, and whether the host can stream its own sound. There is
+  nothing else for the host to announce at this point: the host decides how to
+  encode, not the client, and it says so in `StreamConfig` once it has read what
+  the client can drive. Encoders, capture formats and the list of monitors join
+  it when choosing a monitor is a thing a client can do.
+
+  Audio belongs here because it is the one thing a client has to know before it
+  draws its own controls, and it is probed on the host's own machine the way the
+  codec sets are: a sound server that answers, and an encoder element that is
+  installed. A control that is offered and then does nothing is worse than one
+  that is not offered, because the user cannot tell it from a fault.
 
 `StreamConfig`
 : The host's decision: codec, coded size, visible size, display aspect ratio,
@@ -215,6 +244,11 @@ statuses, and drops to every 250 ms while the host's announced bitrate is under
 
 `CursorUpdate`
 : Where the pointer is and what it looks like. Specified below.
+
+`Audio`
+: What the host is doing about sound, and what its sink is set to. Sent after the
+  hello, as the answer to every `Audio` command, and whenever the sink changes
+  underneath the session. Specified below.
 
 `ClockSyncReply`
 : The client's timestamp, the host's receive timestamp, and the host's send
@@ -319,6 +353,92 @@ been steering. Nothing corrects it, so it drifts, and it is drawn as the
 client's own mark rather than as the host's cursor. A trackpad with a pointer
 that drifts is usable; one with no pointer at all is what this exists to fix.
 
+## Sound
+
+The host streams what its own speakers would have played. There is no separate
+mixer and no per-application selection: the capture tap is the default sink's
+monitor, which is everything the machine is playing.
+
+```rust
+pub enum AudioMode {
+    /// Nothing captured, nothing streamed, the host's output untouched.
+    Off,
+    /// Streamed to the client, and the host's own sink muted.
+    Exclusive,
+    /// Streamed to the client, and the host goes on playing it too.
+    Shared,
+}
+
+pub enum AudioCommand {
+    SetMode(AudioMode),
+    /// Permille of the sink's own 100%.
+    SetVolume(u16),
+    SetMuted(bool),
+}
+
+pub struct AudioStatus {
+    /// What the host is doing, which is not always what it was asked to do.
+    pub mode: AudioMode,
+    /// The sink's volume, in permille.
+    pub volume: u16,
+    /// Whether the sink itself is muted.
+    pub muted: bool,
+}
+```
+
+`Exclusive` is the mode a user in another room asks for: the sound follows them
+rather than staying with the computer. It works because the tap is ahead of the
+sink's own volume and mute, on the monitor ports, so muting the sink silences
+the host without touching a byte of what is streamed.
+
+`Off` is where a session starts and where it must end. The host's mute is
+restored when the mode leaves `Exclusive`, when the client disconnects, and when
+the daemon stops. Nobody sitting down at the host afterwards should have to work
+out why their machine is silent.
+
+The status reports what the host **is** doing rather than what it was asked to
+do. A host that cannot start capture, or that refuses a mode, says so by
+reporting the mode it is really in, and the client's control follows the report
+rather than its own last click.
+
+### One volume, and the client cubes it
+
+The host sink's volume is the volume. The client has no gain control of its own,
+and this is a consequence of where the tap is rather than a simplification: the
+monitor ports carry the same samples whatever the sink's volume is set to, so a
+client that turned its own knob would change what it hears while the host's
+control said something else.
+
+So the host applies `SetVolume` to its sink, reports it back, and the client
+turns the reported number into playback gain:
+
+```
+gain = (volume / 1000)^3
+```
+
+Cubed because permille here is a position on a control and not a ratio of
+amplitude. PulseAudio, and the pipewire-pulse server that answers for it, cube
+the control to reach amplitude, so half way along the control is an eighth of
+the amplitude. A client that applied the number directly would be louder than
+the host at every setting but the two ends.
+
+The same one knob then works in both streaming modes. In `Shared` it moves the
+host's speakers and the client's playback together, which is what a single
+volume means. In `Exclusive` the sink is muted, so it moves only what the client
+hears, and the number it moves is still the host's.
+
+A volume above 1000 is clamped by whichever end reads it. The encoding cannot
+forbid one, and what reads it is a cube: a peer sending ten thousand would
+otherwise put a thousandfold gain into a listener's ears.
+
+`muted` is the host's own silence and only the host's. It reads true throughout
+`Exclusive`, while the client is hearing everything. A client that applied it as
+silence would hear nothing in the one mode chosen to make it hear everything.
+
+The status is sent whenever the sink changes underneath the session, including a
+change somebody made at the host's own keyboard. Without that, the two ends
+disagree about the volume until one of them is touched again.
+
 ## Input events
 
 Pointer motion is relative by default, because the phone is used as a trackpad and
@@ -376,27 +496,39 @@ The sequence parameter set declares that the stream reorders no frames. A decode
 that is not told this holds frames back before emitting them, adding latency that
 no client-side setting can remove.
 
-## Video path
+## Datagram path
 
-Video packets carry a fixed 16-byte header written by hand, byte by byte. At
+Every datagram carries a fixed 16-byte header written by hand, byte by byte. At
 thousands of packets a second, and as the part of the protocol most worth
 auditing, the layout is specified here rather than derived from a Rust type.
 
 All fields are little-endian.
 
-A datagram carries either a piece of the picture or a piece of the parity that
-repairs it, and `slice_id` says which. 255 means parity; anything else is a
-slice of the picture. That byte is read at a fixed offset before anything that
-depends on it, so telling the two apart costs one comparison.
+A datagram is one of four things, and two flag bits and one byte tell them
+apart. Bit 3 of `flags` marks audio and bit 2 marks padding: neither belongs to
+a frame of picture, so both are read before any field that describes one. What
+is neither is picture or parity, and `slice_id` says which of those it is: 255
+means parity, anything else is a slice of the picture. All three are at fixed
+offsets, so telling the four kinds apart costs three comparisons and no parsing.
 
-Four fields mean the same thing in both:
+Bits 2 and 3 together are refused rather than resolved by precedence. They say
+opposite things about the payload, one carrying sound and the other defined to
+carry nothing, and a receiver that guessed would play whichever the sender did
+not mean.
+
+Two fields mean the same thing in all four:
+
+| Offset | Size | Field | Purpose |
+|---|---|---|---|
+| 8 | 2 | `seq` | Session-wide datagram counter, so a gap is visible across a frame boundary. Compared circularly, in the manner of RFC 1982. Parity, padding and audio are counted in it like any other: they cost the path the same bytes and their loss is the same evidence about it. |
+| 15 | 1 | `flags` | Bit 0 marks a key frame, bit 1 the frame's last slice, bit 2 padding, bit 3 audio. The rest are spare and a receiver must ignore them. Bits 0 and 1 are meaningless on anything but a picture packet. |
+
+Two more mean the same thing in picture and parity:
 
 | Offset | Size | Field | Purpose |
 |---|---|---|---|
 | 0 | 4 | `frame_id` | Reassembly key, and what a recovery request names. Counts encoded pictures and skips none. |
-| 8 | 2 | `seq` | Session-wide datagram counter, so a gap is visible across a frame boundary. Compared circularly, in the manner of RFC 1982. Parity packets are counted in it like any other: they cost the path the same bytes and their loss is the same evidence about it. |
 | 14 | 1 | `slice_id` | Which slice of the frame, or 255 for parity. |
-| 15 | 1 | `flags` | Bit 0 marks a key frame, bit 1 the frame's last slice, bit 2 padding. The rest are spare and a receiver must ignore them. Bit 1 is meaningless on a parity packet. |
 
 A picture packet, `slice_id` under 255:
 
@@ -543,7 +675,50 @@ A receiver counts its sequence number, records its arrival for the next
 Sequence accounting is the only thing padding takes part in, and it is the only
 thing it is for.
 
-`slice_id` 255 is what forward error correction took, and it is specified above.
-The spare flag bits were not needed: one byte at a fixed offset separates the
-two kinds of datagram, and a second marker saying the same thing would be a
-second thing to get wrong. They stay spare.
+### Sound travels on the same datagrams
+
+A datagram with bit 3 of `flags` set carries exactly one Opus packet.
+
+| Offset | Size | Field | Purpose |
+|---|---|---|---|
+| 0 | 4 | `frame_id` | Counts the session's audio packets and skips none, for the reason the picture's identifier skips none: a packet every trace of which was lost leaves nothing but the hole to say it existed. A receiver reads that hole as the sound it has to conceal. |
+| 4 | 4 | `capture` | When the samples were captured, on the same clock and in the same 100-microsecond ticks a picture's capture time is in. So the two can be lined up without either end sending a mapping between two timelines. |
+| 10 | 5 | | Zero on write, ignored on read. |
+
+There is no length field, no channel count and no sample rate. An Opus packet
+describes its own duration and channel layout in its own table of contents, and
+the datagram's length is the packet's, so a second statement of any of it would
+be a second thing to get wrong.
+
+Those five zero bytes are the opposite of what padding writes there, and that is
+deliberate. `slice_pkts` of zero is not a slice, so a receiver that does not know
+the audio bit rejects the datagram by name instead of handing a video decoder a
+band of picture it read out of an Opus packet. It is the cheapest refusal
+available and it costs the sender nothing.
+
+Sound takes part in the sequence accounting and in nothing else. It reaches no
+reassembly: one Opus packet is one datagram, so there is nothing to put back
+together, and every field that would say which picture it belongs to is absent
+rather than meaningless. It is counted in `seq` for the same reason parity and
+padding are: it costs the path the same bytes, its loss is the same evidence
+about the path, and a receiver report that skipped it would omit a tenth of the
+session's datagrams from every delay measurement taken.
+
+It is not paced with the picture, and the host must not queue it behind one. A
+key frame is released over tens of milliseconds, and sound queued behind one
+arrives that late every time a key frame goes out. A gap in the picture is a
+frame nobody sees; a gap in sound is a click everybody hears.
+
+### Why sound takes a flag bit
+
+`slice_id` 255 is what forward error correction took, and the next identifier
+down would have cost the picture a slice it can use. That is the small reason.
+
+The real one is that `slice_id` is read **after** the fragment fields, and on an
+audio datagram those fields describe nothing. Marking sound the way parity is
+marked would mean validating a fragment count and index that the sender never
+wrote, on every audio packet, before finding out that it is not a picture. The
+flag bit is read first, exactly as padding's is, which is what lets a datagram
+that belongs to no frame skip every check about frames.
+
+Bits 4 through 7 stay spare, and a receiver must ignore them.

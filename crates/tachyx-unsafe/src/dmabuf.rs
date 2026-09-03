@@ -5,8 +5,8 @@
 
 use std::os::fd::OwnedFd;
 
-use gstreamer_allocators::DmaBufAllocator;
 use gstreamer_allocators::prelude::*;
+use gstreamer_allocators::DmaBufAllocator;
 
 /// Wraps one plane of a shared buffer as GStreamer memory.
 ///

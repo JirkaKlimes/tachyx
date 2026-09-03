@@ -1,0 +1,39 @@
+[package]
+name = "tachyx-relayd"
+description = "The tachyx relay: presence, rendezvous, reflexive addresses and splicing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "tachyx_relayd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "relayd"
+path = "src/main.rs"
+
+[dependencies]
+tachyx-crypto.workspace = true
+tachyx-relay.workspace = true
+tachyx-transport.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+governor.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+ring.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tachyx-proto.workspace = true
+
+[lints]
+workspace = true

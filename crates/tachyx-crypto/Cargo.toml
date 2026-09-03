@@ -1,0 +1,29 @@
+[package]
+name = "tachyx-crypto"
+description = "tachyx device identity, pairing, and the records both sides keep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+data-encoding.workspace = true
+pake-cpace.workspace = true
+postcard.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+zeroize.workspace = true
+
+# The pairing link has to fit a terminal, and a character count is not that
+# measurement. The test draws the code and reads its module count.
+[dev-dependencies]
+qrcode.workspace = true
+
+[lints]
+workspace = true

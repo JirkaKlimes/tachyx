@@ -73,15 +73,20 @@ const ENCODERS: [(Codec, &[&str]); 2] = [
 /// becomes interactive again.
 const BUCKET_CEILING: Duration = Duration::from_millis(100);
 
-/// How long a lost frame may leave the picture wrong.
+/// Pictures the encoder is allowed to code before it schedules a key frame of
+/// its own.
 ///
-/// The scheduled key frame is the only thing that ends the damage: this encoder
-/// offers neither intra refresh nor long-term reference frames, so there is no
-/// cheaper repair. A client that notices asks for one sooner; this bounds the
-/// case where it does not notice, or where its request was refused.
-const KEY_FRAME_INTERVAL_SECONDS: u32 = 2;
-
-/// The largest `key-int-max` the element's property accepts.
+/// The largest the property accepts, which is as close to an infinite group of
+/// pictures as this element reaches: `gst-inspect-1.0` gives `key-int-max` a
+/// range of 0 to 1024 on both `vah264enc` and `vaav1enc`, and 0 means the
+/// element picks one rather than none.
+///
+/// Nothing here wants a scheduled key frame. Every real cause has a caller:
+/// the session start, a resolution or bitrate change, and a client that lost a
+/// frame and asked. A key frame nobody asked for is eight delta frames of
+/// bitrate and tens of milliseconds of pacing spent on a repair with nothing to
+/// repair. See `tachyx_hostd::session` for the one case that has no caller and
+/// for what now covers it.
 const MAX_KEY_INTERVAL: u32 = 1024;
 
 /// What to encode, and at what rate.
@@ -436,7 +441,10 @@ impl Encoder {
             let budget = Arc::clone(&budget);
             std::thread::Builder::new()
                 .name("tachyx-encode".to_owned())
-                .spawn(move || pump(&frames, &control, &counters, &admission, &budget, &sender))?
+                .spawn(move || {
+                    tachyx_sched::raise("encode");
+                    pump(&frames, &control, &counters, &admission, &budget, &sender)
+                })?
         };
 
         Ok((
@@ -473,8 +481,8 @@ impl Encoder {
     /// refused here never reaches the encoder, so the reference chain is
     /// unbroken and every picture that does go out stays decodable. Encoding a
     /// frame and then dropping it on the wire would instead corrupt the picture
-    /// until the next key frame, which with one reference frame is up to
-    /// [`KEY_FRAME_INTERVAL_SECONDS`] away.
+    /// until the next key frame, which is whenever somebody asks for one: no
+    /// key frame is scheduled at all. See [`MAX_KEY_INTERVAL`].
     ///
     /// It starts set, so an encoder nobody gates encodes everything. Refusals
     /// are counted in [`EncodeStats::refused`], apart from the frames capture
@@ -743,14 +751,6 @@ impl Control {
     /// scaler does not convert frame rate: a filter asking it for another rate
     /// fails to link.
     fn apply_rate(&self, rate: Rate) -> Result<(), Error> {
-        // Written first, and it has to be. `key-int-max` is not among the
-        // properties the element marks changeable while playing: it stores the
-        // value and only builds a group of pictures out of it when it
-        // reconfigures. Everything below forces a reconfiguration, the frame
-        // rate in the source caps and the `bitrate` write alike, so a value
-        // written after any of them arrives a group of pictures late.
-        self.encoder
-            .set_property("key-int-max", key_interval(rate.framerate));
         self.source.set_caps(Some(&self.source_caps(rate)?));
         self.interval
             .store(frame_nanos(rate.framerate), Ordering::Relaxed);
@@ -838,24 +838,6 @@ fn encoder_for(codec: Codec) -> Result<gst::Element, Error> {
         .ok_or(Error::MissingEncoder(codec))
 }
 
-/// Pictures allowed between key frames at `declared`, in the element's units.
-///
-/// Counted from the frame rate rather than fixed, because the property counts
-/// pictures and the ladder moves the rate under it: a hundred and twenty is two
-/// seconds at sixty hertz, eight seconds at the ladder's fifteen hertz floor,
-/// and one second at a hundred and twenty.
-///
-/// Two seconds is the ceiling on how long a picture stays wrong. With one
-/// reference frame and no intra refresh, a single frame lost on the wire leaves
-/// every frame after it undecodable until the next key frame, and measured on a
-/// phone that cost nine hundred frames out of two thousand eight hundred. Key
-/// frames are cheap enough to spend now that parity carries them and the
-/// picture is scaled to what the client shows.
-fn key_interval(declared: crate::Framerate) -> u32 {
-    (KEY_FRAME_INTERVAL_SECONDS.saturating_mul(declared.millihertz()) / 1000)
-        .clamp(1, MAX_KEY_INTERVAL)
-}
-
 /// Writes the settings that never move once the pipeline is up.
 ///
 /// Everything outside the `match` belongs to `GstVaBaseEnc` and is on every
@@ -878,6 +860,12 @@ fn configure_encoder(codec: Codec, encoder: &gst::Element) {
     // Measured: at a hundred the requested buffer is honoured and no filler
     // returns.
     encoder.set_property("target-percentage", 100u32);
+    // Written here rather than beside the frame rate, because it no longer
+    // depends on one. It is also not among the properties the element marks
+    // changeable while playing: it stores the value and only builds a group of
+    // pictures out of it when it reconfigures, so a value written later than
+    // this would arrive a group of pictures late.
+    encoder.set_property("key-int-max", MAX_KEY_INTERVAL);
     encoder.set_property("ref-frames", 1u32);
     encoder.set_property_from_str("mbbrc", "disabled");
     encoder.set_property(
@@ -1350,21 +1338,26 @@ mod tests {
         );
     }
 
+    /// A property write that is out of range is clamped by `GObject` and only
+    /// warned about, so an element whose ceiling is lower than
+    /// [`MAX_KEY_INTERVAL`] would quietly schedule key frames again. This reads
+    /// the value back off the real element on whatever hardware is running the
+    /// test, and says nothing on a machine that has no VA encoder.
     #[test]
-    fn the_key_interval_is_two_seconds_whatever_the_declared_rate() {
-        let at = |millihertz| {
-            key_interval(crate::Framerate::from_millihertz(millihertz).expect("nonzero"))
-        };
-        assert_eq!(at(60_000), 120);
-        // The ladder's floor, where the fixed hundred and twenty was eight
-        // seconds of a picture nothing could repair.
-        assert_eq!(at(15_000), 30);
-        assert_eq!(at(119_998), 239);
-        assert_eq!(
-            at(1_000_000),
-            MAX_KEY_INTERVAL,
-            "the property's own ceiling"
-        );
+    fn the_encoder_really_takes_the_longest_group_of_pictures_it_advertises() {
+        let Ok(available) = encoders() else { return };
+        for codec in [Codec::H264, Codec::Av1] {
+            if !available.contains(codec) {
+                continue;
+            }
+            let encoder = encoder_for(codec).expect("the registry just listed it");
+            configure_encoder(codec, &encoder);
+            assert_eq!(
+                encoder.property::<u32>("key-int-max"),
+                MAX_KEY_INTERVAL,
+                "{codec} clamped the group of pictures"
+            );
+        }
     }
 
     fn nal(kind: u8, len: usize) -> Vec<u8> {

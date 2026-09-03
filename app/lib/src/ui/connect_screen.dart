@@ -3,6 +3,8 @@ library;
 
 import 'package:flutter/material.dart';
 
+import 'package:tachyx/src/rust/api/pairing.dart' show KnownHostView;
+import 'package:tachyx/src/session/hosts.dart';
 import 'package:tachyx/src/session/link.dart';
 import 'package:tachyx/src/settings.dart';
 import 'package:tachyx/src/ui/host_list.dart';
@@ -20,7 +22,9 @@ class ConnectScreen extends StatefulWidget {
     required this.state,
     required this.protocolVersion,
     required this.settings,
+    required this.book,
     required this.onDial,
+    required this.onPair,
     required this.onDetach,
     super.key,
   });
@@ -31,11 +35,17 @@ class ConnectScreen extends StatefulWidget {
   /// The protocol version this build speaks.
   final int protocolVersion;
 
-  /// The kept hosts and the user's other choices.
+  /// What a stream may cost and how the trackpad feels.
   final Settings settings;
 
-  /// Called with a `host:port` address to dial.
-  final ValueChanged<String> onDial;
+  /// The hosts this client has paired with.
+  final HostBook book;
+
+  /// Called with the host to dial.
+  final ValueChanged<KnownHostView> onDial;
+
+  /// Called when the user wants to pair with a new host.
+  final VoidCallback onPair;
 
   /// Called when the user wants the input surface with no host behind it.
   final VoidCallback onDetach;
@@ -45,25 +55,11 @@ class ConnectScreen extends StatefulWidget {
 }
 
 class _ConnectScreenState extends State<ConnectScreen> {
-  /// Whether the add form is open. Open by itself while the list is empty,
-  /// because an empty list leaves nothing else on the screen to act on.
-  bool _adding = false;
-
-  void _add(String address) {
-    widget.settings.keepHost(address);
-    setState(() => _adding = false);
-  }
-
   void _openSettings() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (BuildContext context) => SettingsScreen(
-          settings: widget.settings,
-          onConnect: (String address) {
-            Navigator.of(context).pop();
-            widget.onDial(address);
-          },
-        ),
+        builder: (BuildContext context) =>
+            SettingsScreen(settings: widget.settings),
       ),
     );
   }
@@ -73,10 +69,9 @@ class _ConnectScreenState extends State<ConnectScreen> {
     color: Shade.ground,
     child: SafeArea(
       child: AnimatedBuilder(
-        animation: widget.settings,
+        animation: Listenable.merge(<Listenable>[widget.settings, widget.book]),
         builder: (BuildContext context, Widget? _) {
-          final List<String> hosts = widget.settings.hosts;
-          final bool adding = _adding || hosts.isEmpty;
+          final List<KnownHostView> hosts = widget.book.hosts;
           return Stack(
             children: <Widget>[
               Center(
@@ -101,20 +96,27 @@ class _ConnectScreenState extends State<ConnectScreen> {
                           hosts: hosts,
                           state: widget.state,
                           onConnect: widget.onDial,
-                          onForget: widget.settings.forgetHost,
+                          onForget: widget.book.forget,
                         ),
-                        const SizedBox(height: 14),
-                        if (adding)
-                          AddHostForm(onAdd: _add)
-                        else
-                          TextButton(
-                            onPressed: () => setState(() => _adding = true),
-                            style: TextButton.styleFrom(
-                              foregroundColor: Shade.faint,
-                              alignment: Alignment.centerLeft,
+                        if (widget.book.fault != null) ...<Widget>[
+                          const SizedBox(height: 10),
+                          Text(
+                            widget.book.fault!,
+                            style: readout.copyWith(
+                              color: Shade.bad,
+                              fontSize: 11,
                             ),
-                            child: const Text('+ add host'),
                           ),
+                        ],
+                        const SizedBox(height: 14),
+                        TextButton(
+                          onPressed: widget.onPair,
+                          style: TextButton.styleFrom(
+                            foregroundColor: Shade.faint,
+                            alignment: Alignment.centerLeft,
+                          ),
+                          child: const Text('+ pair with a host'),
+                        ),
                       ],
                     ),
                   ),

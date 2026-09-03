@@ -1,0 +1,28 @@
+[package]
+name = "tachyx-audio"
+description = "The client's decode and play path: Opus packets out of the datagrams into the machine's own sound output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tachyx-client.workspace = true
+opus.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+tachyx-unsafe.workspace = true
+ndk = { workspace = true, features = ["audio"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+
+[dev-dependencies]
+tachyx-proto.workspace = true
+
+[lints]
+workspace = true

@@ -25,34 +25,44 @@ final class Offline extends Link {
   const Offline();
 }
 
-/// A connection to [address] is being opened.
+/// A connection to [host] is being opened.
 final class Dialling extends Link {
-  /// Dialling [address].
-  const Dialling(this.address);
+  /// Dialling [host], which is called [name].
+  const Dialling(this.host, this.name);
 
-  /// Where the client is calling.
-  final String address;
+  /// The host's identifier, which is what is dialled. Not an address: a host is
+  /// reached by trying what it gave at pairing and then by asking a relay.
+  final String host;
+
+  /// What that host calls itself, for the screen.
+  final String name;
 }
 
-/// A session is open with the host at [address].
+/// A session is open with [host].
 final class Live extends Link {
-  /// [session] is open with [address].
-  const Live(this.address, this.session);
+  /// [session] is open with [host], which is called [name].
+  const Live(this.host, this.name, this.session);
 
-  /// Where the host is.
-  final String address;
+  /// The host's identifier.
+  final String host;
+
+  /// What it calls itself.
+  final String name;
 
   /// The open session.
   final Session session;
 }
 
-/// The host at [address] could not be reached, and this is what went wrong.
+/// [host] could not be reached, and this is what went wrong.
 final class Refused extends Link {
-  /// [address] refused the connection, saying [reason].
-  const Refused(this.address, this.reason);
+  /// [host] refused the connection, saying [reason].
+  const Refused(this.host, this.name, this.reason);
 
-  /// Where the client called.
-  final String address;
+  /// The host's identifier.
+  final String host;
+
+  /// What it calls itself.
+  final String name;
 
   /// What the client was told, in the words it was told in.
   final String reason;
@@ -85,36 +95,43 @@ class HostLink extends ChangeNotifier {
   /// Where the client is with a host.
   Link get state => _state;
 
-  /// Opens a session with the host at [address], for a video surface of
-  /// [viewport] physical pixels on a display that refreshes [refreshHz] times a
-  /// second, spending at most [bitrateCeiling] bits a second.
+  /// Opens a session with [host], for a video surface of [viewport] physical
+  /// pixels on a display that refreshes [refreshHz] times a second, spending at
+  /// most [bitrateCeiling] bits a second.
   ///
-  /// A dial while one is already under way is ignored here rather than in
-  /// every screen that can ask for one.
+  /// [host] is a device identifier, not an address. The client tries the
+  /// addresses that host gave at pairing and then asks a [relays] relay, and
+  /// either way the identifier is the only half that is checked.
+  ///
+  /// A dial while one is already under way is ignored here rather than in every
+  /// screen that can ask for one.
   Future<void> dial(
-    String address, {
+    String host, {
+    required String name,
     required (int, int) viewport,
     required int refreshHz,
     required int bitrateCeiling,
+    required List<String> relays,
   }) async {
     if (_state is Dialling) return;
-    _set(Dialling(address));
+    _set(Dialling(host, name));
     try {
-      // The host's key is pinned here, so it must outlive the run. Anywhere the
-      // system may clear would silently turn every reconnection into a first
-      // meeting, which is the one moment trust on first use cannot defend.
+      // This client's own key lives here, and it is the key the host paired
+      // with. A directory the system may clear would take it, and a host that no
+      // longer knows this device refuses every session until it is paired again.
       final Directory state = await getApplicationSupportDirectory();
       final Session session = await connect(
-        address: address,
+        device: host,
         viewportWidth: viewport.$1,
         viewportHeight: viewport.$2,
         refreshHz: refreshHz,
         stateDirectory: state.path,
+        relays: relays,
         bitrateCeiling: bitrateCeiling,
       );
-      _set(Live(address, session));
+      _set(Live(host, name, session));
     } on Object catch (error) {
-      _set(Refused(address, describe(error)));
+      _set(Refused(host, name, describe(error)));
     }
   }
 
@@ -136,8 +153,9 @@ class HostLink extends ChangeNotifier {
   /// What went wrong, in the words the thing that failed used.
   ///
   /// A failure from Rust arrives wrapped, and the wrapper's class name in front
-  /// of the message tells the reader nothing they can act on.
-  @visibleForTesting
+  /// of the message tells the reader nothing they can act on. Shared with
+  /// [HostBook], because a pairing that failed has to say the same kind of
+  /// sentence a dial that failed says.
   static String describe(Object error) => switch (error) {
     AnyhowException(:final String message) => message,
     PanicException(:final String message) => 'the client panicked: $message',

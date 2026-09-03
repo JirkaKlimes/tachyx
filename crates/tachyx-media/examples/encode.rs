@@ -143,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         suffix: args.codec.suffix(),
         frames: args.frames,
         seen: Marks::default(),
+        pictures: Pictures::default(),
     };
     run.settle()?;
     println!("\n{}", heading());
@@ -180,6 +181,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run.phase("steady", |_| Ok(()))?;
     }
 
+    report(&run);
+    run.encoder.stop()?;
+    run.capture.stop()?;
+    Ok(())
+}
+
+/// What the whole run did, after the per-phase table.
+fn report(run: &Run) {
     let stats = run.encoder.stats();
     println!(
         "\nencoder latency p50 {:.2} ms  p90 {:.2} ms  p99 {:.2} ms  max {:.2} ms  over {} units",
@@ -188,6 +197,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         millis(stats.latency.p99),
         millis(stats.latency.max),
         stats.encoded
+    );
+    let pictures = run.pictures;
+    println!(
+        "pictures {} keys averaging {:.1} kB, {} deltas averaging {:.1} kB",
+        pictures.keys,
+        Pictures::mean(pictures.keys, pictures.key_bytes),
+        pictures.deltas,
+        Pictures::mean(pictures.deltas, pictures.delta_bytes),
     );
     println!(
         "filler {:.3}% of {} bytes, refused {}",
@@ -200,9 +217,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "capture captured {} dropped {} failed {} starved {}",
         ring.captured, ring.dropped, ring.failed, ring.starved
     );
-    run.encoder.stop()?;
-    run.capture.stop()?;
-    Ok(())
 }
 
 /// Everything one run needs to keep, so a phase is a closure and a count.
@@ -215,6 +229,49 @@ struct Run {
     suffix: &'static str,
     frames: usize,
     seen: Marks,
+    pictures: Pictures,
+}
+
+/// What the run's access units weighed, kept apart by kind.
+///
+/// The ratio between the two is what decides everything about the group of
+/// pictures: a scheduled key frame costs this many delta frames, and the share
+/// of a stream it takes is that ratio over the interval it is scheduled at.
+#[derive(Debug, Default, Clone, Copy)]
+struct Pictures {
+    keys: usize,
+    key_bytes: usize,
+    deltas: usize,
+    delta_bytes: usize,
+}
+
+impl Pictures {
+    fn push(&mut self, kind: FrameKind, bytes: usize) {
+        match kind {
+            FrameKind::Key => {
+                self.keys += 1;
+                self.key_bytes += bytes;
+            }
+            FrameKind::Delta => {
+                self.deltas += 1;
+                self.delta_bytes += bytes;
+            }
+        }
+    }
+
+    fn mean(count: usize, bytes: usize) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a byte count over a frame count, printed to one decimal"
+        )]
+        {
+            if count == 0 {
+                0.0
+            } else {
+                bytes as f64 / count as f64 / 1000.0
+            }
+        }
+    }
 }
 
 /// The counters as they stood at the end of the last phase.
@@ -267,7 +324,10 @@ impl Run {
         let mut previous = started;
         let mut first_gap = Duration::ZERO;
         let mut worst_gap = Duration::ZERO;
-        let mut first_key = None;
+        // How many key frames the phase carried. The phase opens on one, so
+        // anything above one is a key frame the encoder scheduled by itself,
+        // which is what the group of pictures decides.
+        let mut keys = 0usize;
         for index in 0..self.frames {
             let unit = self.units.recv().ok_or_else(|| self.stopped())?;
             let now = Instant::now();
@@ -278,9 +338,10 @@ impl Run {
             } else {
                 worst_gap = worst_gap.max(gap);
             }
-            if first_key.is_none() && matches!(unit.kind, FrameKind::Key) {
-                first_key = Some(index + 1);
+            if matches!(unit.kind, FrameKind::Key) {
+                keys += 1;
             }
+            self.pictures.push(unit.kind, unit.bytes.len());
             file.write_all(&unit.bytes)?;
         }
         let elapsed = started.elapsed();
@@ -300,7 +361,7 @@ impl Run {
             millis(first_gap),
             millis(worst_gap),
             millis(applied),
-            first_key.map_or("none".to_owned(), |at| at.to_string()),
+            keys,
             capture.dropped - before.capture.dropped,
             capture.starved - before.capture.starved,
             format!("{:.2}", megabits(bytes + filler, elapsed)),
@@ -319,6 +380,7 @@ impl Run {
         for taken in 1..=self.frames {
             let unit = self.units.recv().ok_or_else(|| self.stopped())?;
             file.write_all(&unit.bytes)?;
+            self.pictures.push(unit.kind, unit.bytes.len());
             if matches!(unit.kind, FrameKind::Key) {
                 return Ok(taken);
             }
@@ -371,7 +433,7 @@ fn heading() -> String {
         "first ms",
         "worst ms",
         "apply ms",
-        "key at",
+        "keys",
         "drop",
         "starve",
         "Mbit/s",

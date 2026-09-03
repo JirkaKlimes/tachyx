@@ -17,27 +17,28 @@
 //!
 //! The whole of this module exists to make that path unreachable. A frame is
 //! offered only when the queue provably has room for all of it, and is
-//! otherwise refused whole, by us, before it is sent.
+//! otherwise refused whole, by us, before it is encoded. The record of that
+//! queue is in [`crate::queue`], because sound writes to it too.
 //!
 //! The datagrams of a frame that is accepted are then released at a byte rate
 //! rather than handed over back to back. Why, and at what rate, is in
 //! [`crate::pace`].
 
-use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use quinn::Connection;
 use tachyx_congestion::{ClusterId, Probe, Release, cluster_datagrams};
 use tachyx_proto::control::CodedSize;
 use tachyx_proto::media::{FrameKind, HEADER_LEN, Seq};
 use tachyx_proto::packet::{AccessUnit, Packetiser, Parity};
 
+use crate::audio::AudioSender;
 use crate::pace::{Pacer, rate_for};
+use crate::queue::{Handed, Outgoing, QUEUE_OVERHEAD};
 
 /// Release records held for the controller to read.
 ///
@@ -47,18 +48,6 @@ use crate::pace::{Pacer, rate_for};
 /// the controller skips a datagram it has no record of, which is exactly what
 /// it does for one that has aged out.
 const RECORD_BACKLOG: usize = 8_192;
-
-/// Bytes of accounting quinn charges for each queued datagram, on top of its
-/// payload.
-///
-/// Its outgoing queue holds `quinn_proto::frame::Datagram`, which is one
-/// `Bytes` and nothing else, and charges `size_of` that per entry. This is the
-/// term [`quinn::Connection::datagram_send_buffer_space`] leaves out: that
-/// report subtracts one of these from the whole buffer, while the eviction loop
-/// it is supposed to predict charges one per datagram already queued. At the
-/// ninety-two datagrams a 1080p key frame occupies, the difference is 2944
-/// bytes the report does not show.
-const QUEUE_OVERHEAD: usize = size_of::<Bytes>();
 
 /// A 1080p60 key frame out of `vah264enc`, measured on the target machine.
 const MEASURED_KEY_FRAME_BYTES: usize = 130_427;
@@ -195,16 +184,11 @@ pub enum Sent {
 /// whole.
 #[derive(Debug)]
 pub struct VideoSender {
-    connection: Connection,
+    /// The connection, and the record of what is queued on it. Shared with the
+    /// sound path, which writes to the same queue. See [`crate::queue`].
+    outgoing: Arc<Outgoing>,
     packetiser: Packetiser,
     datagrams: Vec<Vec<u8>>,
-    /// The size quinn was configured to give the outgoing datagram queue.
-    /// Nothing on the connection reports it back, and the gate cannot be
-    /// exact without it.
-    buffer: usize,
-    /// Sizes of the datagrams pushed onto that queue, oldest first, less the
-    /// ones quinn is known to have taken.
-    outstanding: VecDeque<usize>,
     key_frame_bytes: usize,
     /// Bytes to expect an ordinary picture to occupy.
     ///
@@ -318,11 +302,9 @@ impl VideoSender {
         let (asked, probes) = sync_channel(1);
         (
             Self {
-                connection,
+                outgoing: Arc::new(Outgoing::new(connection, buffer)),
                 packetiser: Packetiser::new(NOMINAL_PAYLOAD),
                 datagrams: Vec::new(),
-                buffer,
-                outstanding: VecDeque::new(),
                 key_frame_bytes: MEASURED_KEY_FRAME_BYTES,
                 delta_bytes: MEASURED_DELTA_FRAME_BYTES,
                 target: Arc::clone(&shared),
@@ -341,6 +323,25 @@ impl VideoSender {
                 records: drained,
                 probes: asked,
             },
+        )
+    }
+
+    /// A handle that puts encoded sound on the same connection.
+    ///
+    /// Made from here rather than built beside this, because the two paths have
+    /// to agree about three things and this is where all three live: the queue
+    /// they both write to and the record of it, the sequence number every
+    /// datagram is stamped with, and the channel the congestion controller
+    /// reads releases from. See [`crate::audio`].
+    ///
+    /// Taken before this sender is moved onto its own thread, and cloneable
+    /// afterwards, so the session can hand one to whatever encodes audio.
+    #[must_use]
+    pub fn audio(&self) -> AudioSender {
+        AudioSender::new(
+            Arc::clone(&self.outgoing),
+            self.packetiser.sequence(),
+            self.records.clone(),
         )
     }
 
@@ -368,10 +369,15 @@ impl VideoSender {
     #[must_use]
     pub fn payload_len(&self) -> Option<NonZeroUsize> {
         NonZeroUsize::new(
-            self.connection
+            self.connection()
                 .max_datagram_size()?
                 .saturating_sub(HEADER_LEN),
         )
+    }
+
+    /// The connection this sender writes to.
+    fn connection(&self) -> &Connection {
+        self.outgoing.connection()
     }
 
     /// Whether the queue has room for `datagrams` of `payload_per_datagram`
@@ -385,71 +391,13 @@ impl VideoSender {
     /// both unreachable on this hardware, so nothing recovers until the next
     /// key frame.
     ///
-    /// The header and the queue's own accounting are charged per datagram
-    /// rather than once, for the frame being offered and for every datagram
-    /// already queued. Both are terms
-    /// [`quinn::Connection::datagram_send_buffer_space`] omits: it subtracts a
-    /// single entry's accounting from the buffer, while the eviction loop it is
-    /// meant to predict charges one per entry. The report is therefore too
-    /// generous as soon as two datagrams are queued ahead of the frame, and
-    /// believing it reaches an eviction that does not merely lose the frame but
-    /// ends the connection. See this module's own documentation.
+    /// The accounting is charged per datagram rather than once, and the record
+    /// of the queue is shared with the sound path, which writes to it too. See
+    /// [`crate::queue`].
     #[must_use]
     pub fn can_send_frame(&self, datagrams: usize, payload_per_datagram: usize) -> bool {
-        let space = self.connection.datagram_send_buffer_space();
-        let Some(queued) = self.queued(space) else {
-            return false;
-        };
-        let required = datagrams.saturating_mul(payload_per_datagram + HEADER_LEN + QUEUE_OVERHEAD);
-        // `space` is the buffer less the payload bytes queued less one entry's
-        // accounting, so adding that entry back gives the bytes the queue has
-        // free, from which every entry in it charges its own.
-        required <= (space + QUEUE_OVERHEAD).saturating_sub(queued * QUEUE_OVERHEAD)
-    }
-
-    /// Datagrams quinn's outgoing queue still holds, or `None` when the record
-    /// of them cannot be squared with what quinn reports.
-    ///
-    /// quinn reports the payload bytes in that queue but never the number of
-    /// entries holding them, and its eviction charges one
-    /// [`QUEUE_OVERHEAD`] per entry. This transport is the only producer on the
-    /// queue and quinn takes from the front, so what is left is the tail of
-    /// what was pushed, and the tail whose sizes add up to the bytes reported
-    /// is the only one it can be.
-    ///
-    /// When they do not add up, something removed a datagram from the middle:
-    /// a path that shrinks makes quinn drop the queued datagrams too large for
-    /// it. The count is then unknown, the gate refuses everything, and the
-    /// record squares itself again the moment the queue drains.
-    fn queued(&self, space: usize) -> Option<usize> {
-        let held = self.held(space);
-        let mut bytes = 0;
-        let mut entries = 0;
-        for size in self.outstanding.iter().rev() {
-            if bytes >= held {
-                break;
-            }
-            bytes += size;
-            entries += 1;
-        }
-        (bytes == held).then_some(entries)
-    }
-
-    /// Forgets the datagrams quinn has taken off the queue.
-    fn forget_sent(&mut self) {
-        let space = self.connection.datagram_send_buffer_space();
-        if let Some(queued) = self.queued(space) {
-            self.outstanding.drain(..self.outstanding.len() - queued);
-        }
-    }
-
-    /// Payload bytes quinn's outgoing queue holds, from the space it reports
-    /// free.
-    ///
-    /// The report is the buffer less those bytes less one entry's accounting,
-    /// so adding that entry back leaves the bytes themselves.
-    const fn held(&self, space: usize) -> usize {
-        self.buffer.saturating_sub(space + QUEUE_OVERHEAD)
+        self.outgoing
+            .admits(datagrams, payload_per_datagram + HEADER_LEN)
     }
 
     /// Waits for quinn to take what it holds down to [`QUEUE_RESIDENCE`], so
@@ -459,13 +407,13 @@ impl VideoSender {
     /// [`DRAIN_DEADLINE`].
     fn drain_queue(&mut self, deadline: Instant) -> Result<(), VideoError> {
         let bound = queue_bound(self.target());
-        while self.held(self.connection.datagram_send_buffer_space()) > bound {
+        while self.outgoing.held() > bound {
             if Instant::now() >= deadline {
                 return Ok(());
             }
             self.wait(PACE_QUANTUM)?;
         }
-        self.forget_sent();
+        self.outgoing.prune();
         Ok(())
     }
 
@@ -526,7 +474,7 @@ impl VideoSender {
     /// controller but BBR.
     #[must_use]
     pub fn pacing_rate(&self) -> Option<u64> {
-        self.connection.congestion_state().metrics().pacing_rate
+        self.connection().congestion_state().metrics().pacing_rate
     }
 
     /// Sends one picture, or refuses it whole.
@@ -551,7 +499,7 @@ impl VideoSender {
         self.packetiser
             .set_parity(Parity::fixed(self.parity.load(Ordering::Relaxed)));
         self.take_probe(payload);
-        self.forget_sent();
+        self.outgoing.prune();
         // The packetiser's count, not the picture's: parity is real bytes on
         // this same queue, and a gate that counted only the picture would
         // under-estimate by a fifth and reach the eviction path above.
@@ -624,7 +572,7 @@ impl VideoSender {
                 // The queue drained while this frame was being released, so the
                 // record of what quinn still holds is stale by now. Squaring it
                 // is what keeps the gate exact for the next frame.
-                self.forget_sent();
+                self.outgoing.prune();
                 // The pacer's schedule is a schedule for leaving, not one for
                 // entering a second queue. Only where it already waits: a
                 // picture small enough to leave inside the pacer's burst
@@ -632,21 +580,23 @@ impl VideoSender {
                 self.drain_queue(deadline)?;
             }
             let at = Instant::now();
-            match self.connection.send_datagram(Bytes::from(datagram)) {
-                Ok(()) => {
-                    self.outstanding.push_back(queued);
-                    self.record(seq, at, queued);
-                }
+            match self.outgoing.send(queued, || datagram) {
+                Ok(Handed::Queued) => self.record(seq, at, queued),
+                // Two transients, and the same answer to both.
+                //
                 // The path's measured size can shrink underneath a frame: the
                 // transport lowers it from its own task when it decides a larger
                 // packet is being black-holed, and that lands mid-frame during
-                // the first seconds of a session. Refusing the rest of this
-                // picture is right, and the fragments already queued are
-                // harmless because a receiver abandons a frame it cannot
-                // complete. Treating it as fatal would end video for the life of
-                // the session over a transient the transport is in the middle of
-                // correcting.
-                Err(quinn::SendDatagramError::TooLarge) => {
+                // the first seconds of a session. The queue can also fill under
+                // a frame the gate admitted, because sound is handed over on
+                // the same queue while this picture is being paced out.
+                //
+                // Refusing the rest of this picture is right in either case,
+                // and the fragments already queued are harmless because a
+                // receiver abandons a frame it cannot complete. Treating it as
+                // fatal would end video for the life of the session over a
+                // transient the transport is in the middle of correcting.
+                Ok(Handed::NoRoom) | Err(quinn::SendDatagramError::TooLarge) => {
                     self.frames_refused += 1;
                     return Ok(Sent::Refused);
                 }
@@ -733,7 +683,7 @@ impl VideoSender {
         let Some(probe) = self.armed else {
             return Ok(0);
         };
-        self.forget_sent();
+        self.outgoing.prune();
         if !self.can_send_frame(probe.left, payload.get()) {
             self.armed = None;
             return Ok(0);
@@ -781,7 +731,7 @@ impl VideoSender {
     fn wait(&self, wait: Duration) -> Result<(), VideoError> {
         let due = Instant::now() + wait;
         while let Some(left) = due.checked_duration_since(Instant::now()) {
-            if let Some(reason) = self.connection.close_reason() {
+            if let Some(reason) = self.connection().close_reason() {
                 return Err(VideoError::Connection(reason));
             }
             std::thread::sleep(left.min(WAIT_SLICE));

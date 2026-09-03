@@ -4,6 +4,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:tachyx/src/rust/api/pairing.dart' show KnownHostView;
 import 'package:tachyx/src/session/link.dart';
 import 'package:tachyx/src/ui/theme.dart';
 
@@ -22,16 +23,17 @@ class HostList extends StatelessWidget {
     super.key,
   });
 
-  /// The kept addresses, most recently used first.
-  final List<String> hosts;
+  /// The paired hosts. An address is not enough to connect with any more: the
+  /// host has to hold this client's key, and only a pairing puts it there.
+  final List<KnownHostView> hosts;
 
   /// How far the client has got, so the row being dialled can say so.
   final Link state;
 
-  /// Called with the address of a tapped row.
-  final ValueChanged<String> onConnect;
+  /// Called with the device identifier of a tapped row.
+  final ValueChanged<KnownHostView> onConnect;
 
-  /// Called with the address of a crossed-off row.
+  /// Called with the device identifier of a crossed-off row.
   final ValueChanged<String> onForget;
 
   bool get _busy => state is Dialling;
@@ -42,7 +44,7 @@ class HostList extends StatelessWidget {
       return const Padding(
         padding: EdgeInsets.symmetric(vertical: 18),
         child: Text(
-          'no hosts yet. add one to begin.',
+          'no hosts yet. pair with one to begin.',
           style: TextStyle(color: Shade.dim, fontSize: 13),
         ),
       );
@@ -55,14 +57,14 @@ class HostList extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          for (final (int index, String address) in hosts.indexed) ...<Widget>[
+          for (final (int index, KnownHostView host) in hosts.indexed) ...<Widget>[
             if (index > 0) const Divider(height: 1, color: Shade.edge),
             _HostRow(
-              address: address,
+              host: host,
               state: state,
               enabled: !_busy,
-              onConnect: () => onConnect(address),
-              onForget: () => onForget(address),
+              onConnect: () => onConnect(host),
+              onForget: () => onForget(host.device),
             ),
           ],
         ],
@@ -73,14 +75,14 @@ class HostList extends StatelessWidget {
 
 class _HostRow extends StatelessWidget {
   const _HostRow({
-    required this.address,
+    required this.host,
     required this.state,
     required this.enabled,
     required this.onConnect,
     required this.onForget,
   });
 
-  final String address;
+  final KnownHostView host;
   final Link state;
   final bool enabled;
   final VoidCallback onConnect;
@@ -88,12 +90,12 @@ class _HostRow extends StatelessWidget {
 
   /// What this row has to say about itself, or null for a quiet row.
   Widget? _status() => switch (state) {
-    Dialling(:final String address) when address == this.address => Text(
+    Dialling(:final String host) when host == this.host.device => Text(
       'dialling…',
       style: readout.copyWith(color: Shade.faint, fontSize: 11),
     ),
-    Refused(:final String address, :final String reason)
-        when address == this.address =>
+    Refused(:final String host, :final String reason)
+        when host == this.host.device =>
       Text(
         reason,
         style: readout.copyWith(color: Shade.bad, fontSize: 11),
@@ -115,8 +117,16 @@ class _HostRow extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   Text(
-                    address,
-                    style: readout.copyWith(fontSize: 13),
+                    host.name,
+                    style: const TextStyle(color: Shade.text, fontSize: 14),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  // The identifier, because a name is chosen by the peer and two
+                  // hosts may pick the same one. This is what is compared.
+                  Text(
+                    host.short + (host.control ? '' : ' · view only'),
+                    style: readout.copyWith(color: Shade.dim, fontSize: 11),
                     overflow: TextOverflow.ellipsis,
                   ),
                   if (status != null) ...<Widget>[

@@ -43,4 +43,15 @@ pub mod report;
 /// logical pixels the compositor measures the pointer in and its picture gained
 /// an identifier, so a report from either side read by the other places the
 /// pointer by a fifth of the screen and draws it at the wrong size.
-pub const VERSION: u16 = 3;
+///
+/// Raised to 4 by audio, for two reasons at once. A datagram now carries sound
+/// as well as picture, told apart by a flag bit version 3 left spare, and a
+/// version 3 receiver ignores a spare bit rather than refusing it: it reads an
+/// audio datagram as a picture packet describing no fragments, rejects it, and
+/// never records its sequence number, so every one of them is reported lost.
+/// A hundred audio packets a second read as a hundred lost datagrams a second,
+/// which drives parity to its ceiling and the bitrate to the floor. And
+/// [`control::HostHello`] gained a field, which `postcard` writes with nothing
+/// to name it: the version is the only thing that tells a hello of one shape
+/// from a hello of the other, and it is read before the field that moved.
+pub const VERSION: u16 = 4;
