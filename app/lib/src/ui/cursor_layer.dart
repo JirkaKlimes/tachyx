@@ -20,13 +20,20 @@ import 'package:tachyx/src/session/cursor.dart';
 class FallbackPointer {
   const FallbackPointer._();
 
-  /// How tall the drawn arrow is, in logical pixels.
+  /// How tall the drawn arrow is, in logical pixels, and the smallest a pointer
+  /// is ever drawn.
   ///
   /// A fixed size rather than a fraction of the video: the host's own cursor
   /// scales with its screen because it is a picture of one, and this is not a
   /// picture of anything. It is what the client knows, drawn at a size a thumb
   /// can find.
-  static const double height = 22;
+  ///
+  /// The same size is the floor for the host's own picture. A desktop pointer
+  /// is a couple of dozen of the host's logical pixels, and a phone shows a
+  /// whole ultra-wide screen in a few hundred of its own, so the pointer drawn
+  /// true to that fraction comes out a handful of pixels across: there and
+  /// invisible. See [CursorPainter.atLeast].
+  static const double height = 16;
 
   /// The arrow, with its tip at the origin.
   static Path path() => Path()
@@ -96,8 +103,28 @@ class CursorPainter extends CustomPainter {
         art.image.width.toDouble(),
         art.image.height.toDouble(),
       ),
-      onWholePixels(rect),
+      onWholePixels(atLeast(rect, drawn.hotspotIn(size))),
       Paint()..filterQuality = FilterQuality.medium,
+    );
+  }
+
+  /// [rect] grown about [hotspot] until it is at least
+  /// [FallbackPointer.height] logical pixels on its longer side.
+  ///
+  /// Grown about the hotspot, not the corner, because the hotspot is the point
+  /// the finger is steering and a click lands on: it must stay put while the
+  /// picture around it gets bigger. A pointer already at least this large is
+  /// left alone, so a host with an accessibility cursor keeps its true size.
+  @visibleForTesting
+  Rect atLeast(Rect rect, Offset hotspot) {
+    final double extent = math.max(rect.width, rect.height);
+    if (extent <= 0 || extent >= FallbackPointer.height) return rect;
+    final double by = FallbackPointer.height / extent;
+    return Rect.fromLTWH(
+      hotspot.dx - (hotspot.dx - rect.left) * by,
+      hotspot.dy - (hotspot.dy - rect.top) * by,
+      rect.width * by,
+      rect.height * by,
     );
   }
 
