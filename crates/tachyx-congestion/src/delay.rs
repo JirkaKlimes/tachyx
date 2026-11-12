@@ -61,8 +61,8 @@ const THRESHOLD_START: f64 = 12.5;
 /// How fast the threshold rises towards a noisy link.
 const K_UP: f64 = 0.0087;
 
-/// How fast it falls towards a quiet one: thirty times faster than it rises, so
-/// a link that becomes quiet regains its sensitivity quickly.
+/// How fast it falls towards a quiet one: four and a half times faster than it
+/// rises, so a link that becomes quiet regains its sensitivity quickly.
 const K_DOWN: f64 = 0.039;
 
 /// Below this the picture would be unreadable anyway, and above it the detector
@@ -443,7 +443,7 @@ mod tests {
             }
             peak = peak.max(noisy.threshold());
         }
-        // It falls thirty times faster than it rises, so it is back at the
+        // It falls four and a half times faster than it rises, so it is back at the
         // floor between swells and the peak is what says it moved at all.
         assert!(
             peak > THRESHOLD_START && peak > quiet_peak,

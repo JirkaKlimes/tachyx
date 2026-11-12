@@ -1,7 +1,7 @@
 //! What the host put on the path, and how a receiver report is matched to it.
 //!
 //! The report names datagrams by the `seq` already in the media header, which
-//! is sixteen bits and wraps every 93 seconds at 20 Mbit/s. Numbers are
+//! is sixteen bits and wraps in under 40 seconds at 20 Mbit/s. Numbers are
 //! extended to 64 bits on the way in, so the wrap is invisible for as long as
 //! reports keep arriving, and a report whose base cannot be placed against what
 //! was sent discards the record rather than being trusted.

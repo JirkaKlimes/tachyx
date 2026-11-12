@@ -204,7 +204,7 @@ impl Controller {
         let at = self.history.micros(now);
         let Some(packets) = self.history.read(report) else {
             // The report names a sequence this host cannot place against what
-            // it sent. Sixteen bits wrap every 93 seconds at 20 Mbit/s, and the
+            // it sent. Sixteen bits wrap in under 40 seconds at 20 Mbit/s, and the
             // unwrapping is only correct while reports arrive more often than
             // half a wrap, so the record is discarded rather than trusted.
             self.history.clear();
