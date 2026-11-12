@@ -1,104 +1,163 @@
-# tachyx — architecture
+# tachyx architecture
 
-Open-source remote desktop: screen + keyboard/mouse first. Rust core, Flutter clients, Rust relays.
-Positioning: RustDesk's openness + Parsec's latency + Mullvad's economics + WireGuard's audit posture.
+tachyx is an open-source remote desktop: screen, keyboard and pointer first.
+The core and the relay are Rust. The clients are Flutter. The goal: latency
+close to a local display, a protocol small enough to audit, relays paid per GB,
+and no server that can grant access to a desktop.
 
-Working name `tachyx` (tachys = fast). All names provisional.
+This is the original overall design, and part of it is not built. Each section
+starts with its status, checked against the code: **built**, **partly built**
+(the section says which parts), or **not built** (design only). The built parts
+have their own specifications, which win where they disagree with this one:
+[`protocol.md`](protocol.md) (session), [`pairing.md`](pairing.md) (identity and
+pairing), [`relay.md`](relay.md) (relay), [`congestion.md`](congestion.md) (rate
+control). [`findings.md`](findings.md) records the parts of this design that
+measurement disproved. They stay here, marked.
+
+Names are provisional. `tachyx` is from the Greek *tachys*, fast.
 
 ---
 
 ## 1. Design pillars
 
-1. **Zero-trust infrastructure.** Relays and coordination move ciphertext and routing metadata only.
-   Access to a host is granted exclusively by key pairing between devices. Compromise of our cloud
-   must never grant access to anyone's desktop. This is what makes self-hosting, community relays,
-   and anonymous accounts safe.
-2. **One transport: QUIC.** Unreliable datagrams for video, reliable ordered streams for
-   input/control, connection migration for Wi-Fi↔LTE handoff, 0-RTT resume. WebTransport is QUIC,
-   so the web client shares the protocol instead of forking to WebRTC.
-3. **Direct-first, relay-metered.** Hole punching succeeds for most pairs (target 85–90%) and is
-   free forever, even at zero balance. Relays are the paid fallback — Mullvad-style pay-per-GB.
+Status: partly built. Pillar 1 holds for the built code. Pillar 2 holds except
+0-RTT and tested migration (section 6). Pillar 3: direct first is built,
+metering is not.
 
-Minimalism is applied where it buys security: the **audited core** is the protocol — transport,
-handshake, pairing, framing (~5–8k lines, published as a spec document like the WireGuard
-whitepaper). The media stack (encoders, capture) is inherently vendor glue; it lives behind traits
-in a separate **unprivileged, sandboxed process** (seccomp, no keys in its address space) and is
-swappable.
+1. **Zero-trust infrastructure.** Relays and coordination carry ciphertext and
+   routing metadata only. Access to a host comes only from key pairing between
+   devices. A compromise of the project's servers must never give access to a
+   desktop. This is what makes self-hosting, community relays and anonymous
+   accounts safe.
+2. **One transport: QUIC.** Unreliable datagrams for video, one reliable ordered
+   stream for input and control, connection migration for a Wi-Fi to LTE
+   handoff, 0-RTT resume. WebTransport is QUIC, so a web client shares the
+   protocol instead of a fork to WebRTC.
+3. **Direct first, relay metered.** Hole punching should succeed for most pairs
+   (target 85 to 90%, not measured, see relay.md). Direct sessions are free
+   forever, even at zero balance. Relays are the paid fallback: per GB,
+   prepaid on an anonymous account in the style of Mullvad.
+
+The audited core is the protocol: transport, handshake, pairing, framing.
+Target: 5 000 to 8 000 lines, published as a specification in the style of the
+WireGuard paper. The media stack (capture, encode) is vendor glue. The design
+puts it behind traits in a separate **unprivileged, sandboxed process**
+(seccomp, no keys in its address space). **Not built:** it runs inside
+`tachyx-hostd`.
 
 ---
 
 ## 2. Components
 
-| Component | Binary | Role |
-|---|---|---|
-| Host daemon | `hostd` | Capture, encode, input injection, policy, pairing list. Runs headless on a workstation. |
-| CLI | `tachyx-hostd <subcommand>` | Thin client over `hostd`'s Unix socket, on the same binary. See section 9. |
-| Client apps | Flutter | Desktop, mobile, web. Embed the Rust client core (FFI / wasm). Can also embed the host lib ("share this machine" toggle drives `hostd` over the same socket API). |
-| Relay | `relayd` | Zero-trust ciphertext forwarder + rendezvous mailboxes + presence. One static musl binary; self-hostable. Cloud fleet = same binary with billing module enabled. |
-| Coordination | `coordd` | Accounts, balances, token issuance, Stripe webhooks, signed relay directory, host→home-relay lookup. **Not on the connection path.** |
+Status: partly built.
 
-**Home relay:** each host keeps one persistent QUIC connection to its lowest-RTT relay (probed from
-the signed relay list). That connection is presence + rendezvous channel + fallback data path.
-Reconnects to a paired host never touch `coordd` — the client cached the home relay at pairing
-time. `coordd` down ⇒ no new pairings/top-ups; existing users unaffected.
+| Component | Binary | Role | Status |
+|---|---|---|---|
+| Host daemon | `tachyx-hostd` | Capture, encode, input injection, sound, pairing list, home relay connection. Runs headless on a workstation. | Built |
+| CLI | `tachyx-hostd <subcommand>` | Thin client over the daemon's Unix socket. Section 9. | Built |
+| Client apps | Flutter | Embed the Rust client core (FFI, or wasm for web). Design also: a "share this machine" toggle that drives `tachyx-hostd`. | Linux and Android built. Web, iOS, macOS, Windows, share toggle not built. |
+| Relay | `relayd` | Ciphertext forwarder, rendezvous mailboxes, presence. Self-hostable. Design: the cloud fleet is the same binary with a billing module. | Built, no billing |
+| Coordination | `coordd` | Accounts, balances, token issuance, Stripe webhooks, signed relay directory, host-to-home-relay lookup. **Not on the connection path.** | Not built |
 
-**Federation is safe** (unlike Tailscale DERP): a hostile relay can drop/delay traffic but never
-read or inject into a session, so community relays and the paid fleet are interchangeable
-trust-wise.
+**Home relay.** Each host keeps one persistent QUIC connection to its home
+relay: presence, rendezvous channel and fallback data path in one. Design: the
+lowest-RTT relay from the signed relay list. Built: the first relay in the
+host's configuration. The client stores the home relay at pairing, so a
+reconnect to a paired host never needs `coordd`. Pairing needs only a relay, so
+a `coordd` outage would stop only top-ups and directory lookups.
+
+**Federation is safe.** A hostile relay can drop or delay traffic but never read
+or inject into a session, so community relays and the paid fleet are
+interchangeable in trust. relay.md has the full threat statement.
 
 ---
 
 ## 3. Identity, pairing, auth
 
-### Device identity
-- Ed25519 keypair generated on first run; private key in the platform keystore
-  (Secret Service / TPM-backed where possible on Linux, Keychain, Android Keystore/StrongBox).
-- Public key **is** the device ID.
-- Accounts are Mullvad-style random 16-digit numbers, zero PII, used only for billing and
-  directory lookups. Losing the account loses balance, never access — access lives in pinned keys.
+Status: built, except the platform keystore, accounts, web client auth and
+enforcement of per-device permissions. pairing.md is the specification.
 
-### Pairing (first contact) — PAKE
-- Host allocates a **nameplate** (short mailbox number) on its home relay and generates a secret.
-- Display: QR (primary) = 128-bit secret + host public key + relay hint.
-  Typed fallback = `nameplate-secret`, e.g. `7-4921-8306` (**8-digit** secret).
-- Client joins the nameplate; both run **SPAKE2** over the mailbox; key-confirmation MACs both ways.
-- **One attempt per code.** A wrong guess burns the code and alerts loudly on the host.
-- Inside the SPAKE2 channel: exchange device certs, mutually cross-sign public keys, client stores
-  the host record (home relay, last endpoints), host stores the client key + permissions.
-- Optional short-auth-string (emoji triplet) shown on both screens for human verification.
+### Device identity
+
+- Built: an Ed25519 key pair, generated on first run. The public key **is** the
+  device ID. The private seed is a 0600 file (`device.key`) on hosts, relays
+  and clients.
+- Not built: the key in a platform keystore (Secret Service or TPM, Keychain,
+  Android Keystore or StrongBox). pairing.md, *What is not here*, says why the
+  key stays a file and stays Ed25519.
+- Not built: accounts. Design: Mullvad-style random 16-digit numbers, no
+  personal data, for billing and directory lookups only. Losing the account
+  loses balance, never access: access lives in pinned keys.
+
+### Pairing (first contact): PAKE
+
+Built.
+
+- The host opens a mailbox on its home relay. The relay allocates the
+  **nameplate** (a short mailbox number), so nameplates cannot collide.
+- The host shows two codes for that mailbox, each with its own secret. QR
+  (primary): 128-bit secret, host public key, relay address. Typed fallback:
+  `nameplate-secret`, for example `7-4921-8306` (**8-digit** secret).
+- Both ends run **CPace over Ristretto255** through the mailbox. The design
+  said SPAKE2; pairing.md says why it changed. Each sealed record is its own
+  key confirmation. There are no separate MACs.
+- **One attempt per code.** The first reply consumes the exchange. A wrong
+  guess closes the mailbox, the host logs it, and `pair` fails. The client
+  never resends a spent code.
+- Inside the channel: the client sends its key and name, then the host sends its
+  key, name, home relay, endpoints and permissions. Each side stores the other.
+- Three emoji (18 bits) show on both screens for an optional human check.
+- Not built, by decision: cross-signing of device keys (pairing.md).
 
 ### Why the short code is safe
-PAKE ⇒ zero offline attack; an active MITM (including a malicious rendezvous) gets exactly **one
-online guess per pairing**. At 8 digits that is 10⁻⁸ per attempt; across 10M pairings a fully
-malicious rendezvous expects ~0.1 successes. The QR path carries the full secret **and** the host
-key, so even a malicious server gets **zero** guesses. Nameplate collisions are impossible by
-construction — the relay allocates them.
+
+PAKE allows no offline attack. An active MITM, including a malicious
+rendezvous, gets **one online guess per code**. At 8 digits that is 10⁻⁸ per
+guess. Across 10M pairings a fully malicious rendezvous expects about 0.1
+successes. Against a hostile relay that bound rests on the client never
+resending a spent code (pairing.md, *One attempt per code*). The QR carries the
+full secret **and** the host key, so even a malicious server gets no useful
+guess.
 
 ### Every subsequent connection
-Mutual TLS 1.3 where each side presents a self-signed cert bound to its Ed25519 key and verifies
-the **exact pinned key** (rustls raw-public-key or custom verifier). No CA. No server in the loop.
+
+Built. Mutual TLS 1.3. Each side presents a self-signed certificate bound to
+its Ed25519 key and verifies the **exact pinned key** with a custom rustls
+verifier. No CA, no server in the loop, no trust on first use.
 
 ### Attacker checklist
+
 | Attacker | Outcome |
 |---|---|
-| Passive network observer | SPAKE2 group elements + TLS ciphertext; learns nothing |
-| Active MITM / evil rendezvous | One burned guess (typed) or zero (QR) |
-| Compromised `coordd` DB | Public keys + balances; can deny service, cannot impersonate/decrypt |
-| Compromised relay | Forwards ciphertext it cannot read; worst case drops packets |
+| Passive network observer | CPace group elements and TLS ciphertext. Learns nothing. |
+| Active MITM or hostile rendezvous | One burned guess (typed) or none (QR) |
+| Compromised `coordd` database (design) | Public keys and balances. Can deny service, cannot impersonate or decrypt. |
+| Compromised relay | Forwards ciphertext it cannot read. Worst case: drops packets. |
 | Stolen client device | Revoke that one key on the host |
-| Residual | Endpoint compromise; relay-visible metadata (who↔whom, when, bytes) |
+| Residual | Endpoint compromise. Relay-visible metadata: who talks to whom, when, how many bytes. |
 
 ### Host-side policy (per paired device)
-Permissions: `view` | `control`; `unattended` yes/no (no ⇒ local click to accept); revocable any
-time. **No ID+password unattended mode, ever** — that is the remote-support-scam vector.
+
+Permissions: `view` or `control`, and `unattended` yes or no (no means a local
+click accepts each session). Revocable at any time. **No ID-and-password
+unattended mode, ever**: that is the remote-support-scam vector.
+
+Partly built. The host records both flags at pairing, changes them with
+`pairings set`, and tells the client. **The session does not enforce them
+yet**: input from a view-only device is injected, and nothing asks for a local
+click.
 
 ### Web client auth
-No long-term keys in browser storage. Every web session is an ephemeral device approved
-WhatsApp-Web-style (QR + PAKE from a paired device), or via LAN share (below).
+
+Not built. Design: no long-term keys in browser storage. Every web session is
+an ephemeral device, approved WhatsApp-Web-style (QR and PAKE from a paired
+device) or through LAN share (section 8).
 
 ---
 
 ## 4. Handshakes
+
+Status: built. pairing.md and relay.md have the detail.
 
 ### Pairing
 
@@ -107,13 +166,12 @@ sequenceDiagram
     participant C as New client
     participant R as Rendezvous (relay mailbox)
     participant H as Host
-    H->>R: allocate nameplate, open mailbox
+    H->>R: Allocate, gets nameplate 7
     Note over H: shows 7-4921-8306 + QR
-    C->>R: join nameplate 7
-    C-->>H: SPAKE2 A/B (via mailbox, E2E)
-    C-->>H: key-confirm MACs (wrong code burns pairing)
-    C-->>H: exchange + cross-sign device keys
-    H-->>C: host record: home relay, endpoints, permissions
+    H-->>C: CPace step 1 for both codes (held until a client joins)
+    C->>R: Join 7
+    C-->>H: code form, CPace step 2, sealed client record
+    H-->>C: sealed host record: home relay, endpoints, permissions
     Note over C,H: keys pinned · mailbox closed · server learned nothing
 ```
 
@@ -124,301 +182,418 @@ sequenceDiagram
     participant C as Client
     participant R as Home relay
     participant H as Host
-    C->>R: QUIC connect + sealed offer for H
-    R->>H: deliver opaque offer
-    C->>R: observed address + candidates
-    H->>R: observed address + candidates
-    C->>H: simultaneous QUIC open (hole punch)
-    Note over C,R,H: punch failed ⇒ relay splices the two pipes (physical only)
-    C-->>H: E2E QUIC/TLS 1.3, pinned keys — identical direct or relayed
-    C-->>H: capabilities (codecs, subsampling, viewport, fps, HDR)
-    H-->>C: stream config (e.g. AV1 4:2:0, 1440p60, host downscales 4K)
-    C-->>H: media datagrams + reliable input stream
+    H->>R: QUIC connect, Register
+    R->>H: Observed (reflexive address)
+    C->>R: QUIC connect
+    R->>C: Observed (reflexive address)
+    C->>R: Connect: signed offer for H, with candidates
+    R->>H: Offered (the relay reads only the destination)
+    H->>R: Answer: signed, with candidates
+    R->>C: Answered
+    H--xC: punch: Initials the client drops
+    C->>H: QUIC connect, direct
+    Note over C,H: no connection in 2 s ⇒ Splice, the relay forwards packets
+    C-->>H: E2E QUIC/TLS 1.3, pinned keys, identical direct or relayed
+    C-->>H: ClientHello: decoders, viewport, frame rate, bitrate ceiling
+    H-->>C: HostHello, StreamConfig: codec, coded size, frame rate, bitrate
+    C-->>H: input and control on one reliable stream
+    H-->>C: video and sound datagrams
 ```
 
-Solid arrows = physical links; dashed = end-to-end content the relay cannot read. The relay does
-the STUN job itself (reports each peer's reflexive address over the existing connection — no
-separate STUN infra). Relayed sessions run the *same* E2E QUIC handshake through the spliced pipe.
+Solid arrows are physical links. Dashed arrows are end-to-end content the relay
+cannot read. The relay does the STUN job itself, over the existing connection.
+A relayed session runs the *same* handshake through the splice. Before it asks
+the relay, the client tries the endpoints stored at pairing.
 
 ---
 
 ## 5. Capability negotiation (codec, subsampling, resolution)
 
-Exchanged on the first E2E control flight; re-sending the same struct mid-session = live
-renegotiation (window resize, tablet rotation, monitor hotplug).
+Status: partly built. protocol.md is the specification.
 
-- **Client advertises:** decoders (codec, profile, max level/res/fps, 10-bit, 4:4:4), viewport in
-  physical px, device pixel ratio, HDR.
-- **Host advertises:** encoders, capture formats, monitor list.
-- **Host picks** from a deterministic preference table:
-  codec AV1 > HEVC > H.264 when hardware exists on both ends;
-  subsampling 4:2:0 default, 4:4:4 only when both ends support it or user enables "text mode".
-- **Skip 4:2:2 entirely** — AV1 Professional-profile only, near-zero hardware decode support; a
-  negotiation branch that never fires.
-- **Resolution modes:**
-  - `fit` (default): encode at min(capture, client viewport); host GPU downscales *before* encode
-    (VA-API VPP / Vulkan blit) — a 4K desktop streams to a 1080p tablet at 1080p.
-  - `native`: full host resolution, client scales locally (bandwidth-hungry, crisp when zooming).
-  - Under both, the congestion controller may temporarily step down the encode ladder without
-    touching the negotiated target.
-- Keyboard is HID usage codes (layout-independent; host applies layout). Cursor shape/position sent
-  as metadata and rendered client-side.
+Built:
+
+- **Client advertises** in `ClientHello`: viewport in physical pixels, largest
+  decodable size and its frame rate, requested frame rate, bitrate ceiling, and
+  the codecs it can decode, probed at run time.
+- **Host** probes its encoders at startup and picks AV1 over H.264 when both
+  ends have it. No common codec ends the session. Design: the host also
+  advertises encoders, capture formats and a monitor list. Built: it sends only
+  whether it has sound and the chosen `StreamConfig`.
+- The codec is chosen once. Re-sending the capabilities mid-session
+  (`ViewportChanged`: resize, rotation, picture-in-picture) renegotiates
+  resolution and bitrate ceiling.
+- **Resolution (`fit`):** encode at min(capture, viewport). The host GPU scales
+  *before* encode, so a 4K desktop streams to a 1080p tablet at 1080p. The
+  congestion controller steps down a ladder below that without touching the
+  negotiated target.
+- Keyboard is HID usage codes (layout-independent, the host applies its
+  layout). Cursor shape and position travel as metadata. The client draws the
+  cursor.
+
+Not built: HEVC (design preference: AV1 > HEVC > H.264 when both ends have
+hardware), 4:4:4 "text mode" (design: only when both ends support it, or on
+request; built: 4:2:0 only), `native` mode (full host resolution,
+client scales), codec change mid-session, monitor hotplug, 10-bit, HDR.
+
+Decision kept: **no 4:2:2.** It is AV1 Professional profile only, with almost
+no hardware decode. The branch would never run.
 
 ---
 
-## 6. Transport & latency machinery
+## 6. Transport and latency machinery
 
-- **Video → QUIC DATAGRAM** (RFC 9221), sliced so one lost packet kills a slice, not a frame.
-  Never retransmitted.
-- **Input/control → one reliable ordered stream** (tiny; HOL blocking irrelevant).
-- **Loss recovery without retransmit:** intra-refresh (rolling I-columns, no IDR spikes) +
-  long-term reference frames — on loss, client requests a P-frame off the last acked LTR;
-  recovery costs one frame interval. Optional FEC parity for lossy mobile links.
-- **Congestion control:** delay-based estimator (GCC/SCReAM-style, one-way delay gradients from
-  receiver feedback) retargets the *encoder* at ~85% of estimate; BBR-ish pacing in QUIC beneath.
-  Desktop/KBM degradation ladder: hold fps and chroma on text, drop bitrate → resolution.
-- **Mobile:** QUIC connection migration keeps the session alive across Wi-Fi↔LTE.
-- **Perceived latency:** client-side cursor rendering; input batched at 500–1000 Hz into 2–4 ms
-  ticks; clock-sync handshake feeds a Parsec-style stats HUD (per-stage ms) from day one.
-- **Budget:** capture 1–2 ms · encode 2–5 · pace ~1 · network one-way · jitter 0–2 frames ·
-  decode 2–5 · present ≤1 vsync. Added latency over raw RTT: **~10–20 ms**.
+Status: partly built. protocol.md and congestion.md are the specifications.
 
-**Build-vs-buy:** prototype punching + relays on **iroh** (quinn-based, magicsock-style). Keep the
-protocol agnostic to the connection layer; decide later whether a slimmer bespoke layer is worth it
-once real-world punch rates are known.
+Built:
+
+- **Video on QUIC DATAGRAM** (RFC 9221), never retransmitted. Design: sliced,
+  so a lost packet costs a slice, not a frame. Built: one slice (H.264) or tile
+  (AV1) per picture, because four slices encoded slower (8.81 ms mean against
+  7.30).
+- **Input and control on one reliable ordered stream.** It is tiny, so
+  head-of-line blocking does not matter.
+- **Loss recovery without retransmission:** Reed-Solomon parity that follows
+  measured loss (zero on a clean link), and a key frame on client request.
+  Bitrate changes, resolution changes and requests share one key-frame budget.
+- **Congestion control:** a delay-based estimator (one-way delay gradients from
+  the receiver report) retargets the *encoder*. BBR in quinn beneath. Degrade
+  order: bitrate, then frame rate, then resolution (design: hold frame rate and
+  chroma on text, drop bitrate, then resolution). Datagrams are paced and
+  marked DSCP EF.
+- **Perceived latency:** client-side cursor, input batched into 4 ms ticks, a
+  stats overlay.
+
+Not built:
+
+- **Intra refresh and long-term reference frames.** Design: rolling intra
+  columns instead of key-frame spikes, and on loss a P-frame off the last
+  acknowledged LTR, so recovery costs one frame interval. The VA-API GStreamer
+  elements expose neither (findings.md). Every recovery is a full key frame.
+- **Clock-sync handshake** for per-stage latency. The receiver report needs no
+  synchronised clocks.
+- **0-RTT resume.**
+- **Migration across Wi-Fi and LTE.** quinn migrates passively. No test moves a
+  live session between networks.
+- **iroh.** Design: prototype punching and relays on iroh. Built instead:
+  directly on quinn, with the protocol in relay.md.
+
+**Latency budget (design, not measured end to end):** capture 1 to 2 ms, encode
+2 to 5, pace about 1, network one-way, jitter 0 to 2 frames, decode 2 to 5,
+present at most one vsync. Added latency over raw RTT: **about 10 to 20 ms**.
 
 ---
 
 ## 7. Media pipeline (Wayland host first)
 
-**Capture** — default: `xdg-desktop-portal` ScreenCast → PipeWire → DMA-BUF frames + damage
-regions; `restore_token` persisted for unattended re-grant. Second backend for wlroots-family
-(Hyprland etc.): `ext-image-copy-capture-v1` direct — no portal round-trip, ideal headless.
-Damage awareness: static screen ⇒ near-zero bitrate, instant ramp on change.
+Status: partly built. Built for wlroots compositors, developed on Hyprland.
+findings.md has the measurements.
 
-**Encode** — hardware first: VA-API (Intel/AMD), NVENC. MVP via GStreamer *inside the sandboxed
-media process*, behind `FrameSource`/`Encoder` traits; replace hot paths with direct libva/NVENC
-later. Low-latency settings: zero B-frames, slice encoding, tight VBV/CBR, intra-refresh, LTR.
+**Capture.** Built: `ext-image-copy-capture-v1` direct into DMA-BUF. Capture
+blocks until the screen changes, so a static screen sends nothing. Design, not
+built: `xdg-desktop-portal` ScreenCast through PipeWire, "DMA-BUF frames +
+damage regions", with `restore_token` for unattended re-grant. Measured: the
+Hyprland portal is a screencopy client that republishes through PipeWire (more
+hops, not less latency), and the compositor reports full damage on every frame.
 
-**Inject** — default: portal RemoteDesktop (libei); direct wlroots `virtual-pointer` /
-`virtual-keyboard` backend for compositors that support it.
+**Encode.** Built: VA-API through GStreamer (`vah264enc`/`vah264lpenc`,
+`vaav1enc`/`vaav1lpenc`) inside the daemon. Variable bitrate (constant bitrate
+filled 87% of a static desktop's stream with padding), zero B-frames, one slice
+or tile, one reference frame. Not built: NVENC, direct libva, intra refresh,
+LTR, the sandboxed media process.
 
-**Decode/present (client)** — Vulkan Video / VideoToolbox / MediaCodec / WebCodecs; mailbox
-present mode; local cursor overlay; adaptive 0–2-frame jitter buffer.
+**Inject.** Built: wlroots `virtual-pointer` and `virtual-keyboard`. Not built:
+portal RemoteDesktop (libei), the design default.
+`xdg-desktop-portal-hyprland` does not offer it.
 
-**Sound** — the host's own output, tapped at the monitor source of whichever sink the sound server
-calls the default, and never a device named by hand. `pulsesrc ! audioconvert ! audioresample !
-opusenc` at 48 kHz stereo, 128 kbit/s, 10 ms frames, on a thread of its own; one Opus packet a
-datagram, past the pacer rather than through it, because a paced key frame is tens of milliseconds
-and a gap in sound is a click everybody hears. Packets are stamped on the session clock the picture
-is stamped on — `CLOCK_MONOTONIC`, taken once, handed to both — so the two streams can be laid
-together at the far end. Sound costs the link about 141 kbit/s and the host takes that off the video
-target while it flows, in the spirit of the control reserve, because nothing paces it.
+**Keep awake, priority.** Built: a session holds an idle inhibitor, because a
+blanked output sends no frames and the remote user cannot wake it. Picture
+threads get realtime priority through rtkit.
 
-The tap is **before** the sink's own volume and mute. That is the whole design: the host's knob is
-the volume, the client applies what the host reports as playback gain, and `Exclusive` mode mutes
-the host while the client still hears everything. The mute is held by a guard for the life of the
-mode, so a client that disconnects mid-session never leaves a machine silent. Volume, mute and
-which sink is the default are read and written over one PulseAudio client connection, which the
-pipewire-pulse server answers as readily as a real PulseAudio one, and a knob turned on the host
-reaches the client through that server's own subscription rather than a poll.
+**Decode and present (client).** Built: Linux, GStreamer VA-API decode into a
+GL texture. Android, MediaCodec into a Flutter surface producer. No CPU copy on
+either. Not built: Vulkan Video, VideoToolbox, WebCodecs.
 
-**Codec rollout:** H.264 and AV1 are both negotiated today, per session, from what each end
-probes at run time; H.264 is the fallback and decodes literally everywhere incl. WebCodecs.
-Android advertises H.264 only, because its decoder is configured from the bitstream and only an
-H.264 sequence parameter set reader is written. Next: HEVC only where hardware on both ends →
-4:4:4 "text mode".
+**Sound.** Built (protocol.md, *Sound*). The host taps the monitor source of the
+sound server's default sink, never a device named by hand:
+`pulsesrc ! audioconvert ! audioresample ! opusenc`, 48 kHz stereo, 128 kbit/s,
+10 ms frames, own thread. One Opus packet per datagram, past the pacer: a paced
+key frame takes tens of milliseconds, and a gap in sound is an audible click.
+Sound and picture share one session clock (`CLOCK_MONOTONIC`), so the client
+can align them. Sound costs about 141 kbit/s, which the host takes off the
+video target while it flows.
 
-**Web client:** WebTransport + WebCodecs, wasm client core, canvas/WebGPU present. Position as
-"check on your machine" — browser event loop will not match native input latency.
+The tap is **before** the sink's volume and mute. So the host's volume is the
+one knob: the client applies the gain the host reports. `Exclusive` mode mutes
+the host and the client still hears everything. A guard holds that mute for the
+life of the mode, so a client that drops never leaves the host silent. One
+PulseAudio client connection (pipewire-pulse answers it too) reads and writes
+volume, mute and the default sink, and its subscription carries host-side
+changes to the client without polling.
+
+**Codecs.** Built: H.264 and AV1, negotiated per session from what each end
+probes. H.264 is the fallback and decodes everywhere, WebCodecs included.
+Android offers AV1 only when its default AV1 decoder is hardware. Next, not
+built: HEVC (only where both ends have hardware), then 4:4:4 text mode.
+
+**Web client.** Not built. Design: WebTransport, WebCodecs, the client core in
+wasm, canvas or WebGPU present. Scope: "check on your machine". A browser event
+loop will not match native input latency.
 
 ---
 
 ## 8. LAN share (`tachyx temp`)
 
-Instant local screen sharing: no internet, no relay, no account.
+Status: not built. No mDNS code exists.
 
-- `tachyx temp [--view-only] [--ttl 15m]` (or a GUI button) mints an **ephemeral session keypair**
-  (stable device key never broadcast) and announces
-  `Name._tachyx._udp.local` via mDNS: port, ephemeral cert SPKI hash, offered permissions,
-  human tag (e.g. `blue-fox-42`).
-- Native viewers browse the service and pick from a list (device name + tag). Crowded office
-  collisions are a UI-selection problem; picking wrong just fails the code check, because
-  **mDNS is spoofable ⇒ the on-screen short code + PAKE is mandatory even on LAN.**
-- Sharer chooses `view` or `control` at share time; grant evaporates on disconnect/TTL.
-- **Web viewer trick:** browsers can't mDNS and reject self-signed LAN TLS — but WebTransport
-  `serverCertificateHashes` connects to any address given the exact (short-lived ECDSA) cert hash.
-  Host shows a QR = `ip:port + cert hash + secret`; colleague scans, hosted web app opens and
-  connects **directly over the LAN**. Zero-install viewing; cloud never sees a byte.
+Design: instant local screen sharing with no internet, no relay, no account.
+
+- `tachyx temp [--view-only] [--ttl 15m]` (or a GUI button) mints an
+  **ephemeral session key pair** (the stable device key is never broadcast) and
+  announces `Name._tachyx._udp.local` over mDNS: port, ephemeral certificate
+  SPKI hash, offered permissions, human tag (for example `blue-fox-42`).
+- Native viewers browse the service and pick from a list (name and tag). In a
+  crowded office a collision is a selection problem: a wrong pick fails the
+  code check. **mDNS is spoofable, so the on-screen short code and PAKE are
+  mandatory on a LAN too.**
+- The sharer grants `view` or `control` at share time. The grant ends at
+  disconnect or TTL.
+- **Web viewer.** Browsers cannot use mDNS and reject self-signed LAN TLS, but
+  WebTransport `serverCertificateHashes` connects to any address given the
+  exact hash of a short-lived ECDSA certificate. The host shows a QR with
+  `ip:port`, the certificate hash and the secret. A colleague scans it, and the
+  hosted web app connects **directly over the LAN**. No install, and the cloud
+  never sees a byte.
 
 ---
 
-## 9. CLI (subcommands on `tachyx-hostd`; `--json` everywhere)
+## 9. CLI (subcommands on `tachyx-hostd`, `--json` everywhere)
 
-Built, and this is what the binary answers to:
+Status: built.
 
 ```
-tachyx-hostd [run]                   # the daemon. a bare invocation is this
-tachyx-hostd id                      # this host's device identifier
-tachyx-hostd status                  # daemon, home relay, live sessions
-tachyx-hostd pair [--view-only] [--attended] [--ttl 5m]
+tachyx-hostd [run]                    # the daemon; a bare invocation runs it
+tachyx-hostd id                       # this host's device identifier
+tachyx-hostd status                   # daemon, home relay, live sessions
+tachyx-hostd pair [--view-only] [--attended] [--ttl 4m] [--no-qr]
 tachyx-hostd pairings list
 tachyx-hostd pairings revoke <device|name>
-tachyx-hostd pairings set <device|name> --allow view|control --unattended true|false
+tachyx-hostd pairings set <device|name> [--allow view|control] [--unattended true|false]
 tachyx-hostd pairings rename <device|name> <name>
 tachyx-hostd sessions kill <id>
-tachyx-hostd relay list | add <addr:port#KEY> | remove <addr:port>
+tachyx-hostd relay list | add <address:port#KEY> | remove <address:port>
 tachyx-hostd doctor
 ```
 
-One binary rather than two. Everything but `run` is a thin client over the
-daemon's Unix socket at `$XDG_RUNTIME_DIR/tachyx/hostd.sock`, so the split this
-document originally described is a build-time question and not a runtime one, and
-a second binary would only be a second thing to install and keep in step.
+- `<device|name>`: a full identifier, an unambiguous prefix, or a name. Names
+  are tried only when no identifier matches, because the peer chooses its name.
+- `pairings set` needs `--allow`, `--unattended` or both, and keeps what is not
+  named. `pair --ttl` defaults to 4 minutes, at most 5 (the relay's mailbox
+  life). `relay add` accepts a bare `address:port` for an unpinned relay
+  (relay.md). `relay remove` removes every relay at that address.
+- One binary. Everything but `run` is a thin client over the daemon's socket at
+  `$XDG_RUNTIME_DIR/tachyx/hostd.sock` (directory mode 0700). A second binary
+  would be one more thing to install and keep in step.
+- `doctor` and `relay` work with the daemon down. `doctor` exists for that case.
+  It reports the daemon, the device key and its mode, the encoders, sound, the
+  compositor's capture, injection and idle-inhibit protocols, each relay, and
+  the number of paired devices. `relay` then edits the file directly.
+- `--json` (`-j`) prints one JSON value on standard output, and errors as JSON
+  on standard error with a non-zero exit. `pair` shows a code and keeps
+  reporting, so it prints JSON Lines, with the link instead of a drawn QR.
+- Configuration: one TOML file, `$XDG_CONFIG_HOME/tachyx/hostd.toml`. `relay`
+  edits it in place, so a hand-written file keeps its comments.
 
-`doctor` is the exception: it answers with the daemon down, because that is the
-case it exists for. It reports the daemon, the device key and its mode, the
-encoders, the compositor's capture and injection, each configured relay, and how
-many devices are paired.
-
-`--json` is one JSON value on standard output, with errors as JSON on standard
-error and a non-zero exit. `pair` is the one command that cannot be one value,
-because it shows a code and then keeps reporting, so it is JSON Lines.
-
-**Not built:** `tachyx temp` (the LAN share of section 8) and `tachyx stats`.
-Lifetime counters have nowhere to live yet.
-
-Config: single TOML (XDG), edited in place by `relay add` so a hand-written file
-keeps its comments.
+Not built: `tachyx temp` (section 8) and `tachyx stats` (lifetime counters have
+nowhere to live).
 
 ---
 
 ## 10. Relay design
 
-- One static binary. QUIC listener. Functions: presence, rendezvous mailboxes,
-  reflexive-address reporting, ciphertext splicing between two authenticated flows, byte counters.
-- Never holds session keys. Per-IP connection caps + rate limits.
-- **Self-hosted mode:** same binary, public IP, systemd unit; billing module off; friends/team use
-  it with zero accounts.
-- Cloud fleet: relay selection is client-side RTT probing against a signed relay list (no anycast
-  at this scale). Start regions: Falkenstein, Helsinki, Ashburn, Singapore.
-- Capacity: a relayed stream is 5–20 Mbit/s ⇒ an unmetered 1 Gbit dedicated box (~€40–60/mo)
-  carries 50–150 concurrent relayed sessions; with 85–90% direct rate that is thousands of active
-  users per box. Start on cloud VMs (20 TB included), graduate to dedicated.
+Status: partly built. relay.md is the specification.
+
+Built: one binary, `relayd`, one UDP port (47990). Presence, rendezvous
+mailboxes, reflexive-address reporting, splicing between two authenticated
+peers, byte counters per lane. No session keys, nothing stored across a
+restart. New connections rate limited per IPv6 `/64` (or IPv4 address), control
+messages per connection, QUIC retry for an unvalidated source over budget.
+**Self-hosted mode:** the same binary on a public address, no accounts. It
+prints its `address:port#KEY` line at startup.
+
+Not built:
+
+- The billing module and a systemd unit.
+- **Cloud fleet:** client-side relay selection by RTT probes against a signed
+  relay list (no anycast at this scale). Start regions: Falkenstein, Helsinki,
+  Ashburn, Singapore.
+- **Capacity (estimate):** a relayed stream is 5 to 20 Mbit/s, so an unmetered
+  1 Gbit/s dedicated server (about €40 to €60 a month) carries 50 to 150
+  concurrent relayed sessions. At 85 to 90% direct, that is thousands of active
+  users per server. Start on cloud VMs (20 TB included), then move to dedicated.
 
 ---
 
-## 11. Coordination & storage — SQLite, deliberately
+## 11. Coordination and storage: SQLite, deliberately
 
-`coordd` workload after moving mailboxes to relays: accounts, devices, balances, token issuance,
-Stripe webhook, relay directory, host→home-relay lookup. Low-write, tiny, **not** on the
-connection path ⇒ single-node SQLite is correct, not a compromise.
+Status: not built.
 
-- axum + `sqlx` on SQLite (WAL mode); **Litestream** → Hetzner Object Storage (S3-compatible) for
-  continuous backup + point-in-time restore.
-- Keep SQL boring; Postgres migration remains possible if multi-node is ever needed.
-- **Double-spend without Redis:** blind tokens are issued *bound to a specific relay*; each relay
-  keeps its own local spent-set. No shared state between relays. (Issuer learns which relay you'll
-  use — coarse metadata, same class Mullvad sees.)
+With mailboxes on the relays, `coordd` handles accounts, devices, balances,
+token issuance, the Stripe webhook, the relay directory and the
+host-to-home-relay lookup. It writes rarely, is small and is **not** on the
+connection path, so single-node SQLite is correct, not a compromise.
+
+- axum and `sqlx` on SQLite (WAL). **Litestream** to Hetzner Object Storage
+  (S3-compatible) for continuous backup and point-in-time restore.
+- Plain SQL, so Postgres stays possible if multi-node is ever needed.
+- **Double-spend without Redis:** blind tokens are issued *bound to one relay*,
+  and each relay keeps its own spent set. No shared state between relays. The
+  issuer learns which relay a user will use: coarse metadata, the class Mullvad
+  sees.
 
 ---
 
 ## 12. Billing
 
-- **Model:** sell GB of relay traffic; GB never expire (data, not subscription). Direct sessions
-  free forever, even at zero balance. Control channel over relay always free (bytes are trivial)
-  so a broke account still sees host status.
-- **MVP:** relay meters bytes against the account (documented honestly).
-  **v1.1:** Privacy Pass-style blind RSA tokens (RFC 9474/9578) — issuer sees the account but never
-  the token; relay sees the token but never the account. Bearer tokens ≈ 100 MB each, spent as
-  traffic accrues. Design the token API now so the swap is invisible.
-- **Stack:** Stripe Checkout (hosted page ⇒ no card data on our servers ⇒ PCI SAQ-A) + webhook
-  crediting GB, idempotent via stored event IDs in SQLite. Runs inside `coordd`.
-- **EU VAT (CZ seller, B2C digital across EU):** Stripe Tax + quarterly OSS filings, **or** a
-  merchant of record (Paddle / Lemon Squeezy, ~5%) that owns VAT entirely. Recommendation: start
-  MoR, reclaim margin later. Crypto later via self-hosted BTCPay.
-- **Never sell GB in-app on iOS/Android** — web top-ups only (Mullvad-style), or lose 30% and the
-  anonymous-account story in review.
-- **Economics:** Hetzner marginal egress ~€1/TB ⇒ €5 / 500 GB is >90% margin; 500 GB ≈ 100+ hours
-  of *relayed* 1440p60, which most users barely touch.
+Status: not built.
+
+- **Model:** sell GB of relay traffic. GB never expire (data, not a
+  subscription). Direct sessions free forever, even at zero balance. Control
+  over a relay always free (trivial bytes), so a zero balance still sees host
+  status.
+- **MVP:** the relay meters bytes against the account, and the documentation
+  says so. **v1.1:** Privacy Pass-style blind RSA tokens (RFC 9474, RFC 9578).
+  The issuer sees the account but never the token. The relay sees the token but
+  never the account. Bearer tokens of about 100 MB, spent as traffic accrues.
+  The token API is designed now, so the swap is invisible.
+- **Stack:** Stripe Checkout (hosted page, so no card data on project servers:
+  PCI SAQ-A) and a webhook that credits GB, idempotent through event IDs stored
+  in SQLite. Inside `coordd`.
+- **EU VAT** (Czech seller, B2C digital sales across the EU): Stripe Tax with
+  quarterly OSS filings, **or** a merchant of record (Paddle or Lemon Squeezy,
+  about 5%) that owns VAT. Plan: start with a merchant of record, reclaim the
+  margin later. Crypto later through self-hosted BTCPay.
+- **No GB sales in the iOS or Android apps.** Web top-ups only, as Mullvad does.
+  In-app sales cost 30% and put the anonymous-account model at risk in review.
+- **Economics:** Hetzner marginal egress is about €1 per TB, so €5 for 500 GB is
+  over 90% margin. 500 GB is over 100 hours of *relayed* 1440p60, more than
+  most users ever need.
 
 ---
 
-## 13. Hosting & ops
+## 13. Hosting and ops
 
-- All Hetzner. 1 small VM (`coordd` + SQLite + Litestream, Caddy for TLS) + N relay boxes.
-- **NixOS everywhere**, static Rust binaries as packages, deploy with `colmena`/`deploy-rs`,
-  systemd units. No Docker, no k8s.
-- Reproducible builds via Nix + signed releases + published protocol spec = the credible
-  "audit us like WireGuard" story. NixOS module + Home Manager module as first-class install
-  targets, alongside static binary + systemd unit and distro packages.
-- Prometheus endpoints in every binary from day one; add a single VictoriaMetrics+Grafana box when
-  there is something to watch. Uptime monitoring from the start.
+Status: not built. `flake.nix` holds a development shell only.
+
+- All on Hetzner: one small VM (`coordd`, SQLite, Litestream, Caddy for TLS)
+  and N relay servers.
+- **NixOS everywhere:** static Rust binaries as packages, deployed with
+  `colmena` or `deploy-rs`, as systemd units. No Docker, no Kubernetes.
+- Reproducible Nix builds, signed releases and a published protocol
+  specification make an audit like WireGuard's credible. Install targets: NixOS
+  and Home Manager modules, a static binary with a systemd unit, distribution
+  packages.
+- A Prometheus endpoint in every binary. A VictoriaMetrics and Grafana server
+  once there is something to watch. Uptime monitoring from the start.
 
 ---
 
 ## 14. Crates (well-known only)
 
+Status: the crates in use. Planned ones are marked.
+
 | Area | Crates |
 |---|---|
-| Runtime / transport | `tokio`, `quinn`, `rustls` (RPK / pinned-cert verifier), `iroh` (initial punching+relay layer) |
-| API / storage | `axum`, `tower`, `sqlx` (SQLite) |
-| Crypto | `ed25519-dalek`, `x25519-dalek`, `spake2`, later `blind-rsa-signatures` |
-| Serialization | `prost` (protobuf) for control plane; **hand-specified 16-byte header** for media framing (in the spec) |
-| Host / client | `gstreamer-rs` (sandboxed, behind traits), `keyring`, `mdns-sd`, `flutter_rust_bridge` v2 |
-| Plumbing | `clap`, `tracing`, `thiserror`/`anyhow`, `toml`+`serde` |
+| Runtime, transport | `tokio`, `quinn`, `rustls` (custom pinned-key verifiers), `rcgen`, `socket2` |
+| Crypto | `ring` (Ed25519, ChaCha20-Poly1305, HKDF), `pake-cpace`, `zeroize`. Planned: `blind-rsa-signatures` |
+| Serialization | `postcard` + `serde` for control and relay messages. **Hand-specified 16-byte header** for media datagrams (protocol.md) |
+| Media | `gstreamer-rs`, `reed-solomon-simd`, `opus`, `libpulse-binding` |
+| Host, relay | `wayland-client`, `wayland-protocols`, `gbm`, `rtkit-rs`, `qrcode`, `governor` |
+| Client | `flutter_rust_bridge` v2, `irondash_texture`, `ndk`, `jni` |
+| API, storage | Planned: `axum`, `tower`, `sqlx` (SQLite) |
+| Plumbing | `clap`, `tracing`, `thiserror`, `anyhow`, `toml`, `toml_edit`, `serde_json`, `data-encoding` |
 
-Rule: own the protocol and crypto glue; never hand-roll what a boring mainstream crate does.
-Supply chain: `cargo vet`/`cargo audit` in CI.
+Planned but not used: `iroh` (quinn directly), `prost` (`postcard`), `spake2`
+(CPace), `ed25519-dalek` and `x25519-dalek` (`ring`), `keyring` (the key is a
+file), `mdns-sd` (no LAN share).
+
+Rule: own the protocol and the crypto glue. Never hand-roll what a boring
+mainstream crate does. Supply chain: `cargo vet` and `cargo audit` in CI. Not
+built: there is no CI configuration.
 
 ---
 
-## 15. Repo layout
+## 15. Repository layout
+
+Status: built. The design had `proto`, `transport`, `crypto`, `media-host`,
+`media-client`, `client-core`, `hostd`, `relayd`, `coordd`, `cli` and `nix/`.
+The code has:
 
 ```
 tachyx/
   crates/
-    proto/          # wire format + handshake — the audited, spec'd heart
-    transport/      # QUIC, punching, relay client (iroh-backed initially)
-    crypto/         # device identity, SPAKE2 pairing, pinning (thin)
-    media-host/     # capture + encode traits + sandboxed process
-    media-client/   # decode + present glue
-    client-core/    # FFI for Flutter (native + wasm)
-    hostd/          # daemon
-    relayd/         # relay (+ optional billing module)
-    coordd/         # accounts, billing, directory
-    cli/            # tachyx
-  app/              # desktop, mobile, web UI
-  spec/             # protocol document (the "whitepaper")
-  nix/              # packages, NixOS modules, deploy
+    tachyx-proto/        # wire format: control messages, media header, parity
+    tachyx-transport/    # QUIC endpoints, datagrams, control stream, pacing, pinned TLS
+    tachyx-crypto/       # device identity, CPace pairing, paired-device records
+    tachyx-relay/        # relay protocol, peer side, routing socket, rendezvous
+    tachyx-relayd/       # the relay
+    tachyx-congestion/   # delay-based rate control
+    tachyx-media/        # Wayland capture, VA-API encode, sound capture
+    tachyx-input/        # wlroots pointer and keyboard injection
+    tachyx-sched/        # realtime priority through rtkit
+    tachyx-hostd/        # host daemon and CLI
+    tachyx-client/       # client core, no I/O
+    tachyx-driver/       # client I/O: connection, session, decoder feed, pairing
+    tachyx-video/        # client decode and present
+    tachyx-audio/        # client Opus decode and playback
+    tachyx-client-ffi/   # flutter_rust_bridge boundary
+    tachyx-unsafe/       # the one crate that permits unsafe
+  app/                   # Flutter client (Linux, Android)
+  spec/                  # specifications and findings
+  flake.nix              # development shell
 ```
+
+Not built: `coordd`, a separate CLI crate, `nix/`.
 
 ---
 
-## 16. MVP & roadmap
+## 16. MVP and roadmap
 
-**MVP:** Wayland portal host · Linux/macOS/Android clients · negotiated AV1 or H.264 · direct + relay ·
-PAKE pairing (QR + 8-digit) · fit-mode scaling · CLI incl. `doctor` · simple metered billing ·
-stats HUD.
+Status: each item marked. [`roadmap.md`](roadmap.md) has the current order.
 
-**Fast-follows, in order:** ~~audio~~ (done: host output over the same datagrams, with the host's
-own volume as the one knob) → clipboard → ~~AV1~~ (done: negotiated per session) → blind tokens →
-LAN share polish → multi-monitor selection → Windows/iOS clients → file drag-and-drop → web client
-→ 4:4:4 text mode → Windows/macOS hosts.
+**MVP (design):** Wayland portal host, Linux, macOS and Android clients,
+negotiated AV1 or H.264, direct and relay, PAKE pairing (QR and 8-digit),
+fit-mode scaling, CLI with `doctor`, simple metered billing, stats display.
+Built: all of it except the macOS client and billing. The host uses wlroots
+protocols, not the portal.
 
-**Milestone one (de-risks everything at once):** `hostd` on a Hyprland box + Linux Flutter client;
-portal capture → VA-API → quinn datagrams over LAN; pinned-key auth; stats HUD.
+**Fast-follows, in the original order:** audio (built: host output, the host's
+volume as the one knob), clipboard, AV1 (built: negotiated per session), blind
+tokens, LAN share polish, multi-monitor selection, Windows and iOS clients,
+file drag-and-drop, web client, 4:4:4 text mode, Windows and macOS hosts. All
+items not marked built are not built. The host captures one output, named in
+its configuration. More than one client at a time is not built.
+
+**Milestone one:** `tachyx-hostd` on Hyprland and the Linux Flutter client:
+capture, VA-API, quinn datagrams over a LAN, pinned-key auth, stats display.
+Built, with `ext-image-copy-capture-v1` instead of the portal.
 
 ---
 
 ## 17. Known risks
 
-1. **Unattended Wayland access** is the swamp: `restore_token` persistence across reboots, headless
-   sessions, GNOME's special-cased remote login — per-compositor quirks. Budget it as a workstream.
-2. **Mobile-network congestion control** is years of tuning at Parsec; ship conservative defaults,
-   instrument everything.
-3. **Web client** will trail native input latency; position accordingly.
-4. **Abuse:** short-lived pairing codes + no ID/password unattended mode is the defense; keep it
-   even when users ask for "easier".
-5. **Media-stack sprawl** vs. the minimal ethos: contained by the sandboxed-process + trait
-   boundary; the audited surface stays the protocol.
+Status: design. findings.md and [`assumptions.md`](assumptions.md) record what
+the built code has met.
+
+1. **Unattended Wayland access:** `restore_token` persistence across reboots,
+   headless sessions, GNOME's special-cased remote login, quirks per
+   compositor. Budget it as a workstream. The built host avoids the portal and
+   so runs only on wlroots compositors.
+2. **Congestion control on mobile networks** took Parsec years of tuning. Ship
+   conservative defaults and instrument everything.
+3. **Web client** input latency will trail native. Scope it to match.
+4. **Abuse:** short-lived pairing codes and no ID-and-password unattended mode
+   are the defence. Keep both when users ask for "easier".
+5. **Media-stack sprawl** against a minimal core. Design answer: the sandboxed
+   process and trait boundary keep the audited surface to the protocol. Not
+   built: the media stack runs in the daemon.
