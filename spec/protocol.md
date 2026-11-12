@@ -59,8 +59,9 @@ An earlier design trusted the host key on first use (TOFU), and the host
 accepted any client that reached the port. Pairing replaced both. Neither end
 pins a key on first sight.
 
-The identity stays in the handshake. The host reads a client's permissions from
-the device that connected. No message below names either end.
+The identity stays in the handshake. No message below names either end. A
+client's permissions belong to the device that connected, and the session does
+not enforce them yet ([`pairing.md`](pairing.md)).
 
 ## Control stream framing
 
