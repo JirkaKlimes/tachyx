@@ -377,7 +377,21 @@ class _SessionScreenState extends State<SessionScreen>
             encoding.visibleWidth.toDouble(),
             encoding.visibleHeight.toDouble(),
           );
-    _pad.scale = ImageScale.of(image: image, box: media.size);
+    // The picture is letterboxed to the stream's aspect, so the scale is taken
+    // against that box and not the window. Against the window, the two axes
+    // scale apart by the window's own aspect and the pointer moves faster on
+    // one axis than on the other.
+    final Size box = encoding == null
+        ? media.size
+        : applyBoxFit(
+            BoxFit.contain,
+            Size(
+              encoding.aspectWidth.toDouble(),
+              encoding.aspectHeight.toDouble(),
+            ),
+            media.size,
+          ).destination;
+    _pad.scale = ImageScale.of(image: image, box: box);
   }
 
   void _toggleKeyboard() {
