@@ -1,84 +1,135 @@
-# Where this goes next
+# Roadmap
 
-Written at the end of the first day, when the pipeline works end to end and the
-picture on the phone is real but not yet good.
+What is built, what comes next, and why. Each status comes from the code.
+[`acceptance.md`](acceptance.md) defines when the current milestone is done.
+[`assumptions.md`](assumptions.md) lists what is expected to break on a machine
+that is not the test machine.
 
-The comparison worth making is not against Sunshine and Moonlight as products.
-They have audio, a clipboard, five client platforms, four codecs and a decade of
-per-device workarounds, and none of that is interesting to build. The comparison
-worth making is on latency and on what happens when the link is not perfect,
-because that is what this project is for.
+The project exists for latency and for behaviour on a link that is not perfect.
+Feature count against Sunshine and Moonlight is not the goal.
 
-## What is already better, and why it cannot easily be copied
+## Built
 
-The transport is QUIC. Encryption, connection identity and path management come
-with it, and a session survives moving between Wi-Fi and a mobile network. The
-prior art runs its own reliability layer over raw datagrams and cannot adopt this
-without breaking every client it already has.
+- **Capture.** A wlroots output (developed on Hyprland) through
+  `ext-image-copy-capture-v1` into a DMA-BUF that the encoder imports.
+- **Encode.** VA-API through GStreamer. H.264 or AV1, negotiated per session
+  from what each end probes. A resolution ladder spends bitrate first, then frame
+  rate, then resolution.
+- **Rate control.** A delay-based congestion controller reads a receiver report
+  from the client ([`congestion.md`](congestion.md)). Reed-Solomon parity follows
+  measured loss and stops on a clean link. The pacer releases each picture at a
+  rate set by its own weight on the wire. The session socket marks its packets
+  DSCP EF.
+- **Cursor.** Sent apart from the picture and drawn on the client, which moves
+  it on local input at once and corrects it from the host's reports.
+- **Audio.** The host's sound (`pulsesrc`, Opus) with remote volume control.
+- **Host behaviour.** Idle inhibition during a session. Realtime priority for
+  the picture threads through RealtimeKit.
+- **Identity and pairing.** One Ed25519 key per device. CPace pairing by typed
+  code or QR. Mutual TLS that pins the other end's exact key. Per-device
+  permissions (view or control, attended or unattended) are recorded, but no
+  session enforces them yet (see next steps).
+- **Relay** (`tachyx-relayd`). Presence, rendezvous, reflexive address, hole
+  punch, and a splice fallback when the punch fails.
+- **Host CLI.** `tachyx-hostd id | status | pair | pairings | sessions | relay |
+  doctor`.
+- **Clients.** Flutter on Linux and Android, with hardware decode and no CPU copy
+  of a frame.
 
-Capture is `ext-image-copy-capture` straight into a shared buffer the encoder
-reads. The portal route the alternatives take is itself a screencopy client
-republishing frames through PipeWire, so it is the same path with more hops.
-Presentation timestamps arrive four hundredths of a millisecond behind the copy.
+## Not built
 
-Congestion is measured rather than assumed. Sunshine encodes at whatever bitrate
-the client asked for; Parsec published that it deliberately does not control the
-rate at all. On a stable local network that is defensible. On a phone's hotspot it
-is not, and that is the case this project cares about.
+- Coordination server, accounts and billing. Design only, in
+  [`architecture.md`](architecture.md).
+- iOS, macOS, Windows and web clients. Hosts on compositors that are not
+  wlroots.
+- Clipboard. More than one client at a time.
+- A sandboxed process for capture and encode.
+- Move of a relayed session to a direct path. `Routes::point`
+  (`relay/socket.rs:153-160`) can re-point a peer's address, but only a test
+  calls it, and the congestion controller does not yet handle a change of path.
+- Direct libva encode.
 
-Parity follows measured loss instead of sitting at a fixed fifth of the stream
-forever. On a clean link that fifth is waste; on a bad one it is not enough.
+## Where this differs from the prior art
 
-## What is worse, and how much of it is permanent
+Capture goes from `ext-image-copy-capture-v1` straight into a shared buffer the
+encoder reads. On Hyprland the portal route is itself a screencopy client that
+republishes frames through PipeWire, so it is the same path with more hops
+([`findings.md`](findings.md), "The portal capture path is not a latency
+improvement"). The frame's presentation timestamp is 0.04 ms old at the median
+when capture reads it.
 
-Almost none of it.
+The rate is measured, not assumed. Parsec has published that it does not control
+the rate. On a stable local network that is defensible. On a phone's hotspot it
+is not, and that is the case this project is for.
 
-Recovery is the real gap. This encoder offers neither intra refresh nor long-term
-reference frames, so a single lost frame costs a full key frame, and a key frame
-is eight times an ordinary one. Sunshine avoids this on one path only: reference
-frame invalidation exists in its native NVENC encoder and nowhere else. Every
-other encoder it supports logs that the feature is missing and sends a full key
-frame, exactly as we do.
+Parity follows measured loss. Sunshine and Moonlight carry a flat fifth of
+their bandwidth as parity ([`findings.md`](findings.md)). On a clean link
+that fifth is waste. On a bad link it is not enough.
 
-**But this is a limitation of the GStreamer element, not of the hardware.** VA-API
-exposes an intra-refresh parameter that `vah264enc` does not surface, and
-`cros-libva` reaches it. Going direct to libva would buy intra refresh, long-term
-references, and a coded picture buffer that can actually be set to one frame
-rather than the half second the element floors it at. That would put this ahead of
-the prior art on AMD rather than behind it.
+Recovery is where this build is behind. The GStreamer element exposes neither
+intra refresh nor long-term reference frames ([`findings.md`](findings.md),
+"Intra-refresh and long-term reference frames are unavailable"). So every lost
+frame costs a full key frame. Measured: 130.4 kB against 16.7 kB for a delta
+frame at 1080p60, and 287.2 kB against 30.2 kB at 2580x1080. The element also
+floors the coded picture buffer at half the peak bitrate, which is 500 ms at
+8 Mbit/s. Sunshine sizes its buffer to one frame ([`findings.md`](findings.md),
+"The coded picture buffer cannot be made smaller than half a second").
 
-The rest of the list is work rather than architecture: audio, a clipboard, other
-codecs, other platforms.
+Both limits belong to the element, not to the hardware. VA-API exposes intra
+refresh, and `cros-libva` reaches it. The same route reaches the buffer through
+`VAEncMiscParameterTypeHRD`.
 
-## In order
+## Next, in order
 
-1. **Congestion control that works.** Written; needs to be proven on a real link
-   rather than a shaped one, and its first observed behaviour was pathological:
-   it drove the bitrate to the floor while holding full resolution.
-2. **Direct libva encode.** The largest latency win available. Turns every
-   recovery from a hundred and thirty kilobytes into one frame interval, and
-   removes the coded picture buffer floor that currently costs half a second of
-   reaction time.
-3. **Adaptive parity, actually adapting.** The policy is written and tested and
-   nothing calls it, because the receiver report only just exists.
-4. **Pointer motion scaling.** The protocol says the host scales deltas by the
-   ratio of capture to encode size. It does not, so the pointer moves at the
-   wrong speed and the client works around it by measuring.
-5. Then audio, which the architecture document calls the first complaint anyone
-   will make, and a clipboard.
+1. **Enforce the per-device permissions.** `pair --view-only` promises a device
+   that cannot type or click, and `--attended` promises an accept step. No
+   session reads either ([`assumptions.md`](assumptions.md)). Dropping input from
+   a view-only device is a few lines. Until an accept flow exists, refuse an
+   attended device's session and say why.
+2. **Survive a link the stream overdrives.** On phone Wi-Fi the return path goes
+   silent under load and does not come back, and the delay-based controller is
+   blind at that moment, because its reports travel the path that died
+   ([`findings.md`](findings.md), "The video path stalls, and the cause is a link
+   this system overdrives"). Built so far: the watchdog drops the controller to
+   its floor and forces a key frame (`session.rs:521-552`). Still needed:
+   - a lower start than the 2 Mbit/s `START_TARGET` (`congestion/lib.rs:102`);
+   - the packet rate as a limit of its own, since packets are already at the
+     path MTU and cannot grow;
+   - a reset of a dead path that drops the stale backlog, so that a stall costs
+     a hiccup and not the session.
 
-## The method that got this far
+   Then prove the controller on a real link, not only a shaped one.
+3. **Direct libva encode.** The largest latency win available. Intra refresh
+   replaces the full key frame of each recovery (130 kB at 1080p) with intra
+   columns spread over the frames that follow. Long-term references let the
+   client recover from the last frame it acknowledged. A coded picture buffer
+   of one frame removes the 500 ms the element now forces before rate control
+   reacts.
+4. **Pointer motion scaling.** The protocol says the host scales `PointerMotion`
+   by the ratio of capture size to encode size (`proto/input.rs:69-74`). The host
+   does not: `input/lib.rs:249-251` injects the deltas unchanged. So the pointer
+   speed changes when the ladder steps. The client measures the gain
+   (`client/cursor.rs:51-72`) to draw its own pointer in the right place, but
+   the speed under the finger still changes.
+5. **Relayed to direct.** Re-point a relayed session once a punch succeeds, and
+   teach the controller that the path changed.
+6. **Clipboard.**
 
-Nearly everything found today was found by running it, not by reading it. The
-frame deadline that abandoned every key frame a third of the way through its own
-arrival. The cursor session whose completion event only arrives once the mouse
-moves, so it never fired on a machine where the daemon is started from the
-keyboard. A bandwidth estimate reporting zero on a healthy hundred-megabit path. A
-key frame interval counted in frames on a capture path that stops producing frames
-when nothing moves.
+After that, the remaining fast-follows of [`architecture.md`](architecture.md),
+section 16, in their order.
+[`assumptions.md`](assumptions.md) lists the code moves that make a second
+client cheaper if they happen first.
 
-None of those were reachable by reasoning about the code, and several contradicted
-what the documentation of the thing in question said. `spec/findings.md` exists to
-hold what measurement established, including where it overturned an earlier
-measurement. Keep writing to it, and keep distrusting anything in it that was not
-run.
+## Method
+
+Most of what is known was found by running the system, not by reading it.
+Examples: a frame deadline that abandoned every key frame a third of the way
+through its arrival; a cursor session whose completion event arrives only once
+the mouse moves; a bandwidth estimate of zero on a healthy 100 Mbit/s path; a
+key frame interval counted in frames on a capture path that produces no frames
+when nothing moves. Reasoning about the code did not reach any of them, and
+several contradicted the documentation of the component in question.
+
+[`findings.md`](findings.md) holds what measurement established, including where
+a later measurement overturned an earlier one. Keep writing to it. Distrust
+anything in it that was not run.
