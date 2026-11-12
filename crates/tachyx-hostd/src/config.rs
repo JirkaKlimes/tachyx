@@ -47,8 +47,9 @@ pub struct Config {
     /// Address to listen on.
     ///
     /// The default accepts from anywhere, because a host nobody can reach from
-    /// their phone is not serving its purpose. There is no authentication yet,
-    /// so this belongs on a network you trust and nowhere else.
+    /// their phone is not serving its purpose. The TLS handshake refuses every
+    /// device this host has not paired with, so reaching the port is not
+    /// enough to open a session.
     pub listen: SocketAddr,
 
     /// Which monitor to capture, by the name the compositor gives it.
