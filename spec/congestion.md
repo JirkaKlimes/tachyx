@@ -3,15 +3,13 @@
 How the host decides how many bits a second to spend, and how it makes the
 encoder spend that many.
 
-Everything the previous design rested on was measured on loopback and on a
-gigabit local network: 344 Mbit/s carried, no loss, a 193 microsecond round
-trip. On that path there is nothing to control, so a controller that did
-nothing looked correct. This document is what replaces it, and the reason it
-exists is one measurement on a real link.
+The previous design was measured only on loopback and a gigabit LAN: 344 Mbit/s,
+no loss, a 193 microsecond round trip. That path needs no control, so a
+controller that did nothing looked correct.
 
-## The measurement that broke the old design
+## The failure
 
-A Galaxy S25 over Wi-Fi 6, sixteen seconds into a session, from the client's own
+A Galaxy S25 on Wi-Fi 6, sixteen seconds into a session, from the client's
 overlay:
 
 | | |
@@ -23,277 +21,227 @@ overlay:
 | Host | 64 sent, 179 gated |
 | Link | lost, no heartbeat |
 
-The host refused three frames out of four because its send queue was
-permanently full. Twelve frames arrived and could not be decoded. Heartbeats
-were late enough that the client declared the connection dead while it was
-still carrying video.
+The host refused three frames of four because its send queue was always full.
+Twelve frames arrived and did not decode. Heartbeats came so late that the
+client declared the link dead while video still flowed. The transport was not at
+fault: the encoder was asked for four times what the link carried. quinn's BBR
+reported up to 216 Mbit/s and never constrained anything, so the only limit was
+the configured bitrate.
 
-None of that is a transport fault. It is what happens when the encoder is asked
-for four times what the link carries. quinn's BBR reported up to 216 Mbit/s on
-that link, so the estimate never constrained anything, and the only limit in the
-system was the number the user configured.
+## Why the transport's estimate cannot be the target
 
-## Why the transport's own estimate cannot be the bitrate
+Two independent reasons. Each is sufficient.
 
-Two independent reasons, and either one on its own is fatal.
+**BBR misreads the path.** Inferred: BBR keeps a windowed maximum of the
+delivery rate, and 802.11 delivers in aggregates. A 92-datagram key frame leaves
+as one or two A-MPDUs and is acknowledged in a burst. BBR divides by the
+aggregate's duration, not the link's, and holds the result for ten round trips.
+This known Wi-Fi pathology explains 216 Mbit/s on a path that does not carry
+twenty. Measured, BBR also fails low: on a healthy 100 Mbit/s path it read
+0.00 Mbit/s for every sample of a twenty-second run. It discards samples taken
+while the sender is limited by its own supply, and a 60 fps sender is in that
+state whenever an acknowledgement arrives.
 
-The first is that BBR measures delivery rate over a windowed maximum, and
-802.11 delivers in aggregates. A key frame offered as ninety-two datagrams
-leaves the host as one or two A-MPDUs and is acknowledged in a burst, so the
-delivery interval BBR divides by is the aggregate's duration and not the link's.
-The maximum filter then holds that figure for ten round trips. This is a known
-pathology of BBR over Wi-Fi and it explains 216 Mbit/s on a path that would not
-carry twenty. It is a mechanism, not a measurement: nothing here measured the
-aggregation directly.
+**quinn exposes no per-packet acknowledgement.** Read from source, and decisive
+alone. `Connection::on_ack_received` is private
+(`quinn-proto-0.11.17/src/connection/mod.rs:1432`). The public `Event` enum has
+only `HandshakeDataReady`, `Connected`, `ConnectionLost`, `Stream`,
+`DatagramReceived` and `DatagramsUnblocked`. A datagram has no identity after
+`send_datagram` returns. A custom `congestion::Controller` sees only bytes and
+instants, with no packet number.
 
-The second reason is decisive on its own. quinn exposes no per-packet
-acknowledgement to the application. `Connection::on_ack_received` is private
-(`quinn-proto-0.11.17/src/connection/mod.rs:1432`), the public `Event` enum
-carries `HandshakeDataReady`, `Connected`, `ConnectionLost`, `Stream`,
-`DatagramReceived` and `DatagramsUnblocked` and nothing else, and a datagram has
-no application-visible identity after `send_datagram` returns. The only hook
-that sees acknowledgement timing at all is a custom `congestion::Controller`,
-and it is handed bytes and instants with no packet number and no way back to a
-datagram.
-
-So there is no way to learn what the path did to our video except to ask the
-receiver. The feedback message below is not an optimisation. It is the only
-source of information this system can have.
-
-BBR stays in place. Its estimate is an upper bound that will not bind once the
-sender paces below it, it still drives loss detection and recovery, and it stays
-in the heartbeat as a diagnostic. It stops being the target.
+So only the receiver can say what the path did, and its report is the only path
+information this system has. BBR stays for loss detection and recovery. Once the
+host paces below it, its estimate is an upper bound that does not bind. Its
+pacing rate stays in the heartbeat as a diagnostic.
 
 ## Choosing the estimator
 
-`goog_cc` 0.1.4 is a direct port of libwebrtc's GoogCC. It is BSD licensed, has
-no unsafe, depends only on `tracing`, and builds clean. It is 20,195 lines, of
-which about 9,500 are not tests. It has one owner, five releases, and nothing
-published since 2025-03-12, tracking a libwebrtc snapshot from December 2024.
+`goog_cc` 0.1.4 is a direct port of libwebrtc's GoogCC: BSD licensed, no unsafe,
+depends only on `tracing`, builds clean. It has 20,195 lines (about 9,500 not
+tests), one owner, five releases, nothing since 2025-03-12, and tracks a
+libwebrtc snapshot from December 2024.
 
-The decisive fact is not the maintenance risk. It is that every algorithm in it
-is private. `lib.rs` uses `mod x; use x::*;` rather than `pub mod`, so
-`TrendlineEstimator`, `AimdRateControl`, `DelayBasedBwe`,
+Its privacy decides it, not its maintenance. `lib.rs` uses `mod x; use x::*;`,
+not `pub mod`, so `TrendlineEstimator`, `AimdRateControl`, `DelayBasedBwe`,
 `AcknowledgedBitrateEstimator`, `ProbeController` and `ProbeBitrateEstimator`
-are all unreachable; only their configuration structs are public. This was
-checked by compiling against each one. The crate is therefore all or nothing:
-you take `GoogCcNetworkController` behind `NetworkControllerInterface`, or you
-take none of it.
-
-Taking all of it means synthesising a WebRTC-shaped world. `SentPacket` wants
-`prior_unacked_data`, `data_in_flight`, an `audio` flag and a `PacedPacketInfo`
-carrying probe cluster identity. There are twelve interface methods covering
+are unreachable. Only their configuration structs are public, as compiling
+against each type confirmed. The only entry is `GoogCcNetworkController` behind
+`NetworkControllerInterface`, which needs a faked WebRTC world. `SentPacket`
+wants `prior_unacked_data`, `data_in_flight`, an `audio` flag and a
+`PacedPacketInfo` with probe cluster identity. Twelve interface methods cover
 route changes, remote bitrate reports, stream configuration and network state
-estimates, none of which apply here. Wiring that faithfully is most of the work,
-and wiring it carelessly gives a controller that misbehaves in ways no
-instrumentation can see, because the parts that would show the misbehaviour are
-private.
+estimates, and none apply. Wired carelessly, it misbehaves invisibly, because
+the parts that would show the fault are private.
 
-What we actually need is small. The inter-arrival grouper is about sixty lines,
-the trendline estimator about a hundred and twenty, the AIMD control about a
-hundred and fifty, the link capacity estimator forty, the acknowledged rate
-window forty, the loss backstop forty, the probe controller a hundred and
-twenty, and the probe estimator fifty. Roughly six hundred lines of arithmetic
-against nine and a half thousand lines we cannot open.
+The parts needed come to about 600 lines: grouper 60, trendline 120, AIMD 150,
+link capacity 40, acknowledged rate 40, loss backstop 40, probe controller 120,
+probe estimator 50. Against 9,500 lines that cannot be opened, **we write it.**
+`goog_cc` stays in `dev-dependencies` as a conformance oracle: it carries
+libwebrtc's unit tests, and `GoogCcNetworkController` runs from a synthetic
+feedback trace, so ours is held to the reference on the same trace. None of it
+ships.
 
-**We write it.** The crate stays useful in one specific way: it is on this
-machine already, it carries libwebrtc's own unit tests, and
-`GoogCcNetworkController` is drivable from a synthetic feedback trace. It
-belongs in `dev-dependencies` as a conformance oracle, so our controller can be
-run against the same trace as the reference and held to it. That buys the
-confidence of a port without the maintenance of one, and nothing ships.
-
-The parts we deliberately do not copy are `loss_based_bwe_v2` (3,943 lines, the
-newest and least settled component upstream), the network state predictor, the
-audio packet separation, the RTT-based backoff and route change handling.
+Not copied: `loss_based_bwe_v2` (3,943 lines, the newest and least settled part
+upstream), the network state predictor, audio packet separation, RTT-based
+backoff and route change handling.
 
 ## The estimator
 
-Everything below runs on the host, once per receiver report, from packets in
-send order. A packet whose send record has been discarded is skipped.
+The host runs it once per receiver report, over packets in send order. A packet
+whose send record was discarded is skipped.
 
 ### Grouping
 
-Packets are grouped the way libwebrtc groups them, because the delay signal is
-taken between groups rather than between packets. A group is closed when a
-packet's send time is more than 5 ms after the group's first send time. A group
-is merged into its predecessor when the arrival delta is at most 5 ms and the
-delay variation is negative, which is the signature of a burst arriving faster
-than it was sent. A group is closed unconditionally after 100 ms.
-
-For two consecutive completed groups, the delay variation is
+The delay signal is taken between groups, as in libwebrtc. A packet sent more
+than 5 ms after the group's first send opens a new group. A packet whose arrival
+delta is at most 5 ms and whose delay variation is negative joins the open
+group: it is part of a burst that arrived faster than it was sent. A burst stops
+joining 100 ms after the group's first arrival. Between two complete groups, in
+milliseconds:
 
     d = (arrival_last(i) - arrival_last(i-1)) - (send_last(i) - send_last(i-1))
 
-in milliseconds. Positive means the group took longer to cross the path than it
-took to leave, which is a queue filling.
+Positive `d` means the group took longer to cross the path than to leave, so a
+queue is filling.
 
 ### The trendline
-
-The delay variations are accumulated, smoothed, and a least-squares slope is
-taken over a window. This is the whole of the delay estimator:
 
     accumulated += d
     smoothed = 0.9 * smoothed + 0.1 * accumulated
     push (arrival_time - first_arrival_time, smoothed) into a window of 20
     trend = ordinary least squares slope of smoothed against arrival time
-
-The slope is compared against an adaptive threshold, scaled so that a short
-history cannot trigger a decision:
-
     modified = min(deltas_seen, 60) * trend * 4.0
 
-`modified > threshold` is overuse, `modified < -threshold` is underuse, and
-anything between is normal. Overuse is only reported once it has persisted more
-than 10 ms and been seen more than once in a row, and only while the trend is
-not falling. That triple condition is what stops a single late aggregate from
-costing a backoff.
+The `min(deltas_seen, 60)` factor stops a short history from deciding.
+`modified > threshold` is overuse, `modified < -threshold` is underuse, anything
+between is normal. Overuse counts only when it persisted more than 10 ms, was
+seen more than once in a row, and the trend is not falling, so one late
+aggregate cannot cause a backoff.
 
-The threshold itself adapts, which is the part draft-ietf-rmcat-gcc-02 gets
-wrong and which matters most on Wi-Fi, where the noise floor is not constant:
+The threshold adapts. draft-ietf-rmcat-gcc-02 gets this wrong, and it matters
+most on Wi-Fi, where the noise floor moves:
 
     if |modified| > threshold + 15: leave it alone
     k = 0.039 if |modified| < threshold else 0.0087
     threshold += k * (|modified| - threshold) * min(elapsed_ms, 100)
     threshold = clamp(threshold, 6, 600)
 
-It starts at 12.5. It rises slowly when the link is noisy so that a noisy link
-does not read as a congested one, and falls thirty times faster than it rises so
-that a link which becomes quiet regains sensitivity quickly.
+It starts at 12.5. It rises slowly, so noise does not read as congestion, and
+falls about 4.5 times faster, so a link that becomes quiet regains sensitivity
+quickly.
 
 ### The rate
 
-An AIMD control turns the signal into a rate, and every one of its adjustments
-is made against the **acknowledged** rate rather than against what we intended
-to send. That distinction is the whole reason the controller is safe: it can
-never talk itself into a number the path has not already carried.
+An AIMD control turns the signal into a rate. It always adjusts against the
+**acknowledged** rate, never against what the host meant to send, so it cannot
+talk itself into a rate the path has not carried.
 
-The acknowledged rate is the arrival-stamped payload bytes over a sliding 500 ms
-window. libwebrtc runs a Bayesian filter here instead. We do not, because the
-report cadence already smooths at 50 ms and a filter whose behaviour we cannot
-justify from a measurement is a filter we cannot tune. This is the one place we
-knowingly deviate.
+The acknowledged rate is the arrival-stamped wire bytes over a sliding 500 ms
+window, once the window spans 100 ms (a frame that lands within 1 ms would read
+as 100 Mbit/s). libwebrtc uses a Bayesian filter here. The 50 ms report cadence
+already smooths, and a filter no measurement justifies cannot be tuned. This is
+the estimator's one knowing deviation from libwebrtc.
 
 | Signal | Action |
 |---|---|
-| Overuse | `rate = 0.85 * acknowledged`, then hold |
+| Overuse | `rate = 0.85 * acknowledged` (never a rise), then hold |
 | Normal after a hold | begin increasing |
 | Underuse | hold |
 
-While increasing, the step is multiplicative at 1.08 per second, capped so that
-a single update can never claim more than one second of growth, and floored at
-1000 bit/s. Once a link capacity estimate exists, the increase becomes additive
-instead, at one average packet's worth per round trip plus 100 ms, floored at
-4000 bit/s per second. The increase is bounded by `1.5 * acknowledged +
-10 kbit/s` so that a quiet sender cannot climb away from what it has proven.
+- With no link capacity estimate, the increase is 1.08 per second, at most one
+  second of growth per update, at least 1000 bit/s.
+- With one, it is one average packet per `2 * (rtt + 100 ms)`, at least
+  4000 bit/s per second. The average packet is a 30 fps frame at the current
+  rate in 1200-byte packets. The round trip comes from quinn every 250 ms, and
+  is 200 ms until known.
+- The rate never exceeds `1.5 * acknowledged + 10 kbit/s`, so a quiet sender
+  cannot climb past what it has proven. The start rate stands in until the
+  first measurement.
 
 The link capacity estimate is an exponential average of the acknowledged rate at
-each overuse, with a coefficient of 0.05, and of each probe result, with a
-coefficient of 0.5. Its variance is tracked alongside and clamped to [0.4, 2.5],
-and the estimate is reset whenever the acknowledged rate leaves three standard
-deviations of it. Probes move it ten times faster than overuse does, which is
-the point of probing.
+each overuse (coefficient 0.05) and of each probe result (0.5, ten times faster,
+which is the point of probing). Its variance is clamped to [0.4, 2.5], and it
+resets when the acknowledged rate leaves three standard deviations of it.
 
 ### Loss
 
-The delay estimator does not see loss that happens without a queue, which on
-Wi-Fi is most of it. A second controller runs beside it on the cumulative
-counters in each report, over a one second window:
+The delay estimator misses loss without a queue, which on Wi-Fi is most loss. A
+second controller reads the report's cumulative counters and takes the loss
+fraction since the previous report:
 
 | Loss | Action |
 |---|---|
-| Below 2% | increase by 8%, at most once a second |
+| 2% or less | `rate = 1.08 * (lowest rate of the last second) + 1 kbit/s`, at most once a second |
 | 2% to 10% | hold |
 | Above 10% | `rate *= 1 - loss/2`, at most once every 300 ms |
 
-The target is the lower of the two controllers. Worth noting against the
-measurement above: 24 packets lost of 859 is 2.8%, which sits in the hold band.
-The loss controller would have done nothing about the session that failed. The
-delay signal has to carry this, and the loss controller is there for the link
-that fails a different way.
+The target is the lower of the two controllers. Each report caps the loss
+controller at the AIMD rate, and a probe result sets both.
+
+The failed session lost 24 of 859 packets, 2.8%, which is in the hold band. The
+loss controller would not have acted, so the delay signal must carry that case.
+The loss controller is for a link that fails differently.
 
 ### Bounds
 
-The floor is 300 kbit/s. That is not arbitrary: the smallest rung of the ladder,
-860x360 at 15 frames a second, needs 279 kbit/s at the quality figure below.
-Under 300 kbit/s there is no picture worth sending, so the controller holds
-there and lets loss speak rather than chasing a number that cannot be spent.
+The floor is 300 kbit/s. The smallest rung, 860x360 at 15 frames a second, needs
+279 kbit/s at the opening quality figure. Below that no picture is worth
+sending, so the controller holds there and lets loss act.
 
-The ceiling is what the user and the client asked for, unchanged.
+The ceiling is the lower of the host's `max_bitrate` and the client's
+`bitrate_ceiling`, and at least the floor. Each viewport change reads it again.
 
 ## The receiver report
 
-The client says when each video datagram arrived. The key is the `seq` already
-in the media header, which counts every datagram of the session and is compared
-circularly in the manner of RFC 1982. Nothing new is needed to identify a
-packet.
+The client reports when each video datagram arrived, keyed on the `seq` already
+in the media header. `seq` counts every datagram of the session and compares
+circularly (RFC 1982), so no new identifier is needed.
 
-Added to `tachyx_proto::control`:
+| `tachyx_proto::control::Feedback` | |
+|---|---|
+| `base: Seq` | `seq` of the first datagram the report covers |
+| `reference: u32` | client clock at the first arrival in `packets`, in 250 microsecond ticks since the client's session began |
+| `packets: Vec<PacketArrival>` | one entry per `seq` from `base` upward, in order, no gaps |
+| `lost: u64` | datagrams never seen, since the session began |
+| `received: u64` | datagrams received, since the session began |
 
-```rust
-/// When each video datagram arrived, and which never did.
-pub struct Feedback {
-    /// The `seq` of the first datagram this report accounts for.
-    pub base: Seq,
-    /// The client's own clock at the arrival of the first datagram in
-    /// `packets` that arrived, in 250-microsecond ticks since the client's
-    /// session began.
-    pub reference: u32,
-    /// One entry per sequence number from `base` upward, in order, no gaps.
-    pub packets: Vec<PacketArrival>,
-    /// Datagrams the client has never seen, since the session began.
-    pub lost: u64,
-    /// Datagrams the client has received, since the session began.
-    pub received: u64,
-}
+`PacketArrival` is `Missing`, or `Received(i16)`: ticks since the previous
+arrival in the report, negative when reordered, and zero for the first arrival,
+which `reference` dates.
 
-pub enum PacketArrival {
-    /// Not received when the report was built.
-    Missing,
-    /// Received this many 250-microsecond ticks after the previous datagram in
-    /// this report that arrived. Negative when the two were reordered. The
-    /// first arrival is measured from `reference`, so its delta is zero.
-    Received(i16),
-}
-```
+- **Deltas, not offsets.** postcard varint-encodes, so a delta is almost always
+  one byte where an offset is two.
+- **Signed.** Wi-Fi retries and multi-queue hardware reorder packets, and an
+  unsigned delta would misreport that.
+- **250 microsecond ticks.** Transport-wide feedback uses them, and a signed
+  16-bit count then spans 8.19 seconds, about thirty times the longest report
+  interval.
 
-`Seq` needs the serde derives; it does not have them today.
+**No clock synchronisation is required and none is implied.** The estimator
+uses only differences between client arrival times, so a constant clock offset
+cancels. Crystal rate skew does not cancel, but at the parts per million a real
+oscillator drifts it is far below the 6 ms threshold floor. So `reference` is on
+the client's clock, and `ClockSyncRequest` stays unimplemented.
 
-Deltas rather than offsets, because postcard varint-encodes and a delta between
-consecutive datagrams is almost always one byte where an offset from the report
-reference is two. Signed, because reordering is real: Wi-Fi retries and
-multi-queue hardware both produce it, and an unsigned delta would have to lie
-about it. Two hundred and fifty microsecond ticks because that is what
-transport-wide feedback uses and because a signed 16-bit tick count then spans
-8.19 seconds, which is thirty times the longest report interval.
+`lost` and `received` are cumulative, so a late report is still exact about its
+interval. A slot that leaves the client's report window empty is lost. The
+reassembler's counters are the wrong source: they call a packet lost when a
+later one arrives and never retract. Measured on a phone, they counted 211 lost
+while 429 arrived late, and held the session at 2 Mbit/s for the whole run.
 
-**No clock synchronisation is required and none is implied.** Every quantity the
-estimator takes from this message is a difference between two client arrival
-times, so a constant offset between the two clocks cancels exactly. Rate skew
-between the two crystals does not cancel, but at the parts-per-million a real
-oscillator drifts it is far below the 6 ms threshold floor. This is why
-`reference` is on the client's own clock and why `ClockSyncRequest` stays
-unimplemented.
+### Cadence
 
-The cumulative `lost` and `received` counters are what the loss controller
-reads. They are cumulative rather than per-interval so that a delayed report is
-still exactly right about the interval it covers.
+Every 50 ms, if at least one datagram arrived since the last report. At most 512
+statuses per report. A longer report splits into parts sent back to back.
 
-### How often
+libwebrtc sets the interval from 68 bytes of report against 5% of the estimate,
+clamped to [50 ms, 250 ms]. Above 218 kbit/s the clamp decides. One comparison
+reproduces the only other case, a collapsing link: while the host's announced
+bitrate is under 250 kbit/s, the client reports every 250 ms.
 
-Every 50 ms, if at least one datagram arrived since the last report, and never
-more than 512 statuses in one report. A report describing more than that is
-split and the parts sent back to back.
-
-libwebrtc computes the interval as 68 bytes of report against 5% of the estimate
-and clamps it to [50 ms, 250 ms]. On any link above 218 kbit/s that formula
-returns something below 50 ms and the clamp decides, so carrying the formula
-would be carrying arithmetic with one answer. The single case where it does
-something is a collapsing link, and one comparison reproduces it: while the
-host's announced bitrate is under 250 kbit/s, report every 250 ms instead.
-
-Measured, with real postcard encodings and the four byte length prefix the
-control stream adds:
+Measured, with real postcard encodings and the control stream's 4-byte length
+prefix:
 
 | Datagrams described | Bytes, no loss | Bytes, 5% loss | Bytes per datagram |
 |---|---|---|---|
@@ -303,107 +251,96 @@ control stream adds:
 | 256 | 529 | 516 | 2.1 |
 | 512 | 1041 | 1015 | 2.0 |
 
-At 1418 byte payloads that is one report per 50 ms describing 8 datagrams at
-2 Mbit/s, 35 at 8 Mbit/s and 88 at 20 Mbit/s. Adding thirty bytes for QUIC, UDP
-and IP framing, the reports cost 9.8, 18.2 and 34.7 kbit/s, which is 0.49%,
-0.23% and 0.17% of the video they describe. The cost falls as a share of the
-link because the per-report overhead is fixed and the per-packet cost is two
-bytes.
+At 1418-byte payloads a 50 ms report covers 8 datagrams at 2 Mbit/s, 35 at 8 and
+88 at 20. With 30 bytes of QUIC, UDP and IP framing that is 9.8, 18.2 and
+34.7 kbit/s: 0.49%, 0.23% and 0.17% of the video described. The overhead per
+report is fixed and each packet adds about two bytes, so the share falls as the
+rate rises.
 
-### The sender's side
+### The sender's record
 
-The host keeps, for every datagram it releases, the sequence number, the release
-time, the wire size, and the probe cluster it belonged to if any. Three seconds
-of history at 20 Mbit/s is 5,289 entries, about 127 kB. Sequence numbers are
-extended to 64 bits on the way in using `Seq::distance_from`, so a wrap every
-93 seconds at 20 Mbit/s is invisible as long as reports keep arriving, and the
-history is discarded and restarted if a report's base cannot be placed.
+For each released datagram the host keeps the `seq`, release time, wire size and
+probe cluster, if any. Three seconds at 20 Mbit/s is 5,289 entries, about
+127 kB. `Seq::distance_from` extends `seq` to 64 bits on the way in, so the
+wrap (every 37 seconds at 20 Mbit/s, 93 seconds at 8 Mbit/s) is invisible while
+reports arrive. A report whose base cannot be placed discards the history.
 
 ## The probe sender
 
-Without probing the controller recovers by multiplicative increase alone, and
-1.08 per second means a factor of five takes `ln 5 / ln 1.08`, which is 20.9
-seconds. That is exactly the recovery time the earlier simulation observed after
-an 80% capacity cut, and it is not a tuning problem. It is what the algorithm
-does when nothing tests the link. Probing is not an optimisation of GCC. It is
-half of it.
+Without probes, recovery is multiplicative increase alone. At 1.08 per second a
+factor of five takes `ln 5 / ln 1.08`, which is 20.9 seconds, and a simulation
+observed exactly that after an 80% capacity cut. That is not a tuning problem.
+It is what the algorithm does when nothing tests the link. Probing is half of
+GCC.
 
-A probe is a cluster of datagrams released at a chosen rate, higher than the
-current target, whose arrival spacing in the next report says whether the link
-carried them. The result sets the estimate directly instead of waiting for the
-increase to walk there.
+A probe is a cluster of datagrams released above the current target. Their
+arrival spacing in the next report shows whether the link carried that rate, and
+the result sets the estimate directly.
 
 ### What a probe is made of
 
-Media first. When a probe is scheduled and the encoder has just produced a
-frame, that frame's datagrams are released at the probe rate rather than the
-pacing rate, and they are the cluster. This costs nothing at all: the same bytes
-were going out anyway, only sooner.
+**Media first.** If a probe is due when the encoder has just produced a frame,
+that frame's datagrams are the cluster, released at the probe rate instead of
+the pacing rate. The bytes were leaving anyway, so this costs nothing.
 
-Padding second, because a desktop is usually still and produces no frames for
-seconds at a time, which is precisely when a probe is most needed. A padding
-datagram carries the ordinary 16 byte media header with **bit 2 of `flags`**
-set, and a payload of zeroes. A receiver that sees that bit counts the sequence
-number, records the arrival, and discards the packet without touching
-reassembly: `frame_id`, `capture`, `slice_pkts`, `pkt_idx` and `slice_id` all
-mean nothing on a padding packet. Sequence accounting is the only thing padding
-participates in, and it is the only thing it exists for.
+**Padding second.** A still desktop produces no frames for seconds, which is
+when a probe is most needed. A padding datagram is the normal 16-byte media
+header with **bit 2 of `flags`** set, and a zero payload. The receiver counts its
+`seq`, records its arrival and drops it before reassembly. `frame_id`,
+`capture`, `slice_pkts`, `pkt_idx` and `slice_id` mean nothing on it.
 
-A cluster is `max(5 datagrams, 15 ms at the probe rate)`. The five packet floor
-matters at low rates: at 300 kbit/s, 15 ms is one datagram and one datagram
-measures nothing, so the cluster becomes five datagrams spread over 96 ms and
-the spacing still reads the link.
+A cluster is `max(5 datagrams, 15 ms at the probe rate)`. At 300 kbit/s, 15 ms
+is one datagram, which measures nothing, so the cluster becomes five datagrams
+over 96 ms.
 
 ### When to probe
 
-At startup, immediately, at three times the start rate, and then at six times
-once the first result is in. Thereafter at twice the current estimate whenever
-the estimate has grown to within 70% of the last probe's rate, until the
-ceiling is reached.
+- **Startup.** At once, at three times the start rate. Then at twice the
+  estimate (six times the start rate after the first result) each time the
+  estimate reaches 70% of the last probe's rate, up to the ceiling.
+- **Steady state.** At twice the estimate whenever the sender has been
+  application-limited for 5 seconds. A still screen produces no frames, so this
+  is the ordinary case. It stops one transient from leaving the controller at a
+  depressed rate for ever. (The build drops this gate. See the end.)
+- **After a fall.** When the estimate drops below 66% of the highest estimate of
+  the last 5 seconds, at 85% of that high-water mark.
 
-In steady state, whenever the sender has been application-limited for 5 seconds,
-at twice the current estimate. A remote desktop is application-limited almost
-all the time, because a still screen produces no frames, so this is the ordinary
-case rather than the exception, and it is the specific answer to a controller
-that would otherwise sit at a depressed rate forever after one transient.
+One cluster at a time, at least 1 second apart, never during overuse. Both
+steady-state rules wait 5 seconds after the last probe. A result not back within
+1 second abandons the cluster, and its rate is forgotten.
 
-After a fall, if the estimate drops below 66% of the highest estimate seen in
-the last 5 seconds, probe at 85% of that high water mark.
-
-A result is waited for at most 1 second, after which the cluster is abandoned.
-
-The cost of the steady-state probe is fixed as a share of the link and does not
-depend on the link. Probing at `2R` for `D` seconds every `T` seconds costs
-`2D/T` of `R`, which at 15 ms every 5 seconds is 0.6%, whether R is 300 kbit/s
-or 20 Mbit/s.
+Probing at `2R` for `D` seconds every `T` seconds costs `2D/T` of `R`. At 15 ms
+every 5 seconds that is 0.6%, at 300 kbit/s or at 20 Mbit/s.
 
 ### Reading a probe
 
-From the report, take the cluster's first and last send times and first and last
-arrival times, and the bytes excluding the first packet in each direction:
+Take the cluster's first and last send times and first and last arrival times.
+The send bytes exclude the last datagram sent, and the receive bytes exclude the
+first datagram received.
 
     send_rate    = send_bytes / (last_send - first_send)
     receive_rate = receive_bytes / (last_arrival - first_arrival)
 
-If `receive_rate / send_rate` exceeds 2.0 the cluster was not delivered as a
-cluster and the result is discarded. Otherwise the result is
-`min(send_rate, receive_rate)`, except that if `receive_rate` came in below 90%
-of `send_rate` the link was saturated by the probe and the result is
-`0.8 * receive_rate`, so that acting on it does not immediately overuse.
+At least 4 datagrams must arrive. If `receive_rate / send_rate` exceeds 2.0, the
+cluster was not delivered as a cluster and the result is discarded. Otherwise the
+result is `min(send_rate, receive_rate)`. If `receive_rate` is below 90% of
+`send_rate`, the probe saturated the link, and the result is
+`0.8 * receive_rate` so that acting on it does not overuse at once. libwebrtc
+uses 0.95. Here an overshoot costs a key frame, about eight ordinary frames, so
+the factor is 0.8.
 
-A result sets the AIMD control's rate outright and updates the link capacity
-estimate at a coefficient of 0.5.
+A result sets the AIMD rate outright and moves the capacity estimate with
+coefficient 0.5.
 
 ## Making the encoder produce less
 
-This is where the old design was not merely mistuned but pointed at the wrong
-thing. It set a number on the encoder and dropped whole frames after encoding
-when the number did not work. Both halves are wrong.
+The old design set a number on the encoder, then dropped whole frames after
+encoding when the number did not hold. Both halves were wrong.
 
-### The bitrate property is not a limit, and it is barely a hint
+### The bitrate property does not bound the output
 
-Measured on this machine, `vah264enc` at 1920x1088, variable bitrate, declared
-60 frames a second, eight seconds a run, output measured as bytes on disk:
+Measured: `vah264enc` at 1920x1088, variable bitrate, 60 fps declared, eight
+seconds a run, bytes on disk.
 
 | Content | Configured | Achieved | Ratio |
 |---|---|---|---|
@@ -416,45 +353,38 @@ Measured on this machine, `vah264enc` at 1920x1088, variable bitrate, declared
 | ball | 8.0 Mbit/s | 0.19 Mbit/s | 0.02x |
 | ball | 20.0 Mbit/s | 0.21 Mbit/s | 0.01x |
 
-The property spans two orders of magnitude of error in each direction. On
-content the encoder cannot compress it is pinned at its quantiser ceiling and
-emits 24 kB a frame no matter what it is asked for. On content it can compress
-it emits 400 bytes a frame no matter what it is asked for. Snow is a worst case
-nobody's desktop reaches, but a video window playing at full screen is closer to
-snow than to a still page, and the earlier finding that a bitrate of 20 produced
-20.7 to 35.8 Mbit/s is the same effect at a milder amplitude.
+The error spans two orders of magnitude each way. On content it cannot
+compress, the encoder sits at its quantiser ceiling and emits 24 kB a frame
+whatever it is asked for. On easy content it emits 400 bytes a frame. No desktop
+reaches snow, but a full-screen video window is closer to snow than to a still
+page, and [`findings.md`](findings.md) records 20.7 to 35.8 Mbit/s at a
+configured 20.
 
-The conclusion is unavoidable. **Nothing written into the encoder bounds what
-goes on the wire.** The only thing that bounds it is refusing to give the
-encoder pictures.
+**Nothing written into the encoder bounds what goes on the wire.** Only refusing
+to give it pictures does.
 
 ### The token bucket is the rate limiter
 
-`tachyx_media::Encoder` already checks an `admission` flag before it pushes a
-capture frame into the pipeline, and the pipeline is synchronous, so the byte
-cost of a frame is known the moment it returns. That is everything a token
-bucket needs.
+The encoder pump checks each capture frame before it enters the pipeline. The
+pipeline is synchronous, so a frame's byte cost is known when the call returns:
 
     balance += target_bits * elapsed          (refilled continuously)
     balance = min(balance, ceiling)
     admit the next capture frame while balance >= 0
     balance -= encoded_bits                   (charged the real size)
 
-The ceiling is the greater of 100 ms of the target and the current key frame
-estimate, so a desktop that has been still for a fifth of a second has banked
-enough credit to pay for a key frame outright. That is exactly the case that
-matters: the user comes back, the screen changes, a key frame is needed, and it
-must not be rationed at the moment the session becomes interactive again.
+The ceiling is the greater of 100 ms of the target and the last key frame, so a
+desktop still for a fifth of a second can pay for a key frame outright. Then
+someone returns, the screen changes, and the key frame is not rationed as the
+session becomes interactive again.
 
-The balance may go negative by at most one frame, and the frames refused while
-it recovers are refused **before** the encoder sees them. A frame never
-submitted leaves the reference chain intact and costs the client nothing. That
-is the entire difference between this and the gate that produced twelve
-undecodable frames.
+The balance goes at most one frame negative. Frames refused while it recovers
+are refused **before** the encoder sees them, so the reference chain stays
+intact and the client loses nothing. That is the difference from the gate that
+produced twelve undecodable frames.
 
-Charging the measured size rather than a modelled one is not fastidiousness. The
-model is wrong. Measured, dropping capture frames ahead of the encoder at a
-fixed declared frame rate:
+The bucket charges the measured size because the model is wrong. Measured,
+dropping capture frames ahead of the encoder at a fixed declared rate:
 
 | Frames delivered | Rate on the wire | Mean frame |
 |---|---|---|
@@ -463,40 +393,29 @@ fixed declared frame rate:
 | 30.9/s | 8.43 Mbit/s | 34,124 B |
 | 14.9/s | 5.56 Mbit/s | 46,702 B |
 
-Halving the frame rate gives 62% of the bytes, not 50%, and quartering it gives
-41%, not 25%. The wire rate follows roughly the 0.65 power of the delivered
-frame rate, because the encoder's own rate control lowers its quantiser when it
-finds itself under budget and spends the slack on the frames that do arrive.
-This contradicts the line in [`findings.md`](findings.md) that says caps
-declaring 60 while capture delivers 20 produces a third of the configured rate.
-That reading is linear and the behaviour is not.
+Half the frame rate gives 62% of the bytes, not 50%. A quarter gives 41%, not
+25%. The wire rate follows roughly the 0.65 power of the delivered frame rate:
+under budget, the encoder lowers its quantiser and spends the slack on the
+frames that arrive. This contradicts the linear reading in
+[`findings.md`](findings.md), that caps declaring 60 while capture delivers 20
+produce a third of the configured rate. It helps the controller, because refused
+frames come back partly as quality.
 
-For the controller this is good news rather than bad: refused frames are partly
-repaid as quality on the frames that survive. It only means the bucket must be
-charged what actually happened.
+### Retargeting the encoder
 
-### The coarse knob, and what it costs
+The `bitrate` property still sets the operating point the bucket polices. Far
+too high, the bucket refuses most frames and the picture judders. Too low, the
+picture is soft for no reason. Every change costs a full key frame.
 
-The encoder's `bitrate` property still matters, because it sets the operating
-point the bucket is asked to police. Set far too high, the bucket refuses most
-frames and the picture judders. Set too low, the bucket refuses nothing and the
-picture is soft for no reason.
-
-Changing it costs a full key frame, and two traps make that worse than it
-sounds.
-
-The first is that the setter has no equality guard. Read from
-`gst-plugins-bad/sys/va/gstvah264enc.c`, `PROP_BITRATE`, `PROP_CPB_SIZE` and
-`PROP_TARGET_PERCENTAGE` all assign and then set `reconf` unconditionally, and
+**The setter has no equality guard.** Read from
+`gst-plugins-bad/sys/va/gstvah264enc.c`: `PROP_BITRATE`, `PROP_CPB_SIZE` and
+`PROP_TARGET_PERCENTAGE` assign and set `reconf` unconditionally, and
 `gst_va_base_enc_handle_frame` turns `reconf` into a drain plus
 `gst_va_base_enc_reset_state`, which restarts the group of pictures. Measured on
-a running pipeline: writing 20000 to a `bitrate` that already held 20000
-produced a key frame. **Anything that retargets the encoder must compare before
-it writes.**
+a running pipeline, writing 20000 to a `bitrate` that held 20000 produced a key
+frame. **Anything that retargets the encoder must compare before it writes.**
 
-The second is the opposite, and it is free. Measured on the same pipeline, a
-resolution change and a bitrate change applied in the same tick cost **one** key
-frame between them, not two:
+**Changes in one tick share one key frame.** Measured on the same pipeline:
 
 | Change | Key frames |
 |---|---|
@@ -506,65 +425,55 @@ frame between them, not two:
 | size to 3440x1440 **and** bitrate to 20000 together | one |
 | bitrate 20000 to 20000 | one |
 
-So the whole operating point moves in a single step, and the client sees one
-`StreamConfig`. The retarget rule follows:
+So the whole operating point moves in one step, and the client sees one
+`StreamConfig`. The ladder retargets down when the controller's target falls
+below 80% of the encoder's setting, and up when it rises above 130%, at most
+once a second and always through the key frame budget in `idr.rs`.
 
-- Retarget down when the controller's target falls below 80% of what the encoder
-  is set to.
-- Retarget up when it rises above 130% of it.
-- Never more than once a second, and always through the shared key frame budget
-  in `idr.rs`.
+Down is more eager because the errors are not symmetric. Set 25% high, the
+bucket refuses a fifth of frames and 75 Hz becomes 60. Set 25% low, the picture
+is slightly soft. Set twice too high, half the frames go and the session is
+unusable.
 
-Down is more eager than up because the two errors are not symmetric. Set 25%
-high, the bucket refuses a fifth of frames and a 75 Hz stream becomes 60. Set
-25% low, the picture is slightly soft and nothing else happens. Set twice too
-high, half the frames go and the session is unusable.
+### The coded picture buffer
 
-### The coded picture buffer is not being set
+The coded picture buffer sets how far the encoder may overshoot before its rate
+control reacts. `Control::apply_rate` sets `cpb-size` to half the bitrate in
+kilobits, 500 ms. At `target-percentage` 66 the element ignores it. For variable
+bitrate, `_ensure_rate_control` sets
+`max_bitrate = bitrate * 100 / target_percentage` and `target_bitrate = bitrate`.
+`_calculate_bitrate_hrd` rejects any `cpb_size` below `max_bitrate / 2`, which is
+`0.758 * bitrate`, and silently substitutes `max_bitrate * 2`. The log at
+8000 kbit/s shows `Too small cpb_size: 4000`, then `Adjust cpb_size to: 24242`:
+a **two second** buffer, four times the intent and the element's own default.
 
-A defect found while measuring, which belongs here because it decides how far
-the encoder may overshoot before its rate control reacts.
+So the encoder sets `target-percentage` to 100. `max_bitrate` becomes `bitrate`,
+and `cpb-size = bitrate / 2` sits exactly at the floor and is honoured.
+Measured, no filler returns and the achieved rate does not drop: snow at
+8000 kbit/s produced 12.62 Mbit/s at 66 and 13.68 Mbit/s at 100. It is not a
+ceiling, but it removes 1.5 seconds of slack the encoder could spend in one
+burst at the worst moment.
 
-`Control::apply_rate` sets `cpb-size` to half the bitrate in kilobits, which the
-findings document describes as the 500 ms floor. It is not, because
-`target-percentage` is 66. In `_ensure_rate_control`, variable bitrate sets
-`max_bitrate = bitrate * 100 / target_percentage` and `target_bitrate =
-bitrate`, and `_calculate_bitrate_hrd` rejects any `cpb_size` below
-`max_bitrate / 2`, which is `0.758 * bitrate`, and silently substitutes
-`max_bitrate * 2`. Confirmed in the log at 8000 kbit/s: `Too small cpb_size:
-4000` followed by `Adjust cpb_size to: 24242`. The encoder is running with a
-**two second** coded picture buffer, four times the intended figure and the
-element's own default.
+### The ladder: frame rate first, resolution last
 
-Setting `target-percentage` to 100 fixes both halves at once. `max_bitrate`
-becomes `bitrate`, so `cpb-size = bitrate / 2` is exactly at the floor and is
-honoured, giving the intended 500 ms. Measured, the change does not reintroduce
-filler and does not lower the achieved rate: snow at 8000 kbit/s produced 12.62
-Mbit/s at 66 and 13.68 Mbit/s at 100. It is not a ceiling and was never going to
-be one, but it removes 1.5 seconds of accumulated slack that the encoder can
-spend in a burst at the worst possible moment.
-
-### The ladder becomes frame rate first, resolution last
-
-The existing ladder in `ladder.rs` spends bitrate first and resolution last,
-which is right for desktop content and stays. What it lacks is the rung between
-them.
+`ladder.rs` spends bitrate first, frame rate second and resolution last, because
+sharp text degrades far more under a resample than under coarser quantisation.
 
 Frame admission drops whole capture frames, so the deliverable rates are the
-output's refresh divided by a whole number. On a 74.983 Hz output that is 75,
-37.5, 25, 18.75 and 15. A stride `n` in 1 to 5 sets both the declared frame rate
-and the cadence the pump admits at, and 15 frames a second is the floor because
-below it a desktop stops feeling connected.
+refresh divided by a whole number: on a 74.983 Hz output, 75, 37.5, 25, 18.75
+and 15. A stride `n` from 1 to 5 sets both the declared rate and the pump's
+admit cadence. 15 frames a second is the floor, because below it a desktop stops
+feeling connected. The rungs are halvings of the capture (a quarter, a half,
+full), because scaling to three quarters measured 9.8 ms, more than not scaling
+(7.6 ms), while a halving costs 5.1 ms.
 
-Choosing the opening point needs a quality figure, and one is available from
-measurement rather than assumption. The busiest desktop content measured on this
-host, a busy quarter-screen window at 1080p60, carried 7.86 Mbit/s of picture,
-which is 0.063 bits per pixel per frame. Rounding down, `q = 0.06`. The rule is
-then: take the largest rung, and the smallest stride in 1 to 5, for which
+The busiest desktop content measured, a busy quarter-screen window at 1080p60,
+carried 7.86 Mbit/s: 0.063 bits per pixel per frame. Rounded down, `q = 0.06`.
+The session opens at the largest rung, and the smallest stride, for which
 
     q * pixels * refresh / n <= target
 
-Worked through at 74.983 Hz on a 3440x1440 capture:
+The worked table, at 74.983 Hz on a 3440x1440 capture:
 
 | Target | Rung | Stride | Declared |
 |---|---|---|---|
@@ -573,113 +482,98 @@ Worked through at 74.983 Hz on a 3440x1440 capture:
 | 20 Mbit/s | 3440x1440 | 2 | 37.5 fps |
 | 25 Mbit/s | 3440x1440 | 1 | 75 fps |
 
-Native resolution at 25 frames a second on 8 Mbit/s is the right answer for a
-desktop and it is what the failed session should have produced. Sharp text at 25
-Hz beats soft text at 75.
+The failed session should have opened at native resolution and 25 frames a
+second. Sharp text at 25 Hz beats soft text at 75.
 
-That rule is only used before anything has been measured, because `q` is a worst
-case and real desktop content measures 0.006 to 0.063. After the first second
-the ladder closes the loop on what the bucket is actually doing:
+`q` is a worst case, and real desktop content measures 0.006 to 0.063, so the
+rule sets only the opening point. Then the ladder follows the bucket:
 
-- Step down, raising the stride, or dropping a rung when the stride is already 5,
-  when the bucket refuses more than 10% of offered frames over 2 seconds.
-- Step up when the encoder's measured production over 5 seconds is under 60% of
-  the target and the bucket has refused nothing.
+- **Down** when the bucket refuses more than 10% of offered frames over
+  2 seconds. Raise the stride, or at stride 5 drop a rung and return to stride 1.
+- **Up** when production over 5 seconds is under 60% of the target and nothing
+  was refused. Lower the stride, or at stride 1 climb a rung and land at
+  stride 2, because four times the pixels at half the rate is twice the demand.
+- The resolution changes at most once every 5 seconds.
 
-Sixty percent because a step from stride `n` to `n-1` raises production by
+Sixty percent because a step from stride `n` to `n - 1` raises production by
 roughly `n / (n - 1)`, which is 1.5 at the tightest step, so anything above
 `1 / 1.5` of the target would step up into a refusal.
 
-### The transport gate becomes what it was always for
+### The transport gate
 
-`VideoSender::can_send_frame` stays exactly as it is. It does not exist for
-congestion control and never did: it exists because quinn's datagram eviction
-path double-subtracts and reaching it ends the connection. With the pacer below
-keeping quinn's queue one or two datagrams deep, it will not fire, and that is
-the point. It is a safety interlock against a bug, not a rate control mechanism,
-and a session in which it fires is a session with something else wrong.
+`VideoSender::can_send_frame` is not congestion control. quinn's datagram
+eviction path double-subtracts, and reaching it ends the connection. The gate
+keeps that path unreachable. With the pacer keeping quinn's queue shallow it does
+not fire, and a session where it fires has something else wrong.
 
 ## Pacing
 
-The controller's target is useless if the bytes leave in bursts. Three separate
-things need pacing.
+A target is useless if the bytes leave in bursts:
 
-A key frame at 3440x1440 measured 192 kB. On an 8 Mbit/s link that is 192 ms of
-link time. Handed to quinn all at once it fills the bottleneck queue and adds
-192 ms of delay to everything behind it, including the heartbeat, which is
-exactly how a live session came to report "no heartbeat".
+- A 3440x1440 key frame measured 192 kB, 192 ms at 8 Mbit/s. Handed over at
+  once, it fills the bottleneck queue and delays everything behind it by 192 ms,
+  the heartbeat included. That is how a live session reported "no heartbeat".
+- The report's send times must be departure times. A deep quinn queue makes them
+  queue-entry times, and a delay estimate built on wrong send times is worse
+  than none.
+- Control shares packets with video, in an order the host does not choose.
 
-The receiver report's send timestamps must be the times datagrams actually left,
-and a deep queue in quinn makes them queue-entry times instead. A delay estimate
-built on wrong send times is worse than none.
+The pacer is in `crates/tachyx-transport/src/pace.rs` and `video.rs`, with the
+measurements behind each bound:
 
-And control traffic shares packets with video, in an order we do not control.
+- **Rate** `max(2.5 * target, picture wire bytes / 35 ms)`. 2.5 is libwebrtc's
+  pacing factor: a media burst clears in a fraction of a frame interval without
+  being a burst on the wire. The floor keeps a key frame inside the receiver's
+  50 ms frame deadline. Measured, a key frame spread over 43.8 ms arrived 98 to
+  99% of the time, and one spread over 52 ms never arrived.
+- **Burst allowance**, the lesser of 25,000 bytes and 15 ms at the pacing rate,
+  so a delta frame leaves unpaced.
+- **Per datagram.** Each datagram is charged when released. Waits under 1 ms are
+  not slept, and the debt carries forward.
+- **Shallow quinn queue.** Before each picture and after each wait, the sender
+  waits until quinn's queue holds at most 2 ms at the configured rate, and at
+  most 50 ms per picture. Unsent datagrams wait in the host, where they are
+  visible. The estimator groups over 5 ms, so residence that varies by less
+  cannot move the signal.
 
-So the host paces. Datagrams are released into quinn on a 1 ms tick from a token
-bucket at `2.5 * target`, which is libwebrtc's pacing factor and exists so a
-burst of media clears in a reasonable fraction of a frame interval without being
-a burst on the wire. At 8 Mbit/s the release quantum is under 3 kB, so quinn's
-queue holds one or two datagrams and the recorded send time is accurate to about
-a millisecond. Anything the pacer has not released waits in the host's own
-buffer, where we can see it, rather than in quinn's, where we cannot.
-
-The pacer will not release while quinn holds more than four datagrams. If that
-back pressure persists it means quinn's own congestion window has closed, which
-is information, and it is reported rather than worked around.
-
-`datagram_send_buffer_size` should shrink accordingly. It is currently sized to
-hold a whole key frame, 203,785 bytes, because a key frame had to be handed over
-whole. With a pacer in front of it there is no reason for quinn to hold more
-than a handful of datagrams, and 64 KiB is generous. The receive buffer on the
-client stays where it is: the client is not paced by us and a burst can still
-arrive.
+Nothing paces what reaches the client, so its receive buffer stays large.
 
 ## Starting a session
 
-A session begins with no estimate. Starting at the configured ceiling, which is
-what happens today, is the single largest cause of the failure this document
-opens with: 20 Mbit/s of demand on a link carrying eight, from the first frame,
-with a 130 kB key frame sent as a burst before anything had measured anything.
+A session begins with no estimate. Starting at the configured ceiling is the
+single largest cause of the failure this document opens with: 20 Mbit/s of
+demand from the first frame on a link that carries eight, and a 130 kB key frame
+sent as a burst before anything was measured.
 
-**The session starts at 2.0 Mbit/s.** Not because 2 Mbit/s is a good guess about
-the link, but because it is a rate that essentially every link this will run on
-carries, and because a low start is cheap when probing makes it brief. libwebrtc
-starts at 300 kbit/s for the same reason; a remote desktop can afford more
-because it can afford to be wrong for a quarter of a second and cannot afford an
-unreadable first picture.
+**The session starts at 2.0 Mbit/s.** Almost every link carries it, and probing
+makes a low start brief. libwebrtc starts at 300 kbit/s for the same reason. A
+remote desktop starts higher because being wrong for a quarter of a second is
+cheap and an unreadable first picture is not.
 
-At 2 Mbit/s the opening rule picks 1720x720 at a stride of 3, so 25 frames a
-second. The first key frame at that size measured 38 kB, which is 155 ms at
-2 Mbit/s and 52 ms at the first probe's rate.
+At 2 Mbit/s the opening rule picks 1720x720 at stride 3, 25 frames a second. Its
+first key frame measured 38 kB: 155 ms at 2 Mbit/s, 52 ms at the first probe's
+rate. That key frame, 27 datagrams that must go anyway, is the first probe, and
+at 6 Mbit/s it measures three times the start rate for free. The probes then
+double until the estimate stops keeping up or the ceiling is reached: 6, 12 and
+20 on a 20 Mbit/s ceiling.
 
-The first key frame is the first probe. It has to be sent anyway, it is a
-cluster of twenty-seven datagrams, and releasing it at 6 Mbit/s rather than
-2 measures the link at three times the start rate for free. The second probe
-follows at 12 Mbit/s, then doubling until the estimate stops keeping up or the
-ceiling is reached, so on a 20 Mbit/s ceiling the sequence is 6, 12 and 20.
+Each probe costs a report interval plus its own duration, so the estimate
+arrives in about 200 to 300 ms. Multiplicative increase alone needs
+`ln 10 / ln 1.08`, which is 29.9 seconds, from 2 to 20 Mbit/s.
 
-Each probe costs one report interval plus the cluster's own duration, so the
-estimate reaches the truth in roughly 200 to 300 milliseconds. Without probing
-it would take 20.9 seconds to climb from 2 to 20 Mbit/s. That difference is the
-whole justification for building a probe sender.
+## Room for the control stream
 
-## What the control stream needs
+quinn writes DATAGRAM frames into a packet before STREAM frames
+(`quinn-proto-0.11.17/src/connection/mod.rs:3314` and `:3370`). The datagram
+loop fills every 1-RTT packet from the datagram queue unconditionally, and
+`write_stream_frames` gets what is left. `SendStream::set_priority` sorts
+pending streams against each other and has no relation to datagrams. The only
+transport knob, `datagram_send_buffer_size`, is coarse. **So the controller
+leaves room and the pacer keeps the queue shallow, and control never waits
+behind more than one packet of video.**
 
-quinn writes DATAGRAM frames into a packet before STREAM frames, at
-`quinn-proto-0.11.17/src/connection/mod.rs:3314` and `:3370` respectively, and
-the datagram loop is unconditional: it drains the outgoing datagram queue into
-every 1-RTT packet until the packet is full, and only then does
-`write_stream_frames` get what is left. `SendStream::set_priority` does not help
-and cannot: it sets the sort key of a heap of pending streams, so it orders
-streams against other streams and has no relationship to datagrams at all.
-
-There is exactly one transport-level knob, `datagram_send_buffer_size`, and it
-is coarse. So the answer is not a priority setting. **The answer is that the
-congestion controller must leave room and the pacer must keep the queue shallow,
-and between them control never waits behind more than one packet of video.**
-
-How much room, measured rather than guessed. Real postcard encodings plus the
-four byte length prefix, plus thirty bytes of QUIC, UDP and IP framing:
+Measured, with postcard encoding, the 4-byte length prefix, and 30 bytes of
+QUIC, UDP and IP framing:
 
 | Message | Bytes | Rate | Cost |
 |---|---|---|---|
@@ -690,155 +584,149 @@ four byte length prefix, plus thirty bytes of QUIC, UDP and IP framing:
 | `InputBatch`, one event | 18 | up to 250/s | 96 kbit/s |
 | `InputBatch`, four events | 54 | up to 250/s | 168 kbit/s |
 
-Input dominates, and by a lot. `INPUT_TICK` is 4 ms, so a sustained drag can
-produce 250 batches a second, and at one event a batch the message is 18 bytes
-carrying about 12 bytes of pointer delta. On a phone reporting touches at the
-display rate the real figure is nearer 120 batches a second and 46 kbit/s, but
-the ceiling is what has to be reserved.
+Input costs the most. `INPUT_TICK` is 4 ms, so a sustained drag sends up to 250
+batches a second, each 18 bytes around about 12 bytes of pointer delta. A phone
+touching at the display rate sends nearer 120 a second, 46 kbit/s, but the
+reserve must cover the ceiling. On a starved link, 48 wire bytes per 12 bytes of
+motion needs another look.
 
-**The video target is the estimate less a flat 150 kbit/s.** Flat, not a
-percentage, because control's cost does not scale with the video rate: 35
-kbit/s of reports at the highest rate this system runs at, 2 kbit/s of
-heartbeat, and up to 100 kbit/s of input. That is 7.5% of a 2 Mbit/s link and
-0.75% of a 20 Mbit/s one, and both are the right answer.
+**The video target is the estimate less a flat 150 kbit/s.** Flat, because
+control does not scale with video: 35 kbit/s of reports at the highest rate this
+system runs at, 2 kbit/s of heartbeat, and up to 100 kbit/s of input. That is
+7.5% of a 2 Mbit/s link and 0.75% of a 20 Mbit/s one, and both are right. While
+sound flows, its 128 kbit/s plus 12.8 kbit/s of headers also comes off the video
+share, never below the floor. Sound is neither paced nor gated, so on top of the
+video the estimator would read it as the picture asking for too much.
 
-Two things follow that are not congestion control but are caused by it. Input
-batching at 4 ms spends 48 bytes on the wire to carry 12 bytes of pointer
-motion, and on a starved link that ratio is worth revisiting. And the heartbeat
-should carry the controller's own target rather than quinn's pacing rate, and
-should count the bucket's refusals separately from the transport gate's, because
-the overlay that reported "179 gated" could not say which mechanism did it.
+The heartbeat carries the controller's `estimate` beside quinn's `pacing_rate`,
+and counts the bucket's `frames_refused` apart from the gate's `frames_gated`.
+The overlay that reported "179 gated" could not say which mechanism fired.
 
-## What this will not fix
+## What this does not fix
 
-Wi-Fi is not a queue. GCC assumes a bottleneck whose queue grows under load, and
-802.11 aggregation, retries, rate adaptation and power-save naps all move delay
-for reasons that are not congestion. The adaptive threshold absorbs the steady
-part of that noise and the probe recovers from a false backoff within five
-seconds, but false backoffs will happen and some of them will be visible.
-
-It does not make loss survivable. 24 packets lost of 859 is 2.8%, and with one
-reference frame and one slice per frame every lost packet destroys a frame and
-every frame after it until the next key frame. Lowering the rate lowers how
-often that happens; it does not change what happens when it does. The twelve
-undecodable frames in the failed session came from post-encode drops and are
-fixed by moving the drop ahead of the encoder. The ones that come from real wire
-loss are not fixed by anything in this document. They are fixed by the parity in
-[`protocol.md`](protocol.md), which is a separate mechanism with its own
-bandwidth cost: the controller's target has to cover the parity as well as the
-picture, because both go on the same queue. Intra refresh and long-term
-reference frames remain unreachable on this hardware, and more slices measured
-slower.
-
-It does not escape the key frame tax. Every change to the operating point costs
-a full key frame, and on a 2 Mbit/s link a 192 kB key frame is 768 ms of link
-time. The budget in `idr.rs` therefore permits about one reconfiguration every
-four seconds down there. Between reconfigurations the only knob is the token
-bucket, so on a link that oscillates faster than the key frame budget the
-picture judders rather than degrading smoothly. This is the largest single
-limitation and it is hardware, not policy.
-
-It does not drain somebody else's queue. If the access point is bufferbloated
-and another device fills it, the delay signal reads it correctly and we back
-off, which is right and does nothing for the latency, because the queue is not
-ours.
-
-It is not fair to TCP. GCC yields to delay and a file copy on the same network
-does not, so a large download will take the link and we will sit low until it
-finishes. That is GCC's known behaviour everywhere and we inherit it whole.
-
-It measures one direction. Nothing estimates the upstream path that input and
-reports travel on. A link asymmetric enough to congest upstream shows up as
-reports going missing, and the controller holds, which is safe and not
-diagnostic.
-
-It does not help a client that is late for other reasons. Forty of the 859
-packets were counted late, which is the client's own deadline being missed.
-Lower rates and shallower queues reduce the causes; the client still needs a
-policy for a packet that arrives after its frame is due.
-
-And the sequence number is 16 bits, which wraps every 93 seconds at 20 Mbit/s.
-The unwrapping is only correct while reports arrive more often than half a wrap.
-They arrive every 50 milliseconds, so this is safe with three orders of
-magnitude to spare, but a client that stops reporting for 45 seconds and resumes
-is misread, and the history is discarded rather than trusted when a report's
-base cannot be placed.
+- **Wi-Fi is not a queue.** Aggregation, retries, rate adaptation and
+  power-save naps move delay with no congestion. The adaptive threshold absorbs
+  the steady noise and a probe undoes a false backoff within five seconds, but
+  some false backoffs will be visible.
+- **Rate does not make loss survivable.** With one reference frame and one slice
+  per frame, a lost packet breaks every frame until the next key frame. A lower
+  rate makes that rarer, not milder. The failed session's twelve undecodable
+  frames came from post-encode drops, and refusing before the encoder removes
+  those. Wire loss needs the parity in [`protocol.md`](protocol.md), which
+  shares the queue, so the target must cover it too (the build does not, see
+  the end). Intra refresh and long-term reference frames are unreachable on this
+  hardware, and more slices measured slower.
+- **The key frame tax stays.** On a 2 Mbit/s link a 192 kB key frame is 768 ms
+  of link time, so `idr.rs` allows about one reconfiguration every four seconds.
+  Between them only the bucket acts, so a link that oscillates faster judders.
+  This is the largest limitation, and the hardware sets it, not policy.
+- **Somebody else's queue stays full.** The delay signal reads a bufferbloated
+  access point that another device fills, and the host backs off. That is
+  right, and it does nothing for latency.
+- **It is not fair to TCP.** GCC yields to delay and a file copy does not, so a
+  large download takes the link until it finishes. This design inherits that.
+- **It measures one direction.** Upstream congestion shows only as missing
+  reports, and the controller holds. That is safe, not diagnostic. (The build
+  decays after 6 seconds of silence, see the end.)
+- **Late clients.** 40 of the 859 packets missed the client's own deadline.
+  Shallower queues reduce the causes, but the client still needs a policy for a
+  packet that arrives after its frame is due.
+- **One path per session.** Route change handling was not copied, so the
+  estimate, like quinn's window, is wrong once the path changes.
+  [`relay.md`](relay.md) names this as the reason a relayed session is not moved
+  onto a direct path.
+- **A 16-bit sequence.** It wraps every 37 seconds at 20 Mbit/s, and unwrapping
+  holds only while reports arrive within half a wrap, 18 seconds. At 50 ms the
+  margin is over two orders of magnitude. A client silent for longer is
+  misread, so the host discards history it cannot place.
 
 ## Confidence
 
-Measured on this machine, and reproducible from the scripts in the scratchpad:
-the encoder's achieved rate against its configured rate on hard and easy content;
-that dropping capture frames scales the wire rate as roughly the 0.65 power of
-the frame rate; that `cpb-size` is silently replaced by a two second buffer under
-`target-percentage` 66 and honoured under 100; that writing an unchanged bitrate
-still costs a key frame; that a resolution change and a bitrate change applied
-together cost one key frame; the key frame sizes at each rung; and every byte
-count in the control stream table.
+**Measured** on the development host: the encoder's achieved rate against its
+configured rate on hard and easy content; the 0.65-power scaling of wire rate
+with delivered frame rate; `cpb-size` silently replaced by a two second buffer
+under `target-percentage` 66 and honoured under 100; an unchanged bitrate write
+costing a key frame; a resolution and a bitrate change together costing one; the
+key frame sizes at each rung; every byte count in the report and control stream
+tables.
 
-Read from source, not run: quinn's frame ordering and the scope of
-`SendStream::set_priority`; that no per-datagram acknowledgement is exposed;
-`goog_cc`'s size, dependencies and the privacy of its estimators, though the
-privacy was confirmed by compiling against each type; and the VA encoder's rate
-control arithmetic.
+**Read from source, not run:** quinn's frame ordering and the scope of
+`SendStream::set_priority`; the missing per-datagram acknowledgement; `goog_cc`'s
+size, dependencies and private estimators (the privacy also confirmed by
+compiling against each type); the VA encoder's rate control arithmetic.
 
-Taken from libwebrtc rather than measured here: every constant in the estimator
-and the probe controller. They are the published values and they are known to
-work on paths far worse than this one, but none of them has been tuned against
-this hardware and several will need to be. The threshold floor of 6 ms is the
-one most likely to be wrong on Wi-Fi.
+**Taken from libwebrtc, not measured here:** every constant in the estimator and
+the probe controller except the 0.8 saturated-probe factor. They are the
+published values and work on far worse paths. None has been tuned on this
+hardware, and several will need it. The 6 ms threshold floor is the one most
+likely to be wrong on Wi-Fi.
 
-Inferred, with the mechanism named but not measured: that BBR's 216 Mbit/s came
-from 802.11 aggregation inflating its delivery rate filter. The number is real
-and BBR being unusable as a target is established independently by the lack of
-per-datagram acknowledgement, but the specific explanation is reasoning, not
-evidence.
+**Inferred**, mechanism named but not measured: that 802.11 aggregation
+inflating BBR's delivery rate filter produced the 216 Mbit/s. The number is
+real, and the missing per-datagram acknowledgement alone rules BBR out as a
+target. The explanation is reasoning, not evidence.
 
-Guessed: the 2.0 Mbit/s start, the 150 kbit/s control reserve, the 100 ms bucket
-ceiling, the 0.8 and 1.3 retarget band, the 10% and 60% ladder thresholds, and
-the choice of 15 frames a second as the floor. Each is derived from something
-measured, and each is the kind of number that only a session on a real link can
-settle.
+**Guessed:** the 2.0 Mbit/s start, the 150 kbit/s control reserve, the 100 ms
+bucket ceiling, the 0.8 and 1.3 retarget band, the 10% and 60% ladder
+thresholds, and the choice of 15 frames a second as the floor. Each derives from
+a measurement. Only sessions on real links can settle them.
 
-## What the build does differently, and why
+## Where the build departs from the design
 
-Three places where the code departs from what is above. Each is here rather
-than only in a comment, because a reader who finds the two disagreeing should
-be able to tell a decision from a mistake.
+Recorded here as well as in code, so a reader who finds the two disagreeing can
+tell a decision from a mistake.
 
-**The steady-state probe is not gated on being application-limited.** The rule
-above probes at twice the estimate "whenever the sender has been
-application-limited for 5 seconds", on the grounds that a remote desktop is
-application-limited almost all the time. The build drops the gate and probes
-whenever nothing has tested the link for five seconds. The case the gate
-excludes is the one where recovery matters most: the link recovers, the user is
-doing something, the encoder is producing exactly its target, and the
-controller sits at the depressed rate for as long as they keep working. The
-cost of removing it is fixed as a share of the link and does not depend on the
-link, which is the same argument the section already makes: 15 ms at twice the
-rate every 5 seconds is 0.6%, at 300 kbit/s or at 20 Mbit/s.
+**The steady-state probe is not gated on being application-limited.** It fires
+whenever nothing has tested the link for 5 seconds (`IDLE_INTERVAL` in
+`crates/tachyx-congestion/src/probe.rs`). The gate excludes the case where
+recovery matters most: the link recovers while someone works, the encoder
+produces exactly its target, and the controller stays at the depressed rate for
+as long as the work goes on. Without the gate the cost is the same 0.6%.
 
-This is also where `GoogCcNetworkController` cannot be held to ours.
-`NetworkControllerInterface` exposes no way to tell it the sender is
-application-limited, because that signal comes from libwebrtc's own pacer,
-which is not on the other side of that interface. Driven from a feedback trace
-alone, the reference finds the link and gives it up exactly as ours does, and
-never takes it back. The conformance test asserts the agreement and names the
-divergence.
+`GoogCcNetworkController` cannot follow. `NetworkControllerInterface` cannot say
+the sender is application-limited, because libwebrtc's own pacer supplies that
+signal and is not behind the interface. Driven by a feedback trace alone, the
+reference finds the link and gives it up exactly as ours does, and never takes
+it back. The conformance test asserts the agreement and names the divergence.
 
-**`datagram_send_buffer_size` is unchanged.** The section above argues it can
-shrink to 64 KiB once a pacer keeps quinn's queue shallow. It cannot, because
-the gate in front of it asks whether a whole frame fits before the frame is
-encoded, and a buffer smaller than a key frame refuses every key frame for ever
-— which is the failure `findings.md` records under "two frames". With the pacer
-in front, the buffer sits nearly empty whatever its size, so the size costs
-nothing and its only effect is as a limit. Shrinking it would need the gate to
-ask per datagram, which would mean a frame could be half queued and then
-refused, and a half-sent frame is the thing the gate exists to prevent.
+**`datagram_send_buffer_size` does not shrink to 64 KiB.** The gate asks whether
+a whole frame fits before the frame is encoded, so a buffer smaller than a key
+frame refuses every key frame for ever. [`findings.md`](findings.md) records
+that failure under "two frames". `video_send_buffer` in
+`crates/tachyx-transport/src/video.rs` sizes it per session: the measured
+130,427-byte 1080p key frame scaled by pixel count to the coded size, plus
+parity at the 50% ceiling and per-datagram overhead, plus half again. Behind
+the pacer it stays nearly empty, so the size costs nothing. A smaller buffer
+needs a per-datagram gate, which could queue half a frame and refuse the rest,
+and a half-sent frame is what the gate exists to prevent.
 
-**A probe cluster is one contiguous burst.** Media first and padding second, as
-above, but the padding that fills out a cluster goes in the *same* burst as the
-picture that started it rather than behind the next one. Measured on a shaped
-12 Mbit/s link, a cluster that straddled a frame boundary spanned the idle
-interval between the two frames, read 5.2 Mbit/s, and dragged the estimate down
-every time it fired. With the cluster contiguous the same link reads 8.3 to
-10.9 Mbit/s.
+**A probe cluster is one contiguous burst.** The padding that completes a cluster
+goes in the *same* burst as the picture that opened it, not behind the next
+picture. Measured on a shaped 12 Mbit/s link, a cluster that straddled a frame
+boundary spanned the idle gap, read 5.2 Mbit/s, and dragged the estimate down
+every time. Contiguous, the same link reads 8.3 to 10.9 Mbit/s. The head picture
+leaves at the higher of the probe rate and its own pacing rate, so it keeps its
+deadline. The reader uses recorded send times, so the result still holds.
+
+**The pacer is not a 1 ms tick.** The design released from a bucket at
+`2.5 * target` on a 1 ms tick (under 3 kB a tick at 8 Mbit/s, so quinn held one
+or two datagrams), and stopped while quinn held more than four. Back pressure
+that persisted meant quinn's congestion window had closed, to be reported, not
+worked around. The build is the pacer above. Its 35 ms floor keeps a key frame
+inside the receiver's deadline, and its queue bound is in time, because a
+datagram count is a different wait at every rate.
+
+**A silent return path decays the estimate.** After 6 seconds with no usable
+report, the estimate falls by a factor of 0.85 each 250 ms tick
+(`SILENCE_THRESHOLD`, `SILENCE_DECAY` in `crates/tachyx-congestion/src/lib.rs`):
+20 Mbit/s to the floor in under seven seconds. Six seconds is just above the
+longest a living still desktop goes without feedback, the 5 second padding probe
+plus one report interval. When pictures are offered and none reach the wire, the
+stall watchdog (`Live::watch` in `crates/tachyx-hostd/src/session.rs`) drops the
+estimate to the floor at once, clears the probe history and forces a key frame.
+
+**Parity is not deducted from the encoder's share.** The bucket gets the
+estimate less 150 kbit/s, less sound while it flows, and the packetiser adds
+parity on top (`Live::video_share` in `crates/tachyx-hostd/src/session.rs`). The
+estimator counts wire bytes, so heavy parity still reaches it through the delay
+signal. On a loss-free link parity is zero after one second, and the two agree.
