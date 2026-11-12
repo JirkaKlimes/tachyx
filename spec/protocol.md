@@ -60,8 +60,8 @@ accepted any client that reached the port. Pairing replaced both. Neither end
 pins a key on first sight.
 
 The identity stays in the handshake. No message below names either end. A
-client's permissions belong to the device that connected, and the session does
-not enforce them yet ([`pairing.md`](pairing.md)).
+client's permissions belong to the device that connected, and the host reads
+them when the session opens ([`pairing.md`](pairing.md)).
 
 ## Control stream framing
 

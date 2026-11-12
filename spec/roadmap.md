@@ -26,9 +26,9 @@ Feature count against Sunshine and Moonlight is not the goal.
 - **Host behaviour.** Idle inhibition during a session. Realtime priority for
   the picture threads through RealtimeKit.
 - **Identity and pairing.** One Ed25519 key per device. CPace pairing by typed
-  code or QR. Mutual TLS that pins the other end's exact key. Per-device
-  permissions (view or control, attended or unattended) are recorded, but no
-  session enforces them yet (see next steps).
+  code or QR. Mutual TLS that pins the other end's exact key. A view-only device
+  gets no input. A device paired as attended is refused until the accept step
+  below exists.
 - **Relay** (`tachyx-relayd`). Presence, rendezvous, reflexive address, hole
   punch, and a splice fallback when the punch fails.
 - **Host CLI.** `tachyx-hostd id | status | pair | pairings | sessions | relay |
@@ -48,6 +48,7 @@ Feature count against Sunshine and Moonlight is not the goal.
   (`relay/socket.rs:153-160`) can re-point a peer's address, but only a test
   calls it, and the congestion controller does not yet handle a change of path.
 - Direct libva encode.
+- A local accept step for a device paired as attended.
 
 ## Where this differs from the prior art
 
@@ -81,17 +82,12 @@ refresh, and `cros-libva` reaches it. The same route reaches the buffer through
 
 ## Next, in order
 
-1. **Enforce the per-device permissions.** `pair --view-only` promises a device
-   that cannot type or click, and `--attended` promises an accept step. No
-   session reads either ([`assumptions.md`](assumptions.md)). Dropping input from
-   a view-only device is a few lines. Until an accept flow exists, refuse an
-   attended device's session and say why.
-2. **Survive a link the stream overdrives.** On phone Wi-Fi the return path goes
+1. **Survive a link the stream overdrives.** On phone Wi-Fi the return path goes
    silent under load and does not come back, and the delay-based controller is
    blind at that moment, because its reports travel the path that died
    ([`findings.md`](findings.md), "The video path stalls, and the cause is a link
    this system overdrives"). Built so far: the watchdog drops the controller to
-   its floor and forces a key frame (`session.rs:521-552`). Still needed:
+   its floor and forces a key frame (`session.rs:524-555`). Still needed:
    - a lower start than the 2 Mbit/s `START_TARGET` (`congestion/lib.rs:102`);
    - the packet rate as a limit of its own, since packets are already at the
      path MTU and cannot grow;
@@ -99,21 +95,21 @@ refresh, and `cros-libva` reaches it. The same route reaches the buffer through
      a hiccup and not the session.
 
    Then prove the controller on a real link, not only a shaped one.
-3. **Direct libva encode.** The largest latency win available. Intra refresh
+2. **Direct libva encode.** The largest latency win available. Intra refresh
    replaces the full key frame of each recovery (130 kB at 1080p) with intra
    columns spread over the frames that follow. Long-term references let the
    client recover from the last frame it acknowledged. A coded picture buffer
    of one frame removes the 500 ms the element now forces before rate control
    reacts.
-4. **Pointer motion scaling.** The protocol says the host scales `PointerMotion`
+3. **Pointer motion scaling.** The protocol says the host scales `PointerMotion`
    by the ratio of capture size to encode size (`proto/input.rs:69-74`). The host
    does not: `input/lib.rs:249-251` injects the deltas unchanged. So the pointer
    speed changes when the ladder steps. The client measures the gain
    (`client/cursor.rs:51-72`) to draw its own pointer in the right place, but
    the speed under the finger still changes.
-5. **Relayed to direct.** Re-point a relayed session once a punch succeeds, and
+4. **Relayed to direct.** Re-point a relayed session once a punch succeeds, and
    teach the controller that the path changed.
-6. **Clipboard.**
+5. **Clipboard.**
 
 After that, the remaining fast-follows of [`architecture.md`](architecture.md),
 section 16, in their order.

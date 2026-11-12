@@ -178,15 +178,32 @@ impl Sessions {
     /// pipeline down the same way it does for a client that walked away. One
     /// path out of a session is enough.
     pub fn kill(&self, id: SessionId) -> bool {
-        guard(&self.open)
-            .iter()
-            .find(|entry| entry.id == id)
-            .is_some_and(|entry| {
-                entry
-                    .connection
-                    .close(quinn::VarInt::from_u32(0), b"closed from the host");
-                true
-            })
+        self.close_where(|entry| entry.id == id, "closed from the host") > 0
+    }
+
+    /// Ends every session `device` has open, and reports how many there were.
+    ///
+    /// A session reads the device's permissions once, when it opens. A change
+    /// to the pairing therefore takes effect when the sessions opened under the
+    /// old one end.
+    pub fn end_for(&self, device: DeviceId) -> usize {
+        self.close_where(
+            |entry| entry.peer.device == device,
+            "the host changed this device's pairing",
+        )
+    }
+
+    /// Closes the connection of every row `which` selects. Each session then
+    /// ends by itself, as [`Sessions::kill`] describes.
+    fn close_where(&self, which: impl Fn(&Entry) -> bool, reason: &str) -> usize {
+        let mut closed = 0;
+        for entry in guard(&self.open).iter().filter(|entry| which(entry)) {
+            entry
+                .connection
+                .close(quinn::VarInt::from_u32(0), reason.as_bytes());
+            closed += 1;
+        }
+        closed
     }
 
     /// Takes a row out, which is what dropping a [`Handle`] does.

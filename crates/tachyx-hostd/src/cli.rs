@@ -76,12 +76,13 @@ pub enum Client {
 pub enum Pairings {
     /// List them.
     List,
-    /// Forget one, which is the whole of revocation.
+    /// Forget one, which is the whole of revocation. Its live sessions end.
     Revoke {
         /// An identifier, an unambiguous prefix of one, or a name.
         device: String,
     },
-    /// Change what one may do.
+    /// Change what one may do. Its live sessions end, and the next one opens
+    /// under the change.
     Set(SetArgs),
     /// Change what one is called in the list.
     Rename {
@@ -127,7 +128,8 @@ pub struct PairArgs {
     #[arg(long)]
     pub view_only: bool,
 
-    /// Require somebody at this machine to accept each session.
+    /// Require somebody at this machine to accept each session. This host
+    /// cannot ask yet, so it refuses every session from such a device.
     #[arg(long)]
     pub attended: bool,
 
@@ -166,7 +168,8 @@ pub struct SetArgs {
     #[arg(long, value_name = "view|control")]
     pub allow: Option<Allow>,
 
-    /// Whether a session opens without somebody here accepting it.
+    /// Whether a session opens without somebody here accepting it. This host
+    /// cannot ask yet, so `false` refuses every session from the device.
     #[arg(long, value_name = "true|false")]
     pub unattended: Option<bool>,
 }

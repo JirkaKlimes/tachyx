@@ -27,7 +27,9 @@ The wire format is not frozen.
   identifier. The host shows a QR code and an 8-digit code. The client pairs with
   CPace over Ristretto255. After that, both ends pin the exact key of the other
   end in mutual TLS. There is no trust on first use: the host refuses an unpaired
-  device inside the handshake.
+  device inside the handshake. A device paired `--view-only` gets the picture
+  and no input. Revoking a device, or changing what it may do, ends its live
+  sessions.
 - **Relay** (`relayd`). Presence, rendezvous, reflexive addresses, UDP hole
   punching, and a splice fallback when the punch fails. Session TLS runs end to
   end through the relay. A hostile relay can drop or delay traffic. It cannot
@@ -45,9 +47,8 @@ The wire format is not frozen.
   [`spec/architecture.md`](spec/architecture.md).
 - Move of a relayed session to a direct path. The route swap works in tests.
   The congestion controller cannot yet handle the change of path.
-- Enforcement of per-device permissions. `tachyx-hostd pair --view-only` and
-  `--attended` are stored with the pairing, but a session does not read them
-  yet: every paired device can send input.
+- An accept prompt on the host for a device paired `--attended`. Until it
+  exists, the host refuses every session from such a device and says why.
 - Clipboard, file transfer, more than one client at a time.
 - iOS, macOS, Windows and browser clients. Hosts on compositors that are not
   wlroots.

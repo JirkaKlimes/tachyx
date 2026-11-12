@@ -880,6 +880,21 @@ async fn a_client_of_another_version_is_refused_by_name() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_the_host_refuses_tells_the_client_why() {
+    let tuning = Tuning::for_stream(hd());
+    let link = Link::open("refuse", tuning, tuning);
+    let (host, client) = link.sessions().await;
+
+    host.refuse("somebody at the host has to accept this device");
+
+    let reason = client.connection.closed().await.to_string();
+    assert!(
+        reason.contains("somebody at the host has to accept this device"),
+        "the client is told why the host refused, and got {reason}"
+    );
+}
+
 /// Frames one control message the way [`ControlWriter`] does, so a test can put
 /// the length and the body on the wire separately.
 fn framed<M: serde::Serialize>(message: &M) -> (Vec<u8>, Vec<u8>) {

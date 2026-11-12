@@ -99,13 +99,16 @@ pub enum SessionError {
 /// server only when it is true, and serves without sound if that connection
 /// then fails.
 ///
+/// `injection` is `None` for a device paired to view only, so nothing it sends
+/// reaches the compositor.
+///
 /// # Errors
 /// If the pipeline cannot be started, or the connection fails for a reason
 /// other than the client disconnecting.
 pub async fn serve(
     config: &Config,
     session: HostSession,
-    injection: &tachyx_input::Injection,
+    injection: Option<&tachyx_input::Injection>,
     sessions: &Arc<Sessions>,
     peer: Peer,
     sound: bool,
@@ -660,7 +663,7 @@ impl Latency {
 /// Runs the session until the client goes away.
 async fn run(
     session: HostSession,
-    injection: &tachyx_input::Injection,
+    injection: Option<&tachyx_input::Injection>,
     pipeline: Pipeline,
     listed: &Handle,
     sound: bool,
@@ -759,7 +762,7 @@ async fn run(
 async fn converse(
     live: &mut Live,
     capture: &Capture,
-    injection: &tachyx_input::Injection,
+    injection: Option<&tachyx_input::Injection>,
     listed: &Handle,
     connection: &quinn::Connection,
     to_client: &mut tachyx_transport::control::ControlWriter,
@@ -786,7 +789,9 @@ async fn converse(
                     // Wayland connection and sometimes waits on a full round
                     // trip to the compositor, and this loop also carries the
                     // video feedback, the cursor and the heartbeats.
-                    injection.send(batch.events.into_iter().map(|timed| timed.event).collect());
+                    if let Some(injection) = injection {
+                        injection.send(batch.events.into_iter().map(|timed| timed.event).collect());
+                    }
                 }
                 Ok(ClientMessage::Feedback(report)) => live.feedback(&report, Instant::now()),
                 Ok(ClientMessage::KeyframeRequest { .. }) => {

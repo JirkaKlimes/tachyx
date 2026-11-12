@@ -74,8 +74,8 @@ interchangeable in trust. relay.md has the full threat statement.
 
 ## 3. Identity, pairing, auth
 
-Status: built, except the platform keystore, accounts, web client auth and
-enforcement of per-device permissions. pairing.md is the specification.
+Status: built, except the platform keystore, accounts, web client auth and the
+local accept step for attended devices. pairing.md is the specification.
 
 ### Device identity
 
@@ -143,9 +143,11 @@ click accepts each session). Revocable at any time. **No ID-and-password
 unattended mode, ever**: that is the remote-support-scam vector.
 
 Partly built. The host records both flags at pairing, changes them with
-`pairings set`, and tells the client. **The session does not enforce them
-yet**: input from a view-only device is injected, and nothing asks for a local
-click.
+`pairings set`, and tells the client. A session reads them when it opens. A
+view-only session has no handle to the injector. The local accept click is not
+built, so the host refuses every session from a device paired as attended, with
+that reason. `pairings set` and `pairings revoke` end the device's live
+sessions, so a change takes effect at once.
 
 ### Web client auth
 

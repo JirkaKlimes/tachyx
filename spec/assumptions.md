@@ -26,25 +26,6 @@ Every location was read. Nothing was executed.
 Most of these are a few lines. Each one stands between a new machine and a
 picture.
 
-### Per-device permissions are recorded and never enforced
-
-`Permissions` (`tachyx-crypto/src/pair.rs:45-57`) holds `control` and
-`unattended`. `tachyx-hostd pair --view-only` promises "The device cannot type or
-click", and `--attended` promises that somebody at the machine accepts each
-session (`cli.rs:123-155`). `pairings set` changes both, and `pairings` shows
-them (`show.rs:262-267`, `control.rs:260-261`).
-
-No session code reads either field. `session.rs:784-790` hands every input
-batch to injection. `daemon.rs:522-561` opens a session for every paired device,
-with no accept step. So a device paired view-only controls the host, and an
-attended device opens a session that nobody accepted. **Read**, not run.
-
-This is not a machine assumption, but it is the most urgent item here, because
-the CLI tells the operator the opposite. Fix for `control`: carry the paired
-record into the session (the lookup already happens at `daemon.rs:537-546`) and
-drop input from a view-only device. `unattended: false` needs an accept flow
-that does not exist. Until it does, refuse the session and say why.
-
 ### Injection resolves an unset output to `eDP-1`
 
 `config.rs:57` documents an unset `output` as "the first output the compositor
@@ -125,7 +106,7 @@ fact both ends share, the way `HEARTBEAT_INTERVAL` is stated.
 
 ### Idle inhibition is required, and its mechanism is one compositor's
 
-`session.rs:115` runs `let _awake = crate::idle::Inhibitor::new()?;` before the
+`session.rs:118` runs `let _awake = crate::idle::Inhibitor::new()?;` before the
 pipeline starts. A compositor without `zwp_idle_inhibit_manager_v1` cannot serve
 a session, although the picture does not depend on it. The requirement is
 deliberate (`doctor.rs:24-29` gives the reason: a blanked screen produces no
@@ -143,7 +124,7 @@ module that the visibility rule is Hyprland's.
 
 ### A second client is not refused, it waits until its handshake times out
 
-`daemon.rs:522-561` awaits `session::serve` inside the accept loop. One session
+`daemon.rs:520-575` awaits `session::serve` inside the accept loop. One session
 at a time is therefore structural. That is acceptable for this milestone (see
 [`acceptance.md`](acceptance.md)).
 
@@ -155,7 +136,7 @@ holds the loop for everyone else.
 
 The parts of the fix exist. The close code `REFUSED` is at `endpoint.rs:34-35`,
 and the client turns a close reason into `TransportError::Refused`
-(`endpoint.rs:552-568`). One `accept` in a `select!` that closes the newcomer
+(`endpoint.rs:563-579`). One `accept` in a `select!` that closes the newcomer
 with a "busy" reason turns a timeout into a sentence.
 
 ### A client that disconnects mid-gesture leaves keys and buttons held
@@ -177,12 +158,12 @@ connection and a machine somebody has to walk over to.
 
 ### The host's send buffer is sized for 1920x1088, and a client can ask for more
 
-`daemon.rs:634-639` sizes the transport once, before any client connects, for
+`daemon.rs:648-653` sizes the transport once, before any client connects, for
 `CodedSize::new(1920, 1088)`. `video_send_buffer` (`video.rs:138-169`) gives
 307,138 bytes for that size. The buffer never changes after that.
 
 The ladder's top rung is bounded only by the client's viewport
-(`session.rs:1121-1151`). A Linux client with a 2560x1440 window against the
+(`session.rs:1126-1156`). A Linux client with a 2560x1440 window against the
 3440x1440 output gets a top rung of 3440x1440.
 
 The gate (`queue.rs:179-193`) charges each datagram its payload plus 16 bytes of
@@ -197,7 +178,7 @@ Two measured key frames bracket that limit. One at 3440x1440 was 192 kB
 key frame any more"). So the failure depends on content.
 
 When a key frame is refused, the client sees a hole and asks for another key
-frame, which is refused too. The watchdog (`session.rs:521-552`) notices that
+frame, which is refused too. The watchdog (`session.rs:524-555`) notices that
 nothing reaches the wire, drops the controller to the floor, and forces a key
 frame. A key frame at the floor rate is smaller. Whether it is small enough at
 3440x1440 is not known.
@@ -329,10 +310,10 @@ figure for 1.34 times the pixels. Pixel scaling is a defensible shape for a
 buffer bound. It is not an estimate.
 
 After the first key frame the code follows measurement. The budget reads the
-encoder's measured key frame size before every request (`session.rs:390-405`).
+encoder's measured key frame size before every request (`session.rs:393-408`).
 The pacer paces each picture at its own weight on the wire (`video.rs:525-540`).
 What remains is the buffer, which is sized before a client exists
-(`daemon.rs:634-639`). See the send buffer item above.
+(`daemon.rs:648-653`). See the send buffer item above.
 
 ### The client cannot say what it can decode
 
@@ -346,7 +327,7 @@ format. [`architecture.md`](architecture.md), section 5, lists HEVC, 4:4:4,
 `max_decode` is not a decoder capability. `capabilities()`
 (`client/session.rs:95-105`) sets it to the viewport, with a good argument at
 `:81-94`: a picture larger than the surface is waste. The host uses the field as
-a limit (`session.rs:1148`). The client never asks the platform decoder for its
+a limit (`session.rs:1153`). The client never asks the platform decoder for its
 maximum size, profile or level.
 
 That works because the one phone's decoder exceeds its own panel. It stops
@@ -431,7 +412,7 @@ Two more constants are stated against one monitor:
   output". It is a stride, so the floor is 24 frames a second at 120 Hz, where
   the ladder has no rung left for a bad link, and 6 at 30 Hz, far below the
   "stops feeling connected" line it exists to hold. The refresh it divides is
-  the output's, capped by the client's requested rate (`session.rs:160-166`).
+  the output's, capped by the client's requested rate (`session.rs:163-169`).
 - `MIN_TARGET = 300_000` (`congestion/lib.rs:43-49`) exists because "the
   smallest rung of the ladder, 860x360" needs 279 kbit/s. 860x360 is 3440x1440
   divided by four.
@@ -486,7 +467,7 @@ at each other. The rest need two edits each. Ordered by the cost of a wrong
 edit:
 
 **The coded size is derived twice from separate sources, and nothing compares
-them.** The host computes it in `stream_config` (`session.rs:1192-1220`) from
+them.** The host computes it in `stream_config` (`session.rs:1197-1225`) from
 `EncodeSize::coded` (`media/lib.rs:323-327`). Dart passes it to
 `VideoSurface.kt` to size the image reader (`present.dart:113-120`). The decoder
 parses its own copy from the bitstream (`android/bitstream/h264.rs:53-108`,
@@ -571,7 +552,7 @@ were measured here, with the mechanism written down. `FRAME_SPAN = 35 ms`
 are a sensible clamp around one Monte Carlo. The key frame boost of half again
 (`packet.rs:240-266`) is the lower half of libwebrtc's, and says why. The
 percentage-of-datagrams shape generalises. The level is a starting point, and
-the receiver report now drives it (`session.rs:257-262`).
+the receiver report now drives it (`session.rs:260-265`).
 
 `REORDER_WINDOW = 15 ms` (`packet.rs:763`) is documented as a floor under a
 value derived from the frame rate. Every other measured constant wants that
@@ -608,7 +589,7 @@ for it either.
 `_Registered`, which ends in `tachyx_video::unsupported`. That module's
 `decoders()` returns `Codecs::NONE` (`unsupported.rs:26-28`). So an iOS build
 compiles, links, runs and connects, advertises no decoder, and the host ends the
-session with `NoSharedCodec` (`session.rs:1159-1168`). That is the starting
+session with `NoSharedCodec` (`session.rs:1164-1173`). That is the starting
 position.
 
 The unavoidable work, which no code move removes:
@@ -772,8 +753,12 @@ Settled in the code, with the evidence:
 - Consumer page keys: a stated choice now; volume keys step the host's volume
   (`keyboard.dart:16-36`, `:123-133`).
 - A second codec: AV1 is negotiated per session (`proto/control.rs:107-125`,
-  `session.rs:1159-1168`).
+  `session.rs:1164-1173`).
 - Fractional scale: capture and injection both work in xdg-output logical pixels
   (`capture.rs:73-85`, `:477-482`).
-- Parity that nothing drove: the receiver report sets it (`session.rs:257-262`).
+- Parity that nothing drove: the receiver report sets it (`session.rs:260-265`).
 - The Dart Annex B parser and the second Rust list of JNI names: gone.
+- Per-device permissions that nothing enforced: a view-only session gets no
+  handle to the injector, a device paired as attended is refused with a named
+  reason until an accept step exists, and `pairings set` and `pairings revoke`
+  end the device's live sessions (`daemon.rs`, `session.rs`, `sessions.rs`).

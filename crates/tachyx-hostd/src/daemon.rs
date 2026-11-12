@@ -374,23 +374,21 @@ async fn handle(daemon: &Arc<Daemon>, wire: &mut Wire) -> Result<(), ControlErro
             wire.send(&Response::Pairings(pairings)).await
         }
         Request::PairingsRevoke { device } => {
-            reply(
-                wire,
-                daemon.clients.remove(device),
-                "no such device is paired",
-            )
-            .await
+            let removed = daemon.clients.remove(device);
+            if matches!(removed, Ok(true)) {
+                daemon.sessions.end_for(device);
+            }
+            reply(wire, removed, "no such device is paired").await
         }
         Request::PairingsSet {
             device,
             permissions,
         } => {
-            reply(
-                wire,
-                daemon.clients.set_permissions(device, permissions),
-                "no such device is paired",
-            )
-            .await
+            let changed = daemon.clients.set_permissions(device, permissions);
+            if matches!(changed, Ok(true)) {
+                daemon.sessions.end_for(device);
+            }
+            reply(wire, changed, "no such device is paired").await
         }
         Request::PairingsRename { device, name } => {
             reply(
@@ -534,12 +532,28 @@ async fn serve_sessions(
         // runs its whole budget and keeps sending Initials at a peer that has
         // already arrived.
         home.arrivals().note(session.peer);
+        // Read once, here. A later change to the pairing ends this session
+        // (`Sessions::end_for`), so the next one reads the change.
+        let Some(paired) = daemon.clients.get(session.peer) else {
+            // Revoked between the handshake and here.
+            session.refuse("this host no longer pairs with this device");
+            continue;
+        };
+        if !paired.permissions.unattended {
+            tracing::warn!(
+                device = %session.peer,
+                "refused a device paired as attended: this host cannot ask anybody to accept"
+            );
+            session.refuse(
+                "this device needs somebody at the host to accept each session, \
+                 and this host cannot ask yet",
+            );
+            continue;
+        }
+        let input = paired.permissions.control.then_some(&injection);
         let peer = Peer {
             device: session.peer,
-            name: daemon
-                .clients
-                .get(session.peer)
-                .map_or_else(|| session.peer.to_string(), |paired| paired.name),
+            name: paired.name,
             // A peer the routing table has a virtual address for arrived
             // through a relay. One it does not came straight off the wire.
             relayed: routes.route(session.connection.remote_address()).is_some(),
@@ -548,7 +562,7 @@ async fn serve_sessions(
         match session::serve(
             &daemon.config(),
             session,
-            &injection,
+            input,
             &daemon.sessions,
             peer.clone(),
             daemon.audio,

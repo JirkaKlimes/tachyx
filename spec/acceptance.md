@@ -32,8 +32,8 @@ window.
 9. The host's sound plays on the phone, and the phone's volume keys change it.
 10. The screen does not blank during the session.
 11. A device paired with `--view-only` sees the desktop and cannot type or
-    click. **Not met:** no session reads the permission
-    ([`assumptions.md`](assumptions.md)).
+    click. Built: a view-only session has no handle to the injector. Not yet
+    run on a device.
 12. Nothing runs on the host but the daemon.
 
 ## The numbers

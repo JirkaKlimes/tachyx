@@ -361,10 +361,16 @@ only the printable part of a received name, cut to 64 terminal columns. The
 CLI matches a name only when no identifier or identifier prefix matches.
 
 `tachyx-hostd pair` grants `control` and `unattended` unless `--view-only` or
-`--attended` narrows them. `pairings set` changes them later. **The host session
-does not enforce them yet.** It injects input from a view-only device, and
-nothing asks a person to accept an attended session. The client stores the
-permissions as a label only.
+`--attended` narrows them. `pairings set` changes them later. The host reads
+them when a session opens:
+
+- `control: false`: the session gets no handle to the injector, so no input
+  reaches the compositor.
+- `unattended: false`: the host refuses the session with a close reason that
+  says why. No accept prompt exists yet, so this refusal is the safe reading.
+
+`pairings set` and `pairings revoke` end the device's live sessions, so the next
+session reads the change. The client stores the permissions as a label only.
 
 ### Short authentication string
 

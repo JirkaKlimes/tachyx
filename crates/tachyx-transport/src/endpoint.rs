@@ -451,6 +451,17 @@ pub struct HostSession {
     pub from_client: ControlReader,
 }
 
+impl HostSession {
+    /// Ends the session before it starts, with `reason` as the close reason.
+    ///
+    /// For a policy the host applies after the hellos, such as what a paired
+    /// device may do. The client reads `reason` off the close, as it does a
+    /// version refusal.
+    pub fn refuse(self, reason: &str) {
+        self.connection.close(REFUSED, reason.as_bytes());
+    }
+}
+
 /// The client end of the connection.
 #[derive(Debug)]
 pub struct Client {
