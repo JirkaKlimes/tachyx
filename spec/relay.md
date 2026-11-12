@@ -1,211 +1,221 @@
 # tachyx relay (draft 0)
 
-Status: draft. `relayd` implements what is written here; anything not yet built
-says so.
+Status: draft. `relayd` (crate `tachyx-relayd`) and the peer side in
+`tachyx-relay` implement what is written here. Anything not built says so.
 
-The relay does four jobs and holds no session key while doing any of them.
+The relay does four jobs and holds no session key for any of them.
 
 1. **Presence.** A host keeps one connection open so a client can find it.
-2. **Rendezvous.** Mailboxes for pairing, and offer/answer for connecting.
-3. **Reflexive address reporting.** It tells each peer the address it was seen
-   from. This is the STUN job, done over the connection that is already there.
-   There is no separate STUN server and there is no third-party STUN server.
-4. **Splicing.** When hole punching fails it forwards opaque datagrams between
+2. **Rendezvous.** Mailboxes for pairing, and offer and answer for connecting.
+3. **Reflexive address reporting.** It tells each peer the address it saw that
+   peer at. This is the STUN job, done over the connection that already exists.
+   There is no separate STUN server and no third-party STUN server.
+4. **Splicing.** When hole punching fails, it forwards opaque datagrams between
    two peers.
 
 A hostile relay can drop traffic, delay it, lie about a reflexive address, and
-watch who talks to whom and how much. It cannot read a session, join one, or
+see who talks to whom, when and how much. It cannot read a session, join one or
 inject into one, because the session's own TLS runs end to end through it. That
-is what makes a community relay and the paid fleet interchangeable, and it is
-the property to keep.
+makes a community relay and the paid fleet interchangeable. Every decision in
+this document keeps that property.
 
 ## Reaching a relay
 
 ```
-relay = "100.64.0.2:47990#GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA"
+relay = "192.0.2.10:47990#GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA"
 ```
 
-Address, then `#`, then the relay's `DeviceId` in base32, or a bare
-`address:port` for a relay the operator chose not to pin. A relay is a device
-like any other: the same Ed25519 key, the same self-signed certificate, the same
-exact-key check when a key is written. The key travels in the address because a
-relay address is configuration a person pastes once, and pinning on first sight
-would leave that one moment undefended for no gain.
+The address, `#`, then the relay's `DeviceId` in base32. A bare `address:port`
+names a relay the operator chose not to pin. A relay is a device like any other:
+the same Ed25519 key, the same self-signed certificate, and the same exact-key
+check when a key is written. The key travels in the address because a relay
+address is configuration a person pastes once. Pinning on first sight would
+leave that one moment undefended for no gain. `relayd` prints its own line in
+this form at startup.
 
-A bare address is a decision, not a default, and it is never arrived at by
-accident: a `#` followed by anything that is not a key is refused rather than
-read as no key, so a typo cannot quietly drop a pin. The peer that connects to
-an unpinned relay says in its log what that gives up, every time it connects,
-because a caveat shown once at configuration is a caveat nobody remembers.
+A bare address is a decision, not a default. A `#` followed by anything that is
+not a key is refused, not read as "no key", so a typo cannot drop a pin. A peer
+logs what an unpinned relay gives up at every connection, because a warning
+shown once at configuration is forgotten.
 
 Port 47990. The host listens on 47989.
 
+A host registers with the first relay in its list only. That relay is its
+**home relay**, and the host writes it into every pairing record. A client tries
+the host's home relay first, then its own configured relays.
+
 ### What the relay's key does and does not buy
 
-It is not what makes this zero-trust, and reading it that way would be reading
-this document wrong.
-
-A relay has a key because QUIC has TLS and something must be presented. What
-**verifying** it buys is one thing only: **metadata privacy.** Without the check,
-anyone who can intercept the relay's address becomes the relay, learns who this
-device reaches and when and how much, and can force every session onto the
-relayed path by lying about the reflexive address. With the check, that attacker
-can deny service and nothing else.
+The key is not what makes the design zero-trust. A relay has a key because QUIC
+has TLS and something must be presented. **Verifying** it buys one thing:
+**metadata privacy.** Without the check, anyone who can intercept the relay's
+address becomes the relay: it learns who this device reaches, when and how
+much, and can force every session onto the relayed path by lying about the
+reflexive address. With the check, that attacker can only deny service.
 
 Everything above the metadata is safe either way. The session is end-to-end TLS
-between two pinned device keys and pairing is a balanced PAKE, so a relay that is
-hostile, impersonated, or simply somebody else's cannot read a session, join one,
-inject into one, or turn one online guess into two. That is why a community relay
-and a paid one are interchangeable, and it is the property every other decision
-here is measured against.
-
-So the check is cheap privacy, not the foundation. A deployment that does not
-care who carries its ciphertext can leave the key off the address and accept
-whatever answers; the sessions through it are exactly as safe. What it gives up
-is knowing whose relay it is on.
+between two pinned device keys, and pairing is a balanced PAKE. A relay that is
+hostile, impersonated or somebody else's cannot read a session, join one,
+inject into one, or turn one online guess into two. So a deployment that does
+not care who carries its ciphertext can leave the key off. Its sessions are
+exactly as safe. It gives up knowing whose relay it is on.
 
 ## The connection
 
 One QUIC connection, ALPN `tachyx-relay`. One bidirectional stream carries
-control, framed exactly as [`protocol.md`](protocol.md) frames it: a `u32`
-big-endian length and that many `postcard` bytes, first message in each
-direction carrying the version.
+control, framed as [`protocol.md`](protocol.md) frames the session's control
+stream: a `u32` big-endian length, then that many `postcard` bytes. The first
+message in each direction carries the version (`PeerHello`, `RelayHello`). A
+control message larger than 16 KiB is refused.
 
-Both ends present a certificate. The relay takes the client certificate's key as
-the peer's identity and **authorises nothing**: it needs a stable name to route
-by, not a decision about who may talk to whom. That decision belongs to the host,
-which makes it in its own TLS handshake, and to nobody else.
+The peer sends a keepalive every 20 s, which holds its NAT mapping open while a
+host sits idle. The relay drops a connection after 60 s of silence. The
+connection starts at a 1200-byte packet size and path discovery raises it.
 
-Spliced traffic does **not** travel on this connection. It travels beside it, on
-the same UDP port, as its own kind of packet. Why is the next section.
+Both ends present a certificate. The relay accepts any well-formed self-signed
+Ed25519 certificate and takes its key as the peer's identity. It **authorises
+nothing**: it needs a stable name to route by, not a decision about who may talk
+to whom. The host makes that decision in its own TLS handshake, and nobody else
+does.
+
+Spliced traffic does **not** travel on this connection. It travels beside it,
+on the same UDP port.
 
 ### One socket, two kinds of packet
 
-A peer has exactly one UDP socket. The relay connection, the punch, and the
-session all leave from it, which is what makes the address the relay observes the
-address a peer will be reached at.
+A peer has exactly one UDP socket. The relay connection, the punch and the
+session all leave from it. That is what makes the address the relay observes
+the address the peer will be reached at.
 
-quinn tells its own connections apart by connection identifier, so the relay
-connection and a direct session coexist on that socket with nothing to write.
-Spliced traffic is separated one layer lower, by the bit QUIC reserves for
-exactly this:
+quinn tells its own connections apart by connection ID, so the relay connection
+and a direct session share the socket with no extra code. Spliced traffic is
+separated one layer lower, by the bit QUIC reserves for this:
 
 ```
-byte 0 = 0x2a   (0x40 clear, so RFC 9000 §17.2 guarantees no QUIC packet
-                 can be mistaken for one of these)
-bytes 1..9      the lane token
-bytes 9..       the packet, verbatim
+byte 0     = 0x2a   (0x40 clear; RFC 9000 §17.2 sets that bit in every QUIC
+                     packet, so neither kind can be mistaken for the other)
+bytes 1..9 = the lane token
+bytes 9..  = the packet, verbatim
 ```
 
-Nine bytes, and that is the entire cost of being relayed.
+Nine bytes. That is the whole per-packet cost of being relayed.
 
-Two consequences follow from putting the routing decision under quinn, and
-neither is a choice.
+Routing below quinn has two consequences.
 
-**No segmentation offload on the way out.** quinn asks the *socket* how many
-datagrams one send may carry, not the destination, and one batch can hold
-datagrams for a direct peer and a relayed one at once. The socket therefore
-reports one.
+**Send side.** quinn asks the *socket*, not the destination, how many datagrams
+one send may carry. The socket reports what the kernel segments, so the direct
+path keeps segmentation offload. For a relayed destination the socket splits
+the send and wraps each datagram on its own, because the kernel would cut a
+segmented send into pieces of which only the first carries a header. Only the
+first datagram may report `WouldBlock`: a later failure drops the rest, as the
+network would, because reporting it makes quinn resend the datagrams already
+sent.
 
-**The receive side must report what the kernel actually coalesces.** quinn sizes
-its receive buffers from that number, so reporting fewer than the kernel gives
-truncates a coalesced read and loses data. A coalesced batch can then mix a
-relay's own control packets with spliced ones; only the leading run that agrees
-is kept, and the rest is loss that QUIC repairs.
+**Receive side.** The socket reports what the kernel really coalesces, because
+quinn sizes its receive buffers from that number and a smaller figure truncates
+a coalesced read. A coalesced batch can mix a relay's control packets with
+spliced ones. Only the leading run of one kind is kept. The rest is loss that
+QUIC repairs.
 
 ## What travels through a splice, and what does not
 
 **The session's own QUIC packets travel through it, unwrapped.** The relay
 rewrites the token and forwards the rest untouched. There is no second QUIC
-connection, no second TLS handshake, and no second congestion controller.
+connection, no second TLS handshake and no second congestion controller.
 
-This was not the first design. Carrying the session as datagrams inside the relay
-connection (QUIC in QUIC, the shape iroh's relays have) was measured and
-rejected. The numbers that killed it:
+**Rejected: QUIC in QUIC.** Carrying the session as datagrams inside the relay
+connection was measured and rejected:
 
-- **Thirty-eight bytes of header**, against nine. An inner datagram pays the
-  outer short header, the outer connection identifier, the outer packet number,
-  the outer authentication tag and the DATAGRAM frame's own bound.
-- **A floor, not a tax.** RFC 9000 requires Initial datagrams of 1200 bytes and
-  quinn will not go below it, so an outer path with under about 1238 bytes of UDP
-  payload cannot carry an inner handshake **at all**. Measured: an outer datagram
-  capped at 1091 bytes completed no inner handshake, ever, because every Initial
-  was silently dropped. The tailnet this is first being run on has an interface
-  MTU of 1280, which leaves 1252 bytes of UDP payload. That is eleven bytes of
-  margin. It is not a margin.
+- **38 bytes of header**, against 9. An inner datagram pays the outer short
+  header, the outer connection ID, the outer packet number, the outer
+  authentication tag and the DATAGRAM frame's own fields.
+- **A floor, not a tax.** RFC 9000 requires datagrams that carry an Initial to
+  be at least 1200 bytes, and quinn does not go below that. So an outer path
+  with less than about 1238 bytes of UDP payload cannot carry an inner
+  handshake **at all**. Measured: with outer datagrams capped at 1091 bytes, no
+  inner handshake ever completed, because every Initial was dropped silently. A
+  Tailscale interface has an MTU of 1280 by default. That leaves 1252 bytes of
+  UDP payload over IPv4, a margin of under 15 bytes, and 1232 over IPv6, which
+  is below the floor.
 - **Two congestion controllers and two AEADs** on every relayed packet, with the
-  outer one pacing the inner one's idea of the link.
+  outer controller pacing the inner one's idea of the link.
 
-The cost of forwarding at the UDP layer instead is that the relay is addressed by
-a token rather than by an authenticated connection, and that is what the next
-section is about.
+Forwarding at the UDP layer has one cost: the relay is addressed by a token, not
+by an authenticated connection. The next section covers that.
 
 ### The lane token
 
-`Splice` makes the relay draw two 8-byte tokens, one per direction, and give each
-peer only its own. The relay holds `token -> (the peer that may use it, where its
-counterpart is now, the counterpart's token)` and, on a packet, rewrites the token
-before forwarding.
+`Splice` makes the relay draw two 8-byte tokens, one per direction, and give
+each peer only its own. For each token the relay holds the one address that may
+use it (which is also where packets for that end go) and the counterpart token.
+It rewrites the token before it forwards a packet, so neither peer learns the
+other's token.
 
-- A forged token is one chance in 2⁶⁴, and the relay drops a packet whose token
-  it does not hold without answering, so there is nothing to probe against.
-- A token is bound to the address that first used it. A packet arriving with the
-  right token from another address is dropped, so a token overheard on the path
-  cannot be replayed from elsewhere.
+- A forged token has one chance in 2⁶⁴. The relay drops a packet whose token it
+  does not hold, without an answer, so there is nothing to probe.
+- A token is bound to one address. A packet with the right token from another
+  address is dropped, so a token overheard on the path cannot be replayed from
+  elsewhere.
 - **The relay never forwards more bytes toward an address than it has received
-  from it** until that address has proved itself. RFC 9000 gives QUIC this
-  three-to-one limit for free; a splice is below QUIC and has to state it.
+  from that address** until the address has proved itself: a one-to-one limit.
+  QUIC has its own anti-amplification limit (three to one, RFC 9000 §8). A
+  splice is below QUIC, so it has to state its own.
 
-  Proving it needs care, and the obvious rule deadlocks. The relay has to know
-  where a peer is *before* it can forward anything to it, and in a session the
-  host never speaks first, so "the address that first used the token" is an
-  address that never arrives. So: a lane end's address comes from that peer's
-  **control connection**, and each peer, on being told its `Lane`, sends one
-  **empty spliced frame**, `0x2a` and its token and nothing else. The relay reads
-  that as proof of the address and does not forward it. A peer whose control
-  connection moves is repointed and has to prove the new address again.
-- Tokens die with the lane, and the lane dies with either control connection.
+  The obvious proof deadlocks. The relay must know where a peer is *before* it
+  can forward anything to it, and in a session the host never speaks first, so
+  "the address that first used the token" never arrives. Instead, a lane end's
+  address comes from that peer's **control connection**. On receiving its
+  `Lane`, each peer sends one **empty spliced frame** (`0x2a` and its token),
+  which the relay reads as proof of the address and does not forward. The far
+  end hears of the lane first, so it can prove its address before the asking
+  peer's traffic arrives. The relay checks each control connection's address
+  every 5 s. A peer that moved is repointed, gets a new `Observed`, and must
+  prove the new address.
+- Tokens die with the lane. The lane dies with either control connection.
 
 ### The peer's address never changes, so nothing migrates
 
-Each side gives the other a **virtual address**, drawn locally from `240.0.0.0/4`
-(reserved, never routable, and IPv4 so that an endpoint bound either way can
-carry it). It is allocated from a counter, not derived from anything, because
-the two sides never have to agree on it: it is what quinn is told, and quinn is
-the only thing that reads it.
+Each side gives the other a **virtual address**, drawn locally from
+`240.0.0.0/4`. That block is reserved and never routed, and it is IPv4, so an
+endpoint bound to either family can carry it. The address comes from a counter
+and means nothing. The two sides never have to agree on it: quinn is told it,
+and quinn is the only thing that reads it.
 
 The socket underneath then routes: straight out the wire for a direct path, or
-wrapped and sent to the relay. quinn is told the same remote address either way.
+wrapped and sent to the relay. quinn is told the same remote address either
+way. A direct session also gets a virtual address, so its route can change
+later without quinn seeing a migration.
 
-Measured: a session established through a relay and moved onto a direct path
+Measured: a session established through a relay and moved to a direct path
 mid-connection kept the same `Connection`, reported the same `remote_address`,
-and performed **no path validation and no migration**. 991 Mbit/s relayed,
-1200 Mbit/s direct, RTT 361 µs to 89 µs, one object throughout.
+and performed **no path validation and no migration**. Throughput went from
+991 Mbit/s relayed to 1200 Mbit/s direct and RTT from 361 µs to 89 µs, on one
+object throughout.
 
-One thing that experiment also showed, and it is the sharp edge of this design:
-the congestion window earned on the relayed path is wrong the instant the path
-changes, because there is one controller for what are really two paths. Until
-that is handled the upgrade is not switched on. See *Not built yet*.
+The same experiment showed the sharp edge of this design. One congestion
+controller serves what are really two paths, so the window earned on the
+relayed path is wrong the moment the path changes. Until that is solved, the
+upgrade is off. See *Not built yet*.
 
 ## Messages
 
 ### Peer to relay
 
 `PeerHello`
-: The version, and nothing else. There is no role: a peer that wants to be
-  reachable says so with `Register`, and a peer that does not stays quiet. A
-  version mismatch is refused by name.
+: The version, nothing else. There is no role field: a peer that wants to be
+  reachable sends `Register`, and a peer that does not stays quiet. A version
+  mismatch is refused by name.
 
 `Register`
-: Be reachable under my identifier. A host sends this and keeps the connection.
-  A client that only wants to reach somebody does not have to, which is why an
-  answer cannot be routed by presence.
+: Make me reachable under my identifier. A host sends this and keeps the
+  connection. A client that only wants to reach somebody does not send it,
+  which is why an answer cannot be routed by presence.
 
-  Nothing acknowledges it, and `Observed` arrives *before* it is read, because
-  the relay greets before it reads. So there is a window in which a host is
-  connected and observed but not yet reachable, and a client asking for it in
-  that window is told `UnknownPeer`. That is correct rather than a fault, and it
-  is the one race a test has to wait out.
+  Nothing acknowledges it. The relay sends `Observed` right after the hellos,
+  before it reads any other message. So there is a window in which a host is
+  connected and observed but not yet reachable, and a client that asks for it
+  in that window gets `UnknownPeer`. That is correct behaviour, and it is the
+  one race a test has to wait out.
 
 `Allocate`
 : Open a pairing mailbox. Answered with `Nameplate`.
@@ -213,22 +223,24 @@ that is handled the upgrade is not switched on. See *Not built yet*.
 `Join { nameplate }`
 : Enter an open mailbox as its second party.
 
+  Both first close any mailbox this connection was in.
+
 `Mail { body }`
 : For the other party of my mailbox. The relay forwards the bytes and reads
   none of them.
 
 `Release`
-: Close my mailbox now.
+: Close my mailbox now. Either party may close it.
 
 `Connect { offer }`
 : Reach the host the offer names. The relay reads `offer.to` to know where to
-  forward it, and reads nothing else in it: routing is the one thing it needs,
-  and the signature is for the far end rather than for the relay.
+  forward it, and reads nothing else. It does not verify the signature: the
+  signature is for the far end.
 
 `Answer { offer }`
-: The host's reply. Routed by the **connection the offer arrived on**, not by
-  presence: a client never sends `Register`, so there is no presence entry to
-  route an answer back to.
+: The host's reply. Routed to `offer.to` over that device's open control
+  connection, registered or not, never through presence: a client does not
+  send `Register`, so it has no presence entry.
 
 `Splice { peer }`
 : Punching did not work. Open a relayed path to that peer.
@@ -236,30 +248,35 @@ that is handled the upgrade is not switched on. See *Not built yet*.
 ### Relay to peer
 
 `RelayHello`
-: The version.
+: The version. Sent before the relay reads the peer's hello, so a peer of
+  another version learns which version the relay speaks.
 
 `Observed { address }`
-: The address this connection was seen from. Sent unprompted as soon as the
-  connection is up, and again whenever it changes, which is what a NAT rebinding
-  looks like from here.
+: The address this connection was seen from. Sent unprompted right after the
+  hellos, and again whenever it changes, which is what a NAT rebinding looks
+  like from the relay.
 
 `Nameplate { nameplate }`
+: The mailbox that was opened.
 
 `Mail { body }`
+: What the other party of the mailbox sent. One flight sent before the joiner
+  arrives is held and delivered at `Join`.
 
 `Offered { offer }` and `Answered { offer }`
-: What arrived. Who sent it is `offer.from`, inside the signature, which is where
-  the reader has to check it anyway.
+: What arrived. The sender is `offer.from`, inside the signature, which is
+  where the reader has to check it anyway.
 
 `Lane { token, peer }`
 : A relayed path is open. A packet sent to the relay's own address that begins
-  `0x2a` and this token reaches that peer.
+  with `0x2a` and this token reaches that peer.
 
 `Refused { what }`
 : What could not be done and why: `UnknownPeer`, `UnknownNameplate`,
-  `NameplateTaken`, `NoNameplates`, `NotInMailbox`, `BadOffer`, `RateLimited`.
-  Enough for a client to say something a person can act on, rather than
-  "failed".
+  `NameplateTaken`, `NoNameplates`, `NotInMailbox`, `RateLimited`. Enough for a
+  client to say something a person can act on. The enum also has `BadOffer`,
+  which `relayd` never sends because it does not verify offers. A peer's own
+  `Offer::verify` returns it.
 
 ## The offer is signed, not sealed
 
@@ -279,158 +296,184 @@ pub struct Offer {
 ```
 
 `to` is inside the signature, so an offer collected for one host cannot be
-replayed at another. What is signed is `0x0f`, then `tachyx-offer-v1`, then the
-body: the signing domain travels with its own length in front, so a
-reimplementation from this paragraph alone would produce signatures that do not
+replayed at another. The signed bytes are `0x0f`, then `tachyx-offer-v1`, then
+the body: the signing domain travels with its one-byte length in front. A
+reimplementation that leaves out the length produces signatures that do not
 verify.
 
-`at` is checked against a generous window, sixty seconds either way, because the
-two clocks are not related.
+`at` is checked against a wide window, 60 seconds either way, because the two
+clocks are not related.
 
-Inside that window a replay is caught by the reader, not the relay: an offer
-needs no nonce because its signature is already unique to its content, and a
-host remembers the signatures it has answered inside the window. A repeat is
-dropped after the signature and the paired-list checks, so it costs the host a
-comparison and the sender nothing at all. The second bound is the **candidate
-cap**. Every address in an offer costs the reader a punch
-attempt, and a punch attempt is a 1200-byte QUIC Initial sent where the offer
-said to send it. The message framing alone would carry about 2300 addresses,
-which turns one 16 kB offer into 2.7 MB aimed wherever the signer likes. An offer
-naming more than twelve is refused. A host has a link-local address or two, one
-routable address, and the one the relay observed.
+Two bounds limit what a signed offer can cost the host.
+
+**Replay.** Inside the window the reader catches a replay, not the relay. An
+offer needs no nonce, because its signature is already unique to its content.
+The host remembers the signatures it has answered inside the window. A repeat
+is dropped after the signature and paired-list checks, and costs the host one
+comparison.
+
+**Candidate cap.** Each address in an offer costs the reader a punch attempt,
+and a punch attempt is a 1200-byte QUIC Initial sent where the offer says. The
+16 KiB message limit alone would allow about 2300 addresses, which turns one
+offer into 2.7 MB aimed wherever the signer likes: an amplifier of about 170.
+An offer that names more than 12 is refused (`MAX_CANDIDATES`), and a peer cuts
+its own list to 12. A host has a link-local address or two, one routable
+address, and the one the relay observed.
 
 The host verifies the signature against its paired list **before it sends one
 packet to any address the offer names.** That is what the signature is for. An
-unsigned offer would make every relay a reflector: ask it to reach a host,
-name the victim's address, and the host sprays QUIC Initials at the victim.
+unsigned offer would make every relay a reflector: ask it to reach a host, name
+the victim's address, and the host sprays QUIC Initials at the victim. The
+client checks the host's answer the same way, and also checks that it is from
+the host it asked and addressed to itself.
 
-Sealing the offer to the host's key was considered and dropped. It would hide the
-candidate addresses from the relay, and the relay observes the client's real
-address itself, so it hides nothing the relay does not already have.
+Sealing the offer to the host's key was considered and dropped. It would hide
+the candidate addresses from the relay, but the relay observes the client's
+real address itself, so it would hide nothing the relay does not already have.
 
 ## Connecting, in order
+
+Before it asks a relay, the client tries each endpoint stored at pairing,
+briefly. If none answers:
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant R as Relay
     participant H as Host
-    H->>R: Register
+    H->>R: connect, hellos
     R->>H: Observed
+    H->>R: Register
+    C->>R: connect, hellos
+    R->>C: Observed
     C->>R: Connect(to H, signed offer)
     R->>H: Offered
     H->>R: Answer(signed)
     R->>C: Answered
     H--xC: punch: Initials the client drops
     C->>H: QUIC connect, mutual pinned keys
-    Note over C,R,H: no answer in 2 s ⇒ Splice, and the same handshake runs inside
+    Note over C,H: no connection in 2 s ⇒ Splice, and the same handshake runs through it
 ```
 
 ### The punch
 
-Both ends already hold a UDP socket that the relay has seen, so the mapping a NAT
-made for the relay is the mapping the peer will arrive at. Nothing else has to be
-discovered.
+Both ends already hold a UDP socket that the relay has seen, so the mapping a
+NAT made for the relay is the mapping the peer will arrive at. Nothing else has
+to be discovered.
 
 **Only the client makes the real connection.** The host punches by starting a
 connection of its own toward each of the client's candidates and abandoning it.
 Its Initials open the host's NAT mapping and are then dropped: the client's
-endpoint carries no server configuration, so quinn discards an incoming Initial
-rather than answering it. The host cancels its throwaway attempt as soon as the
-client's connection arrives, and after three seconds regardless.
+endpoint has no server configuration, so quinn discards an incoming Initial
+without answering. The host cancels its attempts when the client's connection
+arrives, or after 3 s.
 
-That is a deliberate choice against racing two real connections and closing the
+This is a deliberate choice against racing two real connections and closing the
 loser. Racing costs a second handshake, needs a rule for which side wins, and
 leaves a window where both are live. One direction is one code path.
 
+The client waits up to 5 s for the answer. It then tries the host's candidates
+in turn, each for an equal share of its 2 s punch budget but never less than
+400 ms.
+
 ### When the punch fails
 
-Two seconds without a direct connection and the client asks for a splice. The
-relay draws the two tokens, tells both peers, and forwards from then on.
+After 2 s without a direct connection, the client asks for a splice. The relay
+draws the two tokens, tells both peers, and forwards from then on.
 
 **The session through the splice is the same session**, in the strongest sense
-available: the same `Connection`, the same ALPN, the same certificates, the same
-key comparison, and the same congestion controller. Nothing about it knows it is
-relayed except the socket underneath, which adds nine bytes and changes where it
-sends.
+available: the same `Connection`, ALPN, certificates, key comparison and
+congestion controller. Only the socket underneath knows it is relayed: it adds
+nine bytes and changes where packets go.
 
 #### The path is smaller and the video already knows
 
-Nine bytes of splice header, and on a tailnet a 1280-byte interface underneath
-that. The video packetiser reads `quinn::Connection::max_datagram_size` on every
-frame rather than assuming a figure, so a smaller path resizes the slices with no
-change anywhere.
+A splice adds nine bytes, and the path underneath may be a 1280-byte interface.
+The video packetiser reads `quinn::Connection::max_datagram_size` on every
+frame, so a smaller path resizes the slices with no other change.
 
-The one figure that does have to move is `initial_mtu`, which
-[`endpoint.rs`](../crates/tachyx-transport/src/endpoint.rs) sets to 1472 for a
-local network. On a 1280-byte path every packet of that size is black-holed until
-discovery notices, which is a stall at exactly the moment a session opens.
+The starting packet size must move.
+[`endpoint.rs`](../crates/tachyx-transport/src/endpoint.rs) defines `LAN_MTU`
+(1472) for a socket that sends straight out the wire and `RELAYED_MTU` (1200)
+for a path that may be relayed. On a 1280-byte path every 1472-byte packet is
+black-holed until discovery notices, which stalls the session as it opens. So
+the host and every relay connection start at 1200. The client starts at 1472
+for its direct try at stored endpoints and at 1200 once a relay is involved.
+Path discovery raises the figure on a larger path.
 
 ## Abuse
 
 A public relay is a machine strangers can reach.
 
-- Connections per source address are capped, on the IPv6 `/64` rather than the
-  address, because a single subscriber is handed a whole one.
-- A connection is judged before it costs anything. quinn hands the accept loop an
-  `Incoming` before the handshake commits, which says whether the source address
-  has been validated and offers `retry`, `refuse` and `ignore`. An unvalidated
-  address whose bucket is empty is sent a retry; a repeat offender is ignored,
-  which sends nothing at all. `max_incoming` and `incoming_buffer_size_total`
-  default to 65536 and 100 MiB and are both far too generous for this.
-- Control messages are rate limited per connection.
+- New connections are rate limited per source prefix: the IPv6 `/64`, because
+  one subscriber is handed a whole one, or the IPv4 address. 30 a minute, with
+  a burst of 10.
+- A connection is judged before it costs anything. quinn hands the accept loop
+  an `Incoming` before the handshake commits, which says whether the source
+  address is validated and offers `retry`, `refuse` and `ignore`. An
+  unvalidated address over budget gets a retry: one packet, and the address
+  must answer it. A validated address still over budget is ignored, which sends
+  nothing.
+- quinn's defaults for `max_incoming` and `incoming_buffer_size_total` are 65536
+  and 100 MiB, far too generous for a relay. `relayd` sets 256 and 4 MiB.
+- Control messages are rate limited per connection: 10 a second, with a burst
+  of 20. A message over budget is answered with `RateLimited`.
 - A mailbox lives five minutes and holds one message toward the joiner. The
   opener stays connected for as long as the mailbox lives, because the mailbox
-  dies with its connection.
+  dies with either party's connection.
 - A nameplate is not reusable **while it is open**, and is not guessable in
-  sequence: it is drawn at random from the free set, and returns to that set when
-  its mailbox closes. Never reusing one at all would cap a relay at 65535
-  pairings for its lifetime, and reuse is safe because the exchange is keyed on
-  the nameplate *and* the secret, so a stale code cannot open a new mailbox.
-- Spliced lanes are counted in bytes per peer, which is the number a metered
-  deployment would bill and the number an unmetered one uses to spot abuse.
-- Nothing is stored. A relay that is restarted has forgotten everything, and
-  every host reconnects.
+  sequence: it is drawn at random from 1 to 65535 and freed when its mailbox
+  closes. Never reusing one would cap a relay at 65535 pairings for its
+  lifetime. Reuse is safe because the exchange is keyed on the nameplate *and*
+  the secret, so a stale code cannot open a new mailbox.
+- Spliced bytes are counted per lane end, received and sent, and logged when
+  the lane closes: the number a metered deployment would bill and an unmetered
+  one watches for abuse.
+- Nothing is stored. A restarted relay has forgotten everything, and every host
+  reconnects. Every 30 s the relay closes expired mailboxes and prunes the rate
+  limiter's map, which would otherwise grow one entry per source forever.
 
 ## Not built yet
 
-Billing, blind tokens, the signed relay directory, and relay selection by measured
-round trip.
+Billing, blind tokens, the signed relay directory, and relay selection by
+measured round trip.
 
-**Upgrading a live relayed session onto a direct path.** The mechanism is built
-and proven, and nothing in the daemon drives it. `Routes::point` swaps the route
-and quinn never learns: measured on a real session, the connection reported
-`240.0.0.1:1` before and after, the relay carried no further bytes, and the round
-trip fell from 373 to 263 microseconds. Only the tests call it.
+**Moving a live relayed session to a direct path.** The mechanism is built and
+proven, and nothing in the daemon drives it. `Routes::point` swaps the route
+and quinn never learns. Measured on a real session: the connection reported
+`240.0.0.1:1` before and after, the relay carried no further bytes, and the
+round trip fell from 373 to 263 µs. Only the tests call it.
 
-What is missing is not the swap. It is the congestion controller, which has one
-window and one round-trip estimate for what has just become a different path. The
-window a relay earned is wrong on a direct path, and the reverse is worse. Until
-that is answered the route is chosen when the session opens and kept.
+The missing part is the congestion controller, not the swap. It has one window
+and one round-trip estimate for what has just become a different path. The
+window a relayed path earned is wrong on a direct path, and the reverse is
+worse. Until that is solved, the route is chosen when the session opens and
+kept.
 
 ## What was measured and what was read
 
 **Measured**, by building it and running it:
 
 - One quinn endpoint holds three connections on one UDP port at once: outbound
-  to a relay, outbound to a peer, and inbound from that peer, with the local address
-  unchanged. Port reuse is not the obstacle to punching.
-- A session over a virtual socket switched from relayed to direct mid-connection
-  with no migration, no path validation and no new handshake.
+  to a relay, outbound to a peer, and inbound from that peer, with the local
+  address unchanged. Port reuse is not the obstacle to punching.
+- A session over a virtual socket switched from relayed to direct
+  mid-connection with no migration, no path validation and no new handshake.
 - QUIC in QUIC stops working entirely below about 1238 bytes of outer UDP
-  payload, rather than degrading.
+  payload. It does not degrade first.
 
 **Read**, from the sources named:
 
-- quinn 0.11 offers the application no way to move a connection to a new peer
-  address. `Endpoint::rebind` changes the local socket, and server-side migration
-  is passive. This is the reason the virtual address exists.
-- Hole punching succeeds for roughly 70% of attempts on libp2p's published
-  measurement of 4.43M tries (Trautwein et al., IMC 2026), and Tailscale reports
-  over 90% of node pairs direct. The architecture's 85 to 90% is inside that range
-  and is not a number this project has measured.
+- quinn 0.11 gives the application no way to move a connection to a new peer
+  address. `Endpoint::rebind` changes the local socket, and server-side
+  migration is passive. This is why the virtual address exists.
+- Hole punching succeeds for roughly 70% of attempts in libp2p's published
+  measurement of 4.43M tries (Trautwein et al., IMC 2026), and Tailscale
+  reports over 90% of node pairs direct. The 85 to 90% target in
+  [`architecture.md`](architecture.md) is inside that range. This project has
+  not measured it.
 - The often-quoted "15 to 30% of users are behind symmetric NAT" has no primary
   source and is not used here. The best figures are Halkes and Pouwelse 2011:
   11% endpoint-dependent mapping, 79% not directly connectable.
-- A NAT mapping should be refreshed at least every 55 seconds; 15 to 25 is the
-  safe operating point.
+- A NAT mapping should be refreshed at least every 55 seconds. 15 to 25 seconds
+  is the safe operating point.
