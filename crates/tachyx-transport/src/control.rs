@@ -13,10 +13,11 @@ use tachyx_proto::control::{HandshakeError, Hello};
 
 /// The largest message either end will read.
 ///
-/// An input batch is the only message whose size depends on anything, and a
-/// tick's worth of pointer motion is a few hundred bytes. Anything approaching
-/// this is a peer that has lost track of the framing, and reading it would mean
-/// allocating on a stranger's say-so.
+/// The messages whose size varies are an input batch, a receiver report and a
+/// cursor update. The largest is a cursor update, whose picture is capped below
+/// this with room for the rest of the message. Anything larger is a peer that
+/// has lost track of the framing, and reading it would mean allocating on a
+/// stranger's say-so.
 pub const MAX_MESSAGE: usize = 64 * 1024;
 
 /// The sending half of the control stream.

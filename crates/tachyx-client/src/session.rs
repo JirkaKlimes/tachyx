@@ -117,7 +117,7 @@ pub enum Liveness {
     /// The host is answering and the screen is not changing.
     #[default]
     Idle,
-    /// The host has said nothing for three heartbeat intervals.
+    /// The host has said nothing for sixteen heartbeat intervals.
     Lost,
 }
 
